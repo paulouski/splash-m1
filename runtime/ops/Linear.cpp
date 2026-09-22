@@ -373,6 +373,8 @@ constexpr uint32_t kWideDecodeTilesPerCore = 2;
 // share the Apple10 prefill rule. Larger Apple9 GPUs (40-core class) keep the
 // wide-tile rule below; it was sized for them and remains unremeasured there.
 constexpr uint32_t kApple9MeasuredPrefillCores = 32;
+// Largest output measured faster on Apple7's one-lane split tile.
+constexpr uint32_t kApple7SplitMaxOutput = 65536;
 constexpr double kApple9WidePrefillGroupsPerCore = 8.0;
 // Missing core metadata uses one intermediate estimate for all families.
 // This is a fallback, not a calibrated optimum. Reported counts always win.
@@ -423,6 +425,12 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
+    // Apple7/8 (M1/M2): eight-simdgroup N128 measured 22-32% faster than four
+    // on an M1 Max. The fused up projection has no eight-simdgroup N128 kernel.
+    if (appleGpuFamily_ < 9)
+      return w.epilogue == LinearEpilogue::UpWithGate
+          ? LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four}
+          : LinearConfig{LinearTile::N128, 0};
     if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kAffinePrefillTileRows - 1) / kAffinePrefillTileRows;
@@ -437,6 +445,15 @@ LinearConfig Linear::baseline(LinearWorkload w, std::span<const Projection *cons
   // two-N256-tiles-per-core boundary rather than model-specific dimensions.
   const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
       tiles256 >= kWideDecodeTilesPerCore * gpuCores_;
+  // Apple7/8 (M1/M2): one-lane plain and residual projections measured
+  // 20-53% faster on the eight-simdgroup split tile at its full grid on an
+  // M1 Max. The vocabulary projection kept its default.
+  if (appleGpuFamily_ < 9 && lanes == 1 && w.epilogue != LinearEpilogue::GateUp &&
+      w.matrix.inputSize % kSplitInputBlock == 0 &&
+      w.matrix.outputSize < kApple7SplitMaxOutput)
+    return {LinearTile::Split64, w.matrix.outputSize / 64, LinearSimdgroups::Eight};
+  // Apple7/8 must not use the register-matrix tile: on an M1 Max its decode
+  // output diverged from the MPP tiles (repeated words at temperature 0).
   if (appleGpuFamily_ == 9 && !widePlain) {
     const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
     const uint32_t grid = w.matrix.outputSize / columns, groups = w.matrix.inputSize / 64;
