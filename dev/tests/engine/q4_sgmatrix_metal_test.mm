@@ -109,11 +109,11 @@ bool within(const Reference &ref, uint16_t actual) {
   return std::isfinite(value) &&
          std::abs(value - expected) <= ref.error + ulpBf16(float(expected)) + ulpBf16(float(value));
 }
-void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
+void runCase(metal::MetalBackend &backend, LinearTile tile, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
   const auto plan = Linear::plan(workload,
-      {LinearTile::Simdgroup, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
+      {tile, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
   Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
@@ -203,7 +203,7 @@ void requireFp64(const SplitOperand &o, uint32_t splits, const std::string &what
       throw std::runtime_error(what + ": element " + std::to_string(i) + " exceeds the fp64 bound");
   }
 }
-void splitVisibility(metal::MetalBackend &backend,
+void splitVisibility(metal::MetalBackend &backend, LinearTile tile,
                      std::array<std::pair<LinearMatrix, LinearEpilogue>, 2> pair, uint32_t lanes) {
   const uint32_t rows = lanes * 8;
   std::vector<SplitOperand> operands;
@@ -239,7 +239,7 @@ void splitVisibility(metal::MetalBackend &backend,
   require(!splitPairs.empty(), "the policy splits neither projection");
   const auto plan = [&](uint32_t i, uint32_t splits) {
     const LinearWorkload &w = operands[i].workload;
-    return Linear::plan(w, {LinearTile::Simdgroup, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
+    return Linear::plan(w, {tile, w.matrix.outputSize / (w.epilogue == LinearEpilogue::GateUp ? 32 : 64),
                               LinearSimdgroups::Four, splits});
   };
   LinearScratchSize size;
@@ -401,13 +401,16 @@ int main(int argc,char **argv) {
         fusedAttentionGate(backend, 16, 2, lanes, layout);
       }
     uint32_t cases=0;
-    for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
-      for (uint32_t splits : {1U,2U,4U,8U}) {
-        if ((k/64)%splits) continue;
-        for (auto e : {LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp})
-          for (uint32_t fixture=0;fixture<4;++fixture)
-            for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
-      }
+    // Simdgroup (bf16 operands) and SimdgroupF32 (Apple7/8: exact half weights,
+    // fp32 activations, every lane in one threadgroup) share bounds and layout.
+    for (auto tile : {LinearTile::Simdgroup, LinearTile::SimdgroupF32})
+      for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
+        for (uint32_t splits : {1U,2U,4U,8U}) {
+          if ((k/64)%splits) continue;
+          for (auto e : {LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp})
+            for (uint32_t fixture=0;fixture<4;++fixture)
+              for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,tile,n,k,splits,e,fixture,rows); ++cases; }
+        }
     // The production pairs of table and norm weights (kernels/shared/normalization.metal): bf16 norms feed both
     // tables, F32 norms only Table16.
     for (auto [layout, float32] : {std::pair{LinearInput::Table64, false}, std::pair{LinearInput::Table16, false},
@@ -417,10 +420,11 @@ int main(int argc,char **argv) {
     for (uint32_t width : {64U, 2048U, 5120U, 17408U})
       for (uint32_t rows : {1U,37U,64U,65U}) prefillNorm(backend, width, rows);
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
-    for (uint32_t lanes : {1U, 4U}) {
-      splitVisibility(backend, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
-      splitVisibility(backend, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);
-    }
+    for (auto tile : {LinearTile::Simdgroup, LinearTile::SimdgroupF32})
+      for (uint32_t lanes : {1U, 4U}) {
+        splitVisibility(backend, tile, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
+        splitVisibility(backend, tile, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);
+      }
     std::cout << "Q4 simdgroup: PASS cases=" << cases
               << " (fp64, range, cancellation, guards, repeated dispatch, fused norm and attention gate in both"
                  " table layouts, norms with bf16 and F32 weights, shared split scratch)\n";

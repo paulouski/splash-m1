@@ -739,6 +739,59 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
   return blockProjection(n, k, std::vector<uint32_t>(segments, format));
 }
 
+// Apple7/8 have no bfloat arithmetic: every decode projection, wide batches
+// included, runs the fp32-operand register-matrix tile with Apple9's K
+// partitions, no candidate offers the bfloat-operand form, and every prefill
+// projection runs the register-matrix prefill tile.
+void apple7Plans() {
+  for (const uint32_t family : {7U, 8U}) {
+    const Linear linear = gpu(family, 32), reference = gpu(9, 32);
+    for (const LinearMatrix matrix : {LinearMatrix{17408, 5120}, LinearMatrix{5120, 17408},
+                                      LinearMatrix{16640, 5120}, LinearMatrix{6144, 5120},
+                                      LinearMatrix{248320, 5120}, LinearMatrix{256, 5120}})
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                    LinearEpilogue::GateUp}) {
+          const LinearWorkload workload{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          const auto plan = linear.plan(workload);
+          const auto config = plan.configuration();
+          const uint32_t columns = epilogue == LinearEpilogue::GateUp ? 32 : 64;
+          // One threadgroup covers every lane: each width has its own kernel.
+          constexpr std::array widths{"", "_m16", "_m24", "_m32"};
+          const std::string expected = std::string("decode_linear_q4_sgf") +
+              (epilogue == LinearEpilogue::GateUp ? "_gate_up"
+               : epilogue == LinearEpilogue::Residual ? "_residual" : "") + widths[lanes - 1];
+          require(config.tile == LinearTile::SimdgroupF32 &&
+                      config.groups == matrix.outputSize / columns &&
+                      config.simdgroups == LinearSimdgroups::Four &&
+                      plan.pipeline() == expected && plan.input() == LinearInput::Table64,
+                  "Apple7 decode does not use the fp32 register-matrix tile");
+          const auto apple9Config = reference.plan(workload).configuration();
+          require(apple9Config.tile != LinearTile::Simdgroup ||
+                      config.splits == apple9Config.splits,
+                  "Apple7 K partitions differ from Apple9");
+          for (const auto &candidate : linear.candidates(workload))
+            require(candidate.configuration().tile != LinearTile::Simdgroup,
+                    "Apple7 candidate uses bfloat simdgroup operands");
+        }
+    for (const LinearMatrix matrix : {LinearMatrix{5120, 17408}, LinearMatrix{17408, 5120},
+                                      LinearMatrix{16640, 5120}, LinearMatrix{5120, 6144}})
+      for (const uint32_t rows : {1U, 33U, 2048U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                    LinearEpilogue::UpWithGate}) {
+          const auto plan = linear.plan({matrix, rows, LinearPhase::Prefill, epilogue});
+          require(plan.configuration() == LinearConfig{LinearTile::Mma64, 0, LinearSimdgroups::Four} &&
+                      plan.pipeline().starts_with("prefill_linear_q4_mma64") &&
+                      plan.tileColumns() == 64 && plan.threadsPerThreadgroup() == 128 &&
+                      plan.reassociates() && plan.scratchSize().input == 0,
+                  "Apple7 prefill does not use the register-matrix tile");
+          for (const auto &candidate : reference.candidates({matrix, rows, LinearPhase::Prefill, epilogue}))
+            require(candidate.configuration().tile != LinearTile::Mma64,
+                    "Apple9 prefill offers the Apple7 register-matrix tile");
+        }
+  }
+}
+
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, tile kernel, input table and scratch of
 // its bf16 plan on every family and core count, and only plain decode
@@ -750,7 +803,7 @@ std::set<std::string_view> floatOutputPlans() {
     return p;
   };
   std::set<std::string_view> kernels;
-  for (const uint32_t family : {9U, 10U, 11U})
+  for (const uint32_t family : {7U, 8U, 9U, 10U, 11U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
       const Linear linear = gpu(family, cores);
       for (const uint32_t n : {256U, 5120U, 16640U, 248320U})
@@ -1419,6 +1472,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     bool simdgroup = false;
   };
   std::vector<SplitOutput> splitOutputs;
+  std::vector<uint16_t> gateValues;  // UpWithGate's stored gate, shared by all candidates
   for (const auto &plan : candidates) {
     const uint64_t outputBytes = uint64_t{storageRows} * p.outputSize * 2;
     const uint64_t guardBytes = uint64_t{8} * p.outputSize * 2;
@@ -1466,6 +1520,12 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
       require(last.threadgroups.x == plan.configuration().groups &&
                   graph.dispatches().size() == dispatches,
               "Linear decode plan/graph geometry mismatch");
+      // The fp32 register-matrix tile covers every lane in one threadgroup.
+      if (plan.usesSimdgroup())
+        require(last.threadgroups.y == plan.configuration().splits &&
+                    last.threadgroups.z ==
+                        (plan.configuration().tile == LinearTile::SimdgroupF32 ? 1 : lanes),
+                "simdgroup Q4 lanes/partitions geometry mismatch");
       // These counters describe projection fusion, excluding input preparation.
       const uint32_t projections = plan.secondPipeline().empty() ? 1 : 2;
       require(stats.fusedSourceOperations == (lanes == 1 ? 0 : lanes * projections) &&
@@ -1523,8 +1583,8 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
     try {
       checkReference(p, gate, workload, b,
                      inPlaceResidual ? immutableResidual.data() : nullptr,
-                     plan.partialSums() > 1 || plan.usesSimdgroup(),
-                     plan.usesSimdgroup() ? std::max(tuning::simdgroupSlack(workload, b.input, p),
+                     plan.reassociates(),
+                     plan.registerMatrix() ? std::max(tuning::simdgroupSlack(workload, b.input, p),
                          tuning::simdgroupSlack(workload, b.input, gate)) : 0);
     } catch (const std::exception &) {
       std::cerr << "matrix=" << p.outputSize << 'x' << p.inputSize
@@ -1562,8 +1622,12 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
           throw std::runtime_error("an fp32 output does not round to its bf16 plan's output");
         }
     }
-    if (plan.partialSums() > 1 || plan.usesSimdgroup()) {
-      splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.usesSimdgroup()});
+    if (workload.epilogue == LinearEpilogue::UpWithGate && gateValues.empty()) {
+      const auto *g = static_cast<const uint16_t *>(b.gateScratch.contents());
+      gateValues.assign(g, g + elements);
+    }
+    if (plan.reassociates()) {
+      splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.registerMatrix()});
     } else {
       if (baseline.empty()) baseline.assign(output, output + elements);
       require(std::memcmp(baseline.data(), output, elements * 2) == 0,
@@ -1606,6 +1670,7 @@ void numericalCase(metal::MetalBackend &backend, Linear &linear,
         reference.gate = tuning::bf16ToFloat(gateReference[i]);
         reference.up = tuning::bf16ToFloat(upReference[i]);
       }
+      if (workload.epilogue == LinearEpilogue::UpWithGate) reference.gate = tuning::bf16ToFloat(gateValues[i]);
       if (!tuning::withinSplitTolerance(tuning::bf16ToFloat(split.output[i]), workload.epilogue, reference,
                                         toleranceSlack)) {
         std::cerr << "split element=" << i << " actual=" << tuning::bf16ToFloat(split.output[i])
@@ -1653,7 +1718,7 @@ std::map<std::string, uint32_t> pipelineScopes() {
         }
     }
   };
-  for (const uint32_t family : {9U, 10U, 11U})
+  for (const uint32_t family : {7U, 8U, 9U, 10U, 11U})
     for (const uint32_t cores : {0U, 10U, 16U, 20U, 40U, 80U}) {
       const Linear linear = gpu(family, cores);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
@@ -1713,6 +1778,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     baselinePlans();
+    apple7Plans();
     affinePolicyLaws();
     ggufPlans();
     ggufCoreLaws();
