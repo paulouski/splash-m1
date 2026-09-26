@@ -245,6 +245,14 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 
 enum class MoePhase : uint8_t { Prefill, Decode };
 
+// Affine expert tile implementation: a device policy the execution plans set,
+// not a tuned choice. Mpp is the shipped tensor-operation tile. Register is
+// the Apple7/8 tile (moe_mma.metal: exact half Q4 weights, fp32 inputs and
+// accumulation, in-kernel input sums), whose gate/up pass is fused at either
+// row count, so its prefill plans never split the experts. Its outputs match
+// the MPP tiles up to summation order, not bitwise.
+enum class MoeExpertKernel : uint8_t { Mpp = 0, Register = 1 };
+
 struct MoeConfig final {
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
@@ -258,6 +266,8 @@ struct MoeConfig final {
   // The tile of a GGUF plan's F32 router; the execution plans derive it from
   // the device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  // Affine plans only; the execution plans derive it from the GPU family.
+  MoeExpertKernel kernel = MoeExpertKernel::Mpp;
   bool operator==(const MoeConfig &) const = default;
 };
 

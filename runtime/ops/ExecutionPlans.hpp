@@ -129,6 +129,8 @@ private:
   uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
   uint32_t appleGpuFamily_ = 0;
+  AttentionTile attentionTile_ = AttentionTile::Mpp;
+  MoeExpertKernel moeExpertKernel_ = MoeExpertKernel::Mpp;
   OperatorChoices choices_;
 };
 

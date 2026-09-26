@@ -42,6 +42,10 @@ template <class Function> void rejects(Function function) {
   throw std::runtime_error("invalid attention plan was accepted");
 }
 
+bool sameGrid(metal::DispatchSize a, metal::DispatchSize b) {
+  return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
 void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout,
                                 ops::PrefillAttentionConfig config) {
   bool unequalAxes = false, partialTile = false, multipleSplits = false;
@@ -119,6 +123,33 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         require(bound.partialsBytes >= plan.workspace.partialsBytes &&
                     bound.statisticsBytes >= plan.workspace.statisticsBytes,
                 "prefill arena omitted a valid shorter/context-edge plan");
+        require(plan.splitThreads.x == 256 && plan.splitThreads.y == 1 &&
+                    plan.splitThreads.z == 1,
+                "MPP prefill tile left its 256-thread threadgroup");
+        // As for verify: the register tile changes only the split entry and
+        // its width, never the partition, scratch or reduce.
+        auto registerConfig = config;
+        registerConfig.tile = ops::AttentionTile::Register;
+        const auto registerPlan = ops::PagedAttention::prefillPlan(
+            rows, queryHeads, layout, history, registerConfig);
+        const bool int8 = layout.format == kv::Format::Int8;
+        require(registerPlan.splitPipeline ==
+                        (int8 ? "prefill_attention_q8_split_sgf" + geometrySuffix
+                              : splitPipeline) &&
+                    registerPlan.configuration.tile ==
+                        (int8 ? ops::AttentionTile::Register : ops::AttentionTile::Mpp) &&
+                    registerPlan.splitThreads.x ==
+                        (int8 ? 32 * queryHeads / layout.kvHeads : 256) &&
+                    registerPlan.reducePipeline == plan.reducePipeline &&
+                    registerPlan.splits == plan.splits &&
+                    registerPlan.workspace.partialsBytes == plan.workspace.partialsBytes &&
+                    registerPlan.workspace.statisticsBytes ==
+                        plan.workspace.statisticsBytes &&
+                    sameGrid(registerPlan.splitGroups, plan.splitGroups) &&
+                    sameGrid(registerPlan.reduceGroups, plan.reduceGroups),
+                "register prefill tile changed more than its split entry");
+        require(int8 != registerPlan.sameExecutionAs(plan),
+                "prefill plan equality ignored the split tile");
       }
   }
   for (const auto config : ops::PagedAttention::verifyCandidates()) {
@@ -156,6 +187,35 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         require(plan.laneSplits[0] == 32 &&
                     (lanes < 4 || plan.laneSplits[3] == kv::kQ8VerifyMaximumSplits),
                 "default verify partition changed");
+      require(plan.splitThreads.x == 256 && plan.splitThreads.y == 1 &&
+                  plan.splitThreads.z == 1,
+              "MPP verify tile left its 256-thread threadgroup");
+      // The Apple7/8 register tile keeps the partition, scratch and reduce;
+      // only the split entry and its one-simdgroup-per-eight-rows width change.
+      auto registerConfig = config;
+      registerConfig.tile = ops::AttentionTile::Register;
+      const auto registerPlan = ops::PagedAttention::verifyPlan(
+          lanes, queryHeads, layout, histories, registerConfig);
+      const bool int8 = layout.format == kv::Format::Int8;
+      require(registerPlan.splitPipeline ==
+                      (int8 ? "verify_attention_q8_split_sgf" + geometrySuffix
+                            : splitPipeline) &&
+                  registerPlan.configuration.tile ==
+                      (int8 ? ops::AttentionTile::Register
+                            : ops::AttentionTile::Mpp) &&
+                  registerPlan.splitThreads.x ==
+                      (int8 ? 32 * queryHeads / layout.kvHeads : 256) &&
+                  registerPlan.reducePipeline == plan.reducePipeline &&
+                  registerPlan.laneSplits == plan.laneSplits &&
+                  registerPlan.splits == plan.splits &&
+                  registerPlan.workspace.partialsBytes == plan.workspace.partialsBytes &&
+                  registerPlan.workspace.statisticsBytes ==
+                      plan.workspace.statisticsBytes &&
+                  sameGrid(registerPlan.splitGroups, plan.splitGroups) &&
+                  sameGrid(registerPlan.reduceGroups, plan.reduceGroups),
+              "register verify tile changed more than its split entry");
+      require(int8 != registerPlan.sameExecutionAs(plan),
+              "verify plan equality ignored the split tile");
     }
   }
   rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout, 0); });
@@ -590,6 +650,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
               "recorded prefill ABI does not describe the actual split plan");
     };
     checkDispatch(graph.dispatches()[1], plan.splitGroups, plan.splitPipeline);
+    require(sameGrid(graph.dispatches()[1].threadsPerThreadgroup, plan.splitThreads),
+            "production prefill split left its planned threadgroup width");
     checkDispatch(graph.dispatches()[2], plan.reduceGroups, plan.reducePipeline);
   } else {
     require(graph.dispatches().size() == 3, "production verify should encode store/split/reduce");
@@ -597,6 +659,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
     const auto &reduce = graph.dispatches()[2];
     require(split.pipelineName == plan.splitPipeline && reduce.pipelineName == plan.reducePipeline &&
                 split.threadgroups.y == plan.splits && split.threadgroups.z == plan.splitGroups.z &&
+                sameGrid(split.threadsPerThreadgroup, plan.splitThreads) &&
                 reduce.threadgroups.y == plan.reduceGroups.y &&
                 reduce.threadgroups.z == plan.reduceGroups.z,
             "production verify encoding departed from its plan");
@@ -626,8 +689,16 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
 void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout,
                    uint32_t history, uint32_t rows) {
   auto data = makeCase(backend, heads, layout, 1, rows, history, false);
+  // Every tuned configuration in both tiles.
+  std::vector<ops::PrefillAttentionConfig> configs;
+  for (const auto candidate : ops::PagedAttention::prefillCandidates())
+    for (auto tile : {ops::AttentionTile::Mpp, ops::AttentionTile::Register}) {
+      auto config = candidate;
+      config.tile = tile;
+      configs.push_back(config);
+    }
   std::vector<uint16_t> defaultOutput;
-  for (const auto config : ops::PagedAttention::prefillCandidates()) {
+  for (const auto config : configs) {
     const auto output = run(backend, data, config, true);
     checkReference(data, output);
     if (config == ops::PrefillAttentionConfig{})
@@ -645,7 +716,7 @@ void checkPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layou
       return std::vector<uint16_t>(begin, begin + buffer.sizeBytes() / 2);
     };
     const auto keys = copy(data.keys), values = copy(data.values), queries = copy(data.queries);
-    for (const auto config : ops::PagedAttention::prefillCandidates()) {
+    for (const auto config : configs) {
       uint32_t offset = 0;
       for (uint32_t chunk : {3U, 5U, 31U, 509U, 509U}) {
         data.rows = chunk;
@@ -681,13 +752,16 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
                   uint32_t history, uint32_t lanes) {
   auto data = makeCase(backend, heads, layout, lanes, 8, history, true);
   std::vector<uint16_t> baseline;
-  for (const auto config : ops::PagedAttention::verifyCandidates()) {
-    const auto output = run(backend, data, config, true);
-    checkReference(data, output);
-    if (baseline.empty())
-      baseline = output;
-    checkEquivalent(data, baseline, output);
-  }
+  for (const auto candidate : ops::PagedAttention::verifyCandidates())
+    for (auto tile : {ops::AttentionTile::Mpp, ops::AttentionTile::Register}) {
+      auto config = candidate;
+      config.tile = tile;
+      const auto output = run(backend, data, config, true);
+      checkReference(data, output);
+      if (baseline.empty())
+        baseline = output;
+      checkEquivalent(data, baseline, output);
+    }
   std::cout << "paged verify candidates: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " lanes=" << lanes << " PASS\n";
 }
@@ -822,8 +896,14 @@ int main(int argc, char **argv) {
             const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
             auto prefill = makeCase(backend, heads, layout, 1, 2048, history, false);
             checkReference(prefill, run(backend, prefill, ops::PrefillAttentionConfig{}, true));
+            ops::PrefillAttentionConfig registerPrefill;
+            registerPrefill.tile = ops::AttentionTile::Register;
+            checkReference(prefill, run(backend, prefill, registerPrefill, true));
             auto verify = makeCase(backend, heads, layout, 4, 8, history, true);
             checkReference(verify, run(backend, verify, ops::VerifyAttentionConfig{}, true));
+            ops::VerifyAttentionConfig registerTile;
+            registerTile.tile = ops::AttentionTile::Register;
+            checkReference(verify, run(backend, verify, registerTile, true));
             std::cout << "long attention: format=" << kv::formatName(format)
                       << " q=" << heads << " history=" << history << " PASS\n" << std::flush;
           }

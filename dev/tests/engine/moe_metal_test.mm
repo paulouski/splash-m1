@@ -26,6 +26,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -325,8 +326,17 @@ const char *configureRouting(Fixture &fixture, Routing distribution) {
   return "invalid";
 }
 
+// Squared error of the grouped gate/up and down passes against the CPU
+// projections, per tile implementation, to compare their accuracy.
+struct ProjectionError {
+  double gateUpError = 0, gateUpReference = 0, downError = 0, downReference = 0;
+};
+ProjectionError shippedError, registerError;
+
 void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
            const std::string &label) {
+  ProjectionError &error =
+      label.find("register") != std::string::npos ? registerError : shippedError;
   const auto *selected =
       static_cast<const uint32_t *>(fixture.buffers.scratch.selectedExperts.contents());
   const auto *routing =
@@ -440,8 +450,16 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
                         0.02F + 0.01F * std::abs(intermediate[n]),
                 label + ": grouped gate/up differs from CPU reference");
         gpuIntermediateValues[n] = float(gpuIntermediate[n]);
+        const double difference = double(gpuIntermediate[n]) - intermediate[n];
+        error.gateUpError += difference * difference;
+        error.gateUpReference += double(intermediate[n]) * intermediate[n];
       }
       const std::vector<float> down = project(downSlab, gpuIntermediateValues);
+      for (uint32_t n = 0; n < kHidden; ++n) {
+        const double difference = double(gpuDown[n]) - down[n];
+        error.downError += difference * difference;
+        error.downReference += double(down[n]) * down[n];
+      }
       for (uint32_t n = 0; n < kHidden; ++n)
         require(std::isfinite(float(gpuDown[n])) &&
                     std::abs(float(gpuDown[n]) - down[n]) <=
@@ -567,6 +585,17 @@ void planBounds() {
         checkPlan(narrow[index]);
       }
     }
+    // Apple7/8 run the register expert tiles in both phases, with the shipped
+    // tile rows and never split prefill experts.
+    for (const uint32_t family : {7U, 8U})
+      for (const auto phase : {MoePhase::Prefill, MoePhase::Decode})
+        for (const auto &plan : candidates(family, shape, phase == MoePhase::Prefill ? 2048 : 32, phase)) {
+          require(plan.configuration().kernel == splash::ops::MoeExpertKernel::Register &&
+                      plan.configuration().m8Simdgroups == MoeExpertSimdgroups::Eight &&
+                      !plan.splitExperts(),
+                  "Apple7/8 MoE plans do not run the register expert tiles");
+          checkPlan(plan);
+        }
     rejects([&] { (void)candidates(10, shape, 0, MoePhase::Prefill); }, "zero prefill");
     rejects([&] { (void)candidates(10, shape, 2049, MoePhase::Prefill); }, "large prefill");
     rejects([&] { (void)candidates(10, shape, 0, MoePhase::Decode); }, "zero batch");
@@ -623,6 +652,18 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
                 dispatches[experts + 1].threadgroups.x == kIntermediate / 256 &&
                 dispatches[experts + 2].threadgroups.x == kHidden / 256,
             "split MoE plan chose inconsistent gate scratch or column tiles");
+  } else if (plan.configuration().kernel == splash::ops::MoeExpertKernel::Register) {
+    // Apple7/8 register tiles: four simdgroups, fused gate/up at both row
+    // counts, 16 gate/up and 32 down columns per simdgroup.
+    const std::string rows = m8 ? "m8" : "m32";
+    require(dispatches[experts].pipelineName == "moe_expert_gate_up_q4_mma_" + rows &&
+                dispatches[experts + 1].pipelineName == "moe_expert_down_q4_mma_" + rows,
+            "register MoE plan chose inconsistent expert pipelines");
+    require(dispatches[experts].threadgroups.x == kIntermediate / (m8 ? 64 : 32) &&
+                dispatches[experts + 1].threadgroups.x == kHidden / (m8 ? 128 : 64) &&
+                dispatches[experts].threadsPerThreadgroup.x == 128 &&
+                dispatches[experts + 1].threadsPerThreadgroup.x == 128,
+            "register MoE plan chose inconsistent column tiles or threadgroup width");
   } else {
     // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
     // to N256; every other fused pass keeps N128 at 256 threads.
@@ -881,6 +922,30 @@ void run(const std::string &metallibPath) {
         fail(label + " " + routingLabel + ": outputs differ from the shipped tile");
       }
     };
+    // The register tiles against the shipped tile on identical inputs: the
+    // same routes, and outputs within bf16 rounding of summation order.
+    double worstCosine = 1, worstRelative = 0;
+    const auto requireClose = [&](const std::vector<float> &candidate,
+                                  const std::vector<float> &baseline,
+                                  const std::string &label) {
+      require(candidate.size() == baseline.size(), label + ": output size differs");
+      double dot = 0, cc = 0, bb = 0, relative = 0;
+      size_t differing = 0;
+      for (size_t index = 0; index < candidate.size(); ++index) {
+        const double c = candidate[index], b = baseline[index];
+        require(std::isfinite(c), label + ": nonfinite register output");
+        dot += c * b, cc += c * c, bb += b * b;
+        differing += c != b;
+        relative = std::max(relative, std::abs(c - b) / (std::abs(b) + 0.05));
+      }
+      const double cosine = dot / std::sqrt(cc * bb);
+      worstCosine = std::min(worstCosine, cosine);
+      worstRelative = std::max(worstRelative, relative);
+      if (!(cosine > 0.99999) || relative > 0.05)
+        fail(label + " " + routingLabel + ": register tile departs from the shipped tile: cosine=" +
+             std::to_string(cosine) + " worst_relative=" + std::to_string(relative) +
+             " differing=" + std::to_string(differing));
+    };
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const auto shipped = candidates(10, fixture.shape, lanes * 8, MoePhase::Decode);
       const std::string label = "decode B" + std::to_string(lanes);
@@ -896,6 +961,10 @@ void run(const std::string &metallibPath) {
                    label + " four-simdgroup M8");
       requireEqual(execute(narrow[1], label + " sg4"), baseline,
                    label + " four-simdgroup M32");
+      // Apple7/8 register tiles: checked against the CPU reference inside
+      // execute(); their summation order differs, so not bitwise.
+      for (const auto &plan : candidates(7, fixture.shape, lanes * 8, MoePhase::Decode))
+        requireClose(execute(plan, label + " register"), baseline, label + " register");
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
     // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
@@ -906,8 +975,17 @@ void run(const std::string &metallibPath) {
       const std::string label = "prefill rows=" + std::to_string(rows);
       const auto baseline = execute(shipped[0], label);
       requireEqual(execute(shipped[1], label), baseline, label);
+      for (const auto &plan : candidates(7, fixture.shape, rows, MoePhase::Prefill))
+        requireClose(execute(plan, label + " register"), baseline, label + " register");
     }
+    std::cout << "register vs shipped tile " << routingLabel << ": worst cosine "
+              << worstCosine << ", worst |diff| / (|shipped| + 0.05) " << worstRelative << '\n';
   }
+  for (const auto &[name, error] : {std::pair{"shipped ", shippedError},
+                                    std::pair{"register", registerError}})
+    std::cout << name << " tile relative RMS error vs CPU: gate/up "
+              << std::sqrt(error.gateUpError / error.gateUpReference) << ", down "
+              << std::sqrt(error.downError / error.downReference) << '\n';
   std::cout << "moe_metal_test: PASS cases=" << cases
             << " wall_seconds=" << wallSeconds << '\n';
 }

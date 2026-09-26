@@ -9,6 +9,7 @@
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
+//                        [--tile mpp|register]
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -68,6 +69,12 @@ struct Plan final {
   kv::Layout layout() const { return {1, shape.kvHeads, shape.headDimension, shape.format}; }
   // The verify plan scales each lane's split count with its own history.
   std::span<const uint32_t> laneHistories() const { return {histories.data(), lanes}; }
+  // --tile selects the prefill tile as well as the verify tile.
+  PrefillAttentionConfig prefillConfig() const {
+    PrefillAttentionConfig config;
+    config.tile = verify.tile;
+    return config;
+  }
   void size(Tensor tensor, uint64_t value) { sizes[tensorIndex(tensor)] = value; }
 };
 
@@ -85,7 +92,7 @@ Plan makePlan(AttentionShape shape, bool prefill, uint32_t lanes, uint32_t histo
   AttentionWorkspace scratch;
   if (prefill) {
     scratch = PagedAttention::prefillPlan(plan.rows, shape.queryHeads, plan.layout(),
-                                          history, PrefillAttentionConfig{})
+                                          history, plan.prefillConfig())
                   .workspace;
   } else {
     scratch = PagedAttention::verifyPlan(plan.lanes, shape.queryHeads, plan.layout(),
@@ -154,7 +161,7 @@ public:
     if (plan_.prefill) {
       const auto attentionPlan = PagedAttention::prefillPlan(
           plan_.rows, plan_.shape.queryHeads, plan_.layout(), plan_.histories[0],
-          PrefillAttentionConfig{});
+          plan_.prefillConfig());
       PagedAttention::addPrefillStore(result, layer_, get(Tensor::ChunkKeys),
                                       get(Tensor::ChunkValues), tables_[0], stores_[0],
                                       plan_.layout());
@@ -372,7 +379,8 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
-                   "[--compare-metallib PATH] [--kv-format int8|bf16]\n";
+                   "[--compare-metallib PATH] [--kv-format int8|bf16] "
+                   "[--tile mpp|register]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -380,6 +388,7 @@ int main(int argc, const char *argv[]) {
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
     kv::Format format = kv::Format::Int8;
+    VerifyAttentionConfig verifyConfig;
     std::string comparisonLibrary, phases = "both";
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
@@ -399,6 +408,13 @@ int main(int argc, const char *argv[]) {
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
       }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--tile") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "mpp" && value != "register")
+          throw std::invalid_argument("--tile takes mpp or register");
+        verifyConfig.tile = value == "register" ? AttentionTile::Register
+                                                : AttentionTile::Mpp;
+      }
       else if (option == "--phases") {
         phases = argv[index + 1];
         if (phases != "both" && phases != "verify" && phases != "prefill")
@@ -439,7 +455,7 @@ int main(int argc, const char *argv[]) {
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension << ")\n";
       for (uint32_t history : histories) {
         auto report = [&](bool prefill, uint32_t lane) {
-          const auto cases = measure(backends, makePlan(geometry, prefill, lane, history), repeat);
+          const auto cases = measure(backends, makePlan(geometry, prefill, lane, history, verifyConfig), repeat);
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")
                       << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i);

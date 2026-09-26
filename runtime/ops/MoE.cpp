@@ -126,6 +126,14 @@ struct ExpertPasses final {
 };
 
 ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
+  // Four simdgroups: gate/up 16 and down 32 columns each, arranged 2 x 2
+  // over the 32-row tile and 4 x 1 over the 8-row tile.
+  if (config.kernel == MoeExpertKernel::Register)
+    return config.expertTile == MoeExpertTile::M32
+               ? ExpertPasses{"moe_expert_gate_up_q4_mma_m32",
+                              "moe_expert_down_q4_mma_m32", 32, 64, 128}
+               : ExpertPasses{"moe_expert_gate_up_q4_mma_m8",
+                              "moe_expert_down_q4_mma_m8", 64, 128, 128};
   if (config.expertTile == MoeExpertTile::M32)
     return {"moe_expert_gate_up_q4_m32", "moe_expert_down_q4_m32", 128, 128,
             metal::CommandGraph::kDefaultThreads};
@@ -248,7 +256,8 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  MoePhase phase)
     : shape_(shape), rows_(rows), config_(config),
       splitExperts_(shape.weightLayout == WeightLayout::Block32 ||
-                    (phase == MoePhase::Prefill && config.expertTile == MoeExpertTile::M32)) {
+                    (phase == MoePhase::Prefill && config.expertTile == MoeExpertTile::M32 &&
+                     config.kernel == MoeExpertKernel::Mpp)) {
   // Affine plans have 8- and 32-row kernels in both phases, GGUF plans 8-row
   // kernels in both phases and 32-row prefill kernels.
   const bool gguf = shape.weightLayout == WeightLayout::Block32;
@@ -258,6 +267,9 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
       config.m8Simdgroups != MoeExpertSimdgroups::Four)
     throw std::invalid_argument("invalid MoE expert simdgroup configuration");
+  if ((config.kernel != MoeExpertKernel::Mpp && config.kernel != MoeExpertKernel::Register) ||
+      (config.kernel == MoeExpertKernel::Register && gguf))
+    throw std::invalid_argument("invalid MoE expert kernel configuration");
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the register expert tile takes block 8-row tiles");

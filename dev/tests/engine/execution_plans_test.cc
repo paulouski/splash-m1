@@ -168,16 +168,20 @@ void baselinePlans() {
 // choice is the device's: candidates carry it and installed tables cannot
 // override it.
 void moeDeviceTiles() {
-  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+  for (uint32_t family : {0U, 7U, 8U, 9U, 10U, 11U}) {
     const auto expected = family == 9 ? MoeExpertSimdgroups::Four
                                       : MoeExpertSimdgroups::Eight;
+    // Apple7/8 run the register affine expert tiles in both phases (as does
+    // an unknown family, which startup refuses).
+    const auto kernel = family < 9 ? MoeExpertKernel::Register : MoeExpertKernel::Mpp;
     require(moeDecodeSimdgroups(family) == expected,
             "decode expert simdgroups are not gated on GPU family 9");
     ExecutionPlans plans(device(family));
     for (auto shape : moeShapes) {
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const MoeWorkload workload{shape, lanes * 8, MoePhase::Decode};
-        require(plans.moeDecode(shape, lanes).configuration().m8Simdgroups == expected,
+        require(plans.moeDecode(shape, lanes).configuration().m8Simdgroups == expected &&
+                    plans.moeDecode(shape, lanes).configuration().kernel == kernel,
                 "MoE decode plan departed from the device tile policy");
         for (const auto &candidate : plans.moeCandidates(workload)) {
           require(candidate.configuration().m8Simdgroups == expected,
@@ -194,11 +198,61 @@ void moeDeviceTiles() {
       }
       for (uint32_t rows : {1U, 8U, 17U, 2048U}) {
         require(plans.moePrefill(shape, rows).configuration().m8Simdgroups ==
-                    MoeExpertSimdgroups::Eight,
+                        MoeExpertSimdgroups::Eight &&
+                    plans.moePrefill(shape, rows).configuration().kernel == kernel,
                 "MoE prefill plan left the shipped expert tile");
         for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
           require(candidate.configuration().m8Simdgroups == MoeExpertSimdgroups::Eight,
                   "MoE prefill candidate left the shipped expert tile");
+      }
+    }
+  }
+}
+
+// Apple7/8 prefill and verify attention run the register tile over INT8 KV whatever
+// split configuration is installed; BF16 KV and newer families keep MPP.
+void attentionDeviceTiles() {
+  for (uint32_t family : {7U, 8U, 9U, 10U}) {
+    const auto expected = family < 9 ? AttentionTile::Register
+                                     : AttentionTile::Mpp;
+    ExecutionPlans plans(device(family));
+    for (auto shape : attentionShapes) {
+      const std::array<uint32_t, 4> histories{31, 2048, 131072, 0};
+      for (auto config : PagedAttention::verifyCandidates()) {
+        OperatorChoices choices;
+        choices.verifyAttention.push_back({{shape, 3}, config});
+        plans.install(choices);
+        const auto selected =
+            plans.verifyAttention(3, shape.queryHeads, layout(shape), histories);
+        auto resolved = config;
+        resolved.tile = expected;
+        require(selected.configuration == resolved,
+                "verify plan departed from the device attention tile");
+        require(selected.sameExecutionAs(PagedAttention::verifyPlan(
+                    3, shape.queryHeads, layout(shape), histories, resolved)),
+                "device verify tile changed the installed split partition");
+        const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
+        require(plans.verifyAttention(3, shape.queryHeads, bf16, histories)
+                        .configuration.tile == AttentionTile::Mpp,
+                "BF16 KV left the MPP verify tile");
+      }
+      for (auto config : PagedAttention::prefillCandidates()) {
+        OperatorChoices choices;
+        choices.prefillAttention.push_back({{shape, 2048}, config});
+        plans.install(choices);
+        const auto selected =
+            plans.prefillAttention(2048, shape.queryHeads, layout(shape), 131072);
+        auto resolved = config;
+        resolved.tile = expected;
+        require(selected.configuration == resolved,
+                "prefill plan departed from the device attention tile");
+        require(selected.sameExecutionAs(PagedAttention::prefillPlan(
+                    2048, shape.queryHeads, layout(shape), 131072, resolved)),
+                "device prefill tile changed the installed split partition");
+        const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
+        require(plans.prefillAttention(2048, shape.queryHeads, bf16, 131072)
+                        .configuration.tile == AttentionTile::Mpp,
+                "BF16 KV left the MPP prefill tile");
       }
     }
   }
@@ -601,6 +655,7 @@ int main() {
   try {
     baselinePlans();
     moeDeviceTiles();
+    attentionDeviceTiles();
     ggufMoePlans();
     allCandidates();
     policyKeysAndBounds();

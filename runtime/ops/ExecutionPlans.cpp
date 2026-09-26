@@ -75,7 +75,15 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
       moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      appleGpuFamily_(device.appleGpuFamily) {}
+      appleGpuFamily_(device.appleGpuFamily),
+      // Apple7/8 have no bfloat arithmetic; their prefill and verify attention
+      // use the register tile whatever split configuration was measured or
+      // installed.
+      attentionTile_(device.appleGpuFamily < 9 ? AttentionTile::Register
+                                            : AttentionTile::Mpp),
+      // Apple7/8 run the register affine expert tiles in both phases.
+      moeExpertKernel_(device.appleGpuFamily < 9 ? MoeExpertKernel::Register
+                                                 : MoeExpertKernel::Mpp) {}
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
@@ -120,19 +128,20 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t historyTokens) const {
   validateHistory(historyTokens, rows);
   const PrefillAttentionPolicy workload{attentionShape(queryHeads, layout), rows};
-  return PagedAttention::prefillPlan(
-      rows, queryHeads, layout, historyTokens,
-      chosenConfiguration(choices_.prefillAttention, workload,
-                       PrefillAttentionConfig{}));
+  PrefillAttentionConfig config =
+      chosenConfiguration(choices_.prefillAttention, workload, PrefillAttentionConfig{});
+  config.tile = attentionTile_;
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, historyTokens, config);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens) const {
   const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
-  return PagedAttention::verifyPlan(
-      lanes, queryHeads, layout, historyTokens,
-      chosenConfiguration(choices_.verifyAttention, workload, VerifyAttentionConfig{}));
+  VerifyAttentionConfig config =
+      chosenConfiguration(choices_.verifyAttention, workload, VerifyAttentionConfig{});
+  config.tile = attentionTile_;
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, config);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
@@ -153,6 +162,7 @@ MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) c
   // The four-simdgroup 8-row tiles are measured at decode occupancy only; a
   // prefill chunk's much larger expert grid keeps the shipped tile.
   config.m8Simdgroups = prefill ? MoeExpertSimdgroups::Eight : moeDecodeSimdgroups_;
+  if (shape.weightLayout == WeightLayout::Affine64) config.kernel = moeExpertKernel_;
   if (shape.weightLayout == WeightLayout::Block32) {
     const MoeGgufTile tile = moeGgufTile(appleGpuFamily_, shape);
     config.expertTile = prefill ? moeGgufPrefillTile(shape, workload.rows, tile) : MoeExpertTile::M8;

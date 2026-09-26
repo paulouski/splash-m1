@@ -97,8 +97,14 @@ void requireScalePlacement(AttentionScalePlacement placement) {
     throw std::invalid_argument("invalid attention scale placement");
 }
 
+void requireTile(AttentionTile tile) {
+  if (tile != AttentionTile::Mpp && tile != AttentionTile::Register)
+    throw std::invalid_argument("invalid attention tile");
+}
+
 uint32_t prefillSplits(uint32_t tiles, PrefillAttentionConfig configuration) {
   requireScalePlacement(configuration.scalePlacement);
+  requireTile(configuration.tile);
   switch (configuration.splitMultiplier) {
   case PrefillSplitMultiplier::One:
   case PrefillSplitMultiplier::Two:
@@ -114,6 +120,7 @@ uint32_t prefillSplits(uint32_t tiles, PrefillAttentionConfig configuration) {
 
 uint32_t verifySplits(VerifyAttentionConfig configuration) {
   requireScalePlacement(configuration.scalePlacement);
+  requireTile(configuration.tile);
   switch (configuration.splitCount) {
   case VerifySplitCount::One:
   case VerifySplitCount::Eight:
@@ -124,8 +131,22 @@ uint32_t verifySplits(VerifyAttentionConfig configuration) {
   throw std::invalid_argument("invalid verify attention configuration");
 }
 
+// BF16 KV keeps the MPP tile; plans record the tile they resolved.
+AttentionTile resolvedTile(kv::Format format, AttentionTile tile) noexcept {
+  return format == kv::Format::Int8 ? tile : AttentionTile::Mpp;
+}
+
+// The register tile runs one simdgroup per eight fused rows of the GQA group.
+uint64_t splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout) noexcept {
+  return tile == AttentionTile::Register ? uint64_t{32} * (queryHeads / layout.kvHeads)
+                                         : metal::CommandGraph::kDefaultThreads;
+}
+
 std::string_view verifySplitPipeline(KernelLayout layout,
                                      VerifyAttentionConfig configuration) noexcept {
+  if (configuration.tile == AttentionTile::Register)
+    return pipeline(layout, "verify_attention_q8_split_sgf",
+                    "verify_attention_q8_split_sgf_kv2_g8");
   const bool cooperative =
       configuration.scalePlacement == AttentionScalePlacement::Cooperative;
   return pipeline(layout,
@@ -143,7 +164,8 @@ bool PrefillAttentionPlan::sameExecutionAs(const PrefillAttentionPlan &other) co
       workspace.partialsBytes == other.workspace.partialsBytes &&
       workspace.statisticsBytes == other.workspace.statisticsBytes &&
       splitPipeline == other.splitPipeline && reducePipeline == other.reducePipeline &&
-      sameGrid(splitGroups, other.splitGroups) && sameGrid(reduceGroups, other.reduceGroups);
+      sameGrid(splitGroups, other.splitGroups) && sameGrid(splitThreads, other.splitThreads) &&
+      sameGrid(reduceGroups, other.reduceGroups);
 }
 
 bool VerifyAttentionPlan::sameExecutionAs(const VerifyAttentionPlan &other) const noexcept {
@@ -151,7 +173,8 @@ bool VerifyAttentionPlan::sameExecutionAs(const VerifyAttentionPlan &other) cons
       workspace.partialsBytes == other.workspace.partialsBytes &&
       workspace.statisticsBytes == other.workspace.statisticsBytes &&
       splitPipeline == other.splitPipeline && reducePipeline == other.reducePipeline &&
-      sameGrid(splitGroups, other.splitGroups) && sameGrid(reduceGroups, other.reduceGroups) &&
+      sameGrid(splitGroups, other.splitGroups) && sameGrid(splitThreads, other.splitThreads) &&
+      sameGrid(reduceGroups, other.reduceGroups) &&
       storePipeline_ == other.storePipeline_ && sameGrid(storeGroups_, other.storeGroups_) &&
       sameGrid(storeThreads_, other.storeThreads_);
 }
@@ -193,6 +216,7 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
     throw std::invalid_argument("prefill attention history exceeds physical context");
   const uint32_t tiles = kv::prefillAttentionTiles(rows);
   const uint32_t splits = prefillSplits(tiles, configuration);
+  configuration.tile = resolvedTile(layout.format, configuration.tile);
   const uint32_t fusedRows =
       kv::kQ8PrefillAttentionTileRows * (queryHeads / layout.kvHeads);
   const bool cooperative = configuration.scalePlacement == AttentionScalePlacement::Cooperative;
@@ -202,6 +226,9 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
                          "prefill_attention_bf16_split_kv2_g8")
+          : configuration.tile == AttentionTile::Register
+              ? pipeline(kernel, "prefill_attention_q8_split_sgf",
+                         "prefill_attention_q8_split_sgf_kv2_g8")
               : pipeline(kernel,
                    cooperative ? "prefill_attention_q8_split_cooperative_scale"
                                : "prefill_attention_q8_split",
@@ -209,7 +236,9 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                                : "prefill_attention_q8_split_kv2_g8"),
           pipeline(kernel, "prefill_attention_q8_reduce",
                    "prefill_attention_q8_reduce_kv2_g8"),
-          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout.format};
+          {layout.kvHeads, tiles, splits},
+          {splitThreads(configuration.tile, queryHeads, layout), 1, 1},
+          {layout.kvHeads, fusedRows, tiles}, layout.format};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
@@ -223,6 +252,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
       historyTokens.size() != SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid verify attention history vector");
   const uint32_t base = verifySplits(configuration);
+  configuration.tile = resolvedTile(layout.format, configuration.tile);
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits{};
   uint32_t splits = 0;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
@@ -243,6 +273,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           pipeline(kernel, "verify_attention_q8_reduce",
                    "verify_attention_q8_reduce_kv2_g8"),
           {layout.kvHeads, splits, lanes},
+          {splitThreads(configuration.tile, queryHeads, layout), 1, 1},
           {layout.kvHeads,
            kv::kQ8VerifyMaximumRows * (queryHeads / layout.kvHeads), lanes},
           layout.format == kv::Format::BFloat16
@@ -430,7 +461,7 @@ void PagedAttention::addPrefill(
   auto buffers = kvBuffers(layer, plan.format, {queries},
                            std::array{partials, statistics, pageTable});
   graph.add(std::string(plan.splitPipeline), std::move(buffers),
-            params, plan.splitGroups);
+            params, plan.splitGroups, plan.splitThreads);
   graph.add(std::string(plan.reducePipeline),
             {std::move(partials), std::move(statistics), std::move(output)},
             params, plan.reduceGroups);
@@ -490,7 +521,7 @@ void PagedAttention::addVerify(
       buffers.pageTables[0], buffers.pageTables[1], buffers.pageTables[2], buffers.pageTables[3]};
   auto attentionBuffers = kvBuffers(layer, plan.format, {buffers.queries}, tail);
   graph.add(std::string(plan.splitPipeline), std::move(attentionBuffers),
-            attention, plan.splitGroups);
+            attention, plan.splitGroups, plan.splitThreads);
   graph.add(std::string(plan.reducePipeline),
             {buffers.partials, buffers.statistics, buffers.output},
             attention, plan.reduceGroups);
