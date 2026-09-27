@@ -1,3 +1,22 @@
+> **Unofficial fork: Splash on M1/M2 Macs.**
+> Splash is built by [Inco](https://github.com/incoai/splash): the engine, the models and the draft
+> models are theirs. This fork only adds support for Apple7/8 GPUs (M1, M2), which upstream Splash
+> does not run on: a kernel policy for those GPUs and Metal kernels written for them.
+> This is a community port, not an official Inco release.
+>
+> - **M1/M2:** prebuilt releases on [the releases page](https://github.com/paperniuk/splash/releases);
+>   source in branch [`apple7-m1-kernels-1.1`](https://github.com/paperniuk/splash/tree/apple7-m1-kernels-1.1)
+>   (upstream 1.1.0 plus the M1/M2 commits).
+> - **On M1/M2 this build runs** Splash packages and the GGUF files upstream 1.1 loads, including
+>   Prism ML's Ternary Bonsai (`PQ2_0`), on its own GGUF kernels. MLX affine 4-bit checkpoints
+>   are repacked into the packages' format and run on the same kernels. The vision encoder has
+>   its own M1/M2 kernels too.
+> - **M3 and newer:** use official Splash, `brew install incoai/tap/splash`.
+> - **M1/M2 problems:** open an issue here, not upstream.
+>
+> If this port is useful to you, a star here helps, and please star
+> [the original Splash](https://github.com/incoai/splash) too: all of this is built on their work.
+
 # Splash
 
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
