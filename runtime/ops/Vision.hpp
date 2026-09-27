@@ -137,7 +137,9 @@ private:
   [[nodiscard]] const metal::MetalBuffer &scratch(Scratch tensor) const noexcept {
     return scratch_[static_cast<uint32_t>(tensor)];
   }
-  void addGemm(metal::CommandGraph &graph, const char *pipeline,
+  // tile names the GEMM variant ("m64n128_residual"): vision_gemm_<tile>, or
+  // vision_gemm_mma_<tile> on Apple7/8.
+  void addGemm(metal::CommandGraph &graph, const char *tile,
                const metal::MetalBuffer &input,
                const VisionAffine &weights,
                const metal::MetalBuffer &output,
@@ -150,6 +152,9 @@ private:
 
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
+  // Apple7/8 (M1/M2) run the simdgroup MMA kernels of vision_mma.metal: their
+  // MPP matmul2d runs far below the MMA rate.
+  bool mma_ = false;
   metal::MetalBuffer arena_;
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
 };

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace splash::ops {
 namespace {
@@ -105,7 +106,8 @@ uint32_t Vision::embeddingRows(ImageGrid grid) noexcept {
 
 Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
                uint32_t maximumPatches)
-    : model_(model), maximumPatches_(maximumPatches) {
+    : model_(model), maximumPatches_(maximumPatches),
+      mma_(backend.capabilities().appleGpuFamily < 9) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
   arena_ = backend.allocateBuffer(total, metal::BufferStorage::Shared,
                                   "vision-scratch");
@@ -122,12 +124,13 @@ Vision::Vision(metal::MetalBackend &backend, const VisionWeights &model,
     throw std::logic_error("vision scratch arena mismatch");
 }
 
-void Vision::addGemm(CommandGraph &graph, const char *pipeline,
+void Vision::addGemm(CommandGraph &graph, const char *tile,
                      const MetalBuffer &input, const VisionAffine &weights,
                      const MetalBuffer &output, const MetalBuffer &residual,
                      uint32_t outputSize, uint32_t inputSize, uint32_t rows,
                      uint32_t tileRows, uint32_t tileColumns) const {
-  graph.add(pipeline, {input, weights.weight, weights.bias, output, residual},
+  graph.add(std::string(mma_ ? "vision_gemm_mma_" : "vision_gemm_") + tile,
+            {input, weights.weight, weights.bias, output, residual},
             VisionGemmParams{outputSize, inputSize},
             {(rows + tileRows - 1) / tileRows, outputSize / tileColumns, 1});
 }
@@ -173,14 +176,14 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
             {model_.positionTable, scratch(Scratch::Positions),
              scratch(Scratch::RopeCos), scratch(Scratch::RopeSin)},
             gridParams, {tokens, 1, 1});
-  addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Patches),
+  addGemm(graph, "m64n128_residual", scratch(Scratch::Patches),
           model_.patchEmbedding, hidden, scratch(Scratch::Positions),
           layout.hiddenSize, layout.patchDimension, tokens, kGemmRowTile,
           kGemmColumnTile);
 
   for (const VisionBlock &block : model_.blocks) {
     addNorm(graph, hidden, block.norm1, normalized, tokens);
-    addGemm(graph, "vision_gemm_m64n128", normalized, block.qkv, qkv, hidden,
+    addGemm(graph, "m64n128", normalized, block.qkv, qkv, hidden,
             3 * layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,
             kGemmColumnTile);
     // Padded key tokens are zeroed by the prepare pass so every 128-key tile
@@ -190,22 +193,22 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
                scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values)},
               qkvParams, {padded, 1, 1});
-    graph.add("vision_attention",
+    graph.add(mma_ ? "vision_attention_mma" : "vision_attention",
               {scratch(Scratch::Queries), scratch(Scratch::Keys),
                scratch(Scratch::Values), scratch(Scratch::Attention)},
               attentionParams,
               {(tokens + kQueryTile - 1) / kQueryTile, layout.heads, 1});
     graph.add("vision_attention_pack", {scratch(Scratch::Attention), context},
               qkvParams, {tokens, 1, 1});
-    addGemm(graph, "vision_gemm_m64n128_residual", context, block.projection, hidden,
+    addGemm(graph, "m64n128_residual", context, block.projection, hidden,
             hidden, layout.hiddenSize, layout.hiddenSize, tokens, kGemmRowTile,
             kGemmColumnTile);
     addNorm(graph, hidden, block.norm2, normalized, tokens);
-    addGemm(graph, "vision_gemm_m64n128_gelu_tanh", normalized, block.upProjection,
+    addGemm(graph, "m64n128_gelu_tanh", normalized, block.upProjection,
             scratch(Scratch::Intermediate), hidden,
             layout.paddedIntermediateSize, layout.hiddenSize, tokens,
             kGemmRowTile, kGemmColumnTile);
-    addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Intermediate),
+    addGemm(graph, "m64n128_residual", scratch(Scratch::Intermediate),
             block.downProjection, hidden, hidden, layout.hiddenSize,
             layout.paddedIntermediateSize, tokens, kGemmRowTile,
             kGemmColumnTile);
@@ -214,11 +217,11 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   // The merger reads the normalized rows as (merged, 4608): four consecutive
   // block-major patches form one merged token.
   addNorm(graph, hidden, model_.mergerNorm, normalized, tokens);
-  addGemm(graph, "vision_gemm_m32n256_gelu_erf", normalized,
+  addGemm(graph, "m32n256_gelu_erf", normalized,
           model_.mergerUpProjection,
           qkv, hidden, layout.mergedHiddenSize, layout.mergedHiddenSize, merged,
           kMergerRowTile, kMergerColumnTile);
-  addGemm(graph, "vision_gemm_m32n256", qkv, model_.mergerDownProjection,
+  addGemm(graph, "m32n256", qkv, model_.mergerDownProjection,
           embeddings,
           hidden, layout.outputHiddenSize, layout.mergedHiddenSize, merged,
           kMergerRowTile, kMergerColumnTile);
