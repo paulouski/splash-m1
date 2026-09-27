@@ -201,8 +201,12 @@ WeightFile::WeightFile(metal::MetalBackend &backend,
         impl_->mapping->address(), impl_->bytes, impl_->mapping,
         impl_->record.relativePath);
     // The weights outlive this loader: the base stays resident until its last
-    // view is gone.
-    backend.keepResident(impl_->base);
+    // view is gone. Apple7/8 (M1/M2) leave these file-backed buffers out of the
+    // residency set: on an M1 Max, wiring the 27B's weights there fails the
+    // first prefill command with kIOGPUCommandBufferCallbackErrorOutOfMemory,
+    // or hangs it, with most of memory free. Commands still make them
+    // resident while they run, as in 1.0.2.
+    if (backend.capabilities().appleGpuFamily >= 9) backend.keepResident(impl_->base);
 }
 
 WeightFile::WeightFile(WeightFile &&) noexcept = default;
