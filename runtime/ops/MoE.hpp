@@ -216,13 +216,17 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
 // numerics; against the staged 32-row tiles, on the 35B's real routes on the
 // 40-core M3 Max (ms per layer), it is faster at 512 rows (3.52 vs 3.72) and
 // slower at 2048 (12.6-13.1 vs 11.0-11.7).
-enum class MoeGgufTile : uint8_t { Staged, Register };
+// Mma: the staged tiles' grid and rows on Apple7/8's simdgroup MMA kernels
+// (kernels/shared/moe_gguf_mma.metal), whose MPP matmul2d runs far below the
+// MMA rate.
+enum class MoeGgufTile : uint8_t { Staged, Register, Mma };
 
 // Apple9 stages experts mostly in a format apple9StagesFormat names: one
 // 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
 [[nodiscard]] inline MoeGgufTile moeGgufTile(uint32_t appleGpuFamily, MoeShape shape) noexcept {
+  if (appleGpuFamily < 9) return MoeGgufTile::Mma;
   return appleGpuFamily == 9 && !apple9StagesFormat(shape.expertFormat) ? MoeGgufTile::Register
                                                                          : MoeGgufTile::Staged;
 }

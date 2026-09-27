@@ -977,7 +977,7 @@ void ggufPlans() {
           "GGUF decode scratch bound");
   // Float projections take the neural accelerator tile from three of its
   // 64 x 32 tiles per two cores: on 16 cores the 35B router (N 256) from 129
-  // rows, alpha/beta (N 64) from 705; never on Apple9 or below 16 rows.
+  // rows, alpha/beta (N 64) from 705; never below Apple10 or 16 rows.
   const Linear oneCore = gpu(10, 1);
   require(linear.ggufFloatTile(32, 256) == FloatTile::Simdgroup && linear.ggufFloatTile(128, 256) == FloatTile::Simdgroup &&
               linear.ggufFloatTile(129, 256) == FloatTile::NeuralAccelerator &&
@@ -985,7 +985,9 @@ void ggufPlans() {
               linear.ggufFloatTile(704, 64) == FloatTile::Simdgroup &&
               linear.ggufFloatTile(705, 64) == FloatTile::NeuralAccelerator &&
               oneCore.ggufFloatTile(15, 256) == FloatTile::Simdgroup &&
-              oneCore.ggufFloatTile(16, 256) == FloatTile::NeuralAccelerator,
+              oneCore.ggufFloatTile(16, 256) == FloatTile::NeuralAccelerator &&
+              gpu(7, 32).ggufFloatTile(2048, 256) == FloatTile::Simdgroup &&
+              gpu(9, 40).ggufFloatTile(2048, 256) == FloatTile::Simdgroup,
           "GGUF float tile rule");
 
   // Apple9 decodes every GGUF width with the exact register tile, all lanes

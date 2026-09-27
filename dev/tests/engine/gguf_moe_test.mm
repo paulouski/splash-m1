@@ -189,6 +189,8 @@ int floatProjection(MetalBackend &backend) {
       const Tensor w = floating(backend, N, K, 0.05f);
       for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
         const bool accelerator = tile == FloatTile::NeuralAccelerator;
+        // Apple7/8 never plan the accelerator tile (Linear::ggufFloatTile).
+        if (accelerator && backend.capabilities().appleGpuFamily < 9) continue;
         double worst = 0, sum = 0;
         size_t outputs = 0;
         int tileFailures = 0;
@@ -577,21 +579,31 @@ int moe(MetalBackend &backend) {
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
   const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, WeightLayout::Block32};
+  // Apple7/8 run the staged plans on their MMA kernels (MoeGgufTile::Mma), and neither the Apple9 register tile nor
+  // the neural accelerator router, whose MPP matmuls run far below their MMA rate.
+  const bool mma = backend.capabilities().appleGpuFamily < 9;
+  const std::vector<MoeGgufTile> tiles = mma ? std::vector<MoeGgufTile>{MoeGgufTile::Mma}
+                                             : std::vector<MoeGgufTile>{MoeGgufTile::Staged, MoeGgufTile::Register};
+  const std::vector<FloatTile> routers = mma ? std::vector<FloatTile>{FloatTile::Simdgroup}
+                                             : std::vector<FloatTile>{FloatTile::Simdgroup, FloatTile::NeuralAccelerator};
+  const auto tileName = [](MoeGgufTile tile) {
+    return tile == MoeGgufTile::Register ? "register" : tile == MoeGgufTile::Mma ? "mma     " : "staged  ";
+  };
   for (int f = 0; f < FMT_COUNT; ++f) {
     const Model m = makeModel(backend, f);
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
     std::string formats;
     for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
-    for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register}) {
+    for (const MoeGgufTile tile : tiles) {
       const int before = failures;
       Stats stats;
       std::vector<uint16_t> widest;
       for (uint32_t lanes = 4; lanes >= 1; --lanes) {
         const MoePlan plan = MoE::decodePlan(
             shape, lanes, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
-        const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
+        const std::string label = formats + " " + tileName(tile) + " decode B" +
                                   std::to_string(lanes);
-        const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
+        const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile != MoeGgufTile::Register, products, stats, label);
         // A row's result depends on its own routes only, not on the lanes it
         // is batched with (the tile rows of one expert are independent).
         if (widest.empty()) widest = rows;
@@ -604,9 +616,9 @@ int moe(MetalBackend &backend) {
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
         const MoePlan plan = MoE::prefillPlan(
             shape, chunk, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
-        const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " prefill rows=" +
+        const std::string label = formats + " " + tileName(tile) + " prefill rows=" +
                                   std::to_string(chunk);
-        const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
+        const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile != MoeGgufTile::Register, products, stats, label);
         if (!std::equal(rows.begin(), rows.begin() + std::min(rows.size(), widest.size()), widest.begin())) {
           printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
           ++failures;
@@ -614,7 +626,7 @@ int moe(MetalBackend &backend) {
       }
       printf("%-20s %s decode B1-4, prefill 263/27/9: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
              "errors at most %.1e/%.1e of sum|x w| %s\n",
-             formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
+             formats.c_str(), tileName(tile),
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
              stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
     }
@@ -622,13 +634,14 @@ int moe(MetalBackend &backend) {
     // with the router on each float tile: a row's result is the same in every
     // chunk on one tile (either tile's scores of a row depend on that row
     // alone).
-    for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+    for (const FloatTile router : routers) {
       const int before = failures;
       Stats stats;
       std::vector<uint16_t> widest;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
         MoeConfig config{MoeExpertTile::M32};
         config.ggufRouterTile = router;
+        if (mma) config.ggufTile = MoeGgufTile::Mma;
         const MoePlan plan = MoE::prefillPlan(shape, rows, config);
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
@@ -639,9 +652,9 @@ int moe(MetalBackend &backend) {
           ++failures;
         }
       }
-      printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
+      printf("%-20s %s prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
              "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
-             formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
+             formats.c_str(), tileName(mma ? MoeGgufTile::Mma : MoeGgufTile::Staged), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
              stats.downWorst, failures > before ? "FAIL" : "ok");
     }

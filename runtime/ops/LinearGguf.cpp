@@ -26,11 +26,19 @@ constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::
 // the 32-row tile over four lanes of storage.
 constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
 
-std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
-  return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
+// Apple7/8 run the staged tiles' dispatches on simdgroup MMA kernels (kernels/shared/gguf_linear_mma.metal): their
+// MPP matmul2d runs far below that rate there.
+bool mmaTiles(uint32_t appleGpuFamily) noexcept { return appleGpuFamily < 9; }
+// Rows of the prefill tiles: the MMA kernels' 64-row tiles divide the staged tiles' storage.
+constexpr uint32_t kMmaPrefillRows = 64;
+constexpr uint32_t kMmaPrefillThreads = 128;
+static_assert(GGUF_PREFILL_ROWS % kMmaPrefillRows == 0);
+
+std::string decodeKernel(const char *format, uint32_t rows, char epilogue, bool mma) {
+  return std::string(mma ? "gguf_decode_mma_" : "gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
 }
-std::string prefillKernel(const char *format, char epilogue) {
-  return std::string("gguf_prefill_") + format + "_" + epilogue;
+std::string prefillKernel(const char *format, char epilogue, bool mma) {
+  return std::string(mma ? "gguf_prefill_mma_" : "gguf_prefill_") + format + "_" + epilogue;
 }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
@@ -77,6 +85,14 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 // per core with 1024 inputs and unsplit fused and gate/up kernels: 6.4%).
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
+// Apple7/8's MMA kernels (one tier): their partitions stay latency-bound
+// longer, so a core takes four times as many threadgroups. On a 32-core M1 Max
+// at one lane (ms, the policy's split against {6, 512}'s): Q4_K 5120 x 17408
+// S8 0.369 against S4 0.433, 17408 x 5120 S4 0.331 against S1 0.353, Q5_K
+// 12288 x 5120 S4 0.264 against S1 0.302, Q4_K 5120 x 6144 S8 0.151 against
+// S4 0.164; at four lanes within 5% of either.
+constexpr SplitTier kMmaTiers[] = {{24, 512}};
+
 // The staged tile's tiers on a family. Apple9 cores take as many of its
 // threadgroups as of the register tile's, and its tiers: on a 40-core M3 Max
 // over the 27B and 35B dense shapes at one to four lanes they come within
@@ -85,6 +101,7 @@ constexpr SplitTier kStagedTiers[] = {{6, 512}};
 // 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
 std::span<const SplitTier> stagedTiers(uint32_t appleGpuFamily) noexcept {
   if (appleGpuFamily == 9) return kRegisterTiers;
+  if (mmaTiles(appleGpuFamily)) return kMmaTiers;
   return kStagedTiers;
 }
 
@@ -337,13 +354,15 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     // budget-sized prefill buffers, and the simdgroups of a tile that only
     // hold them skip their matmuls.
     const char epilogue = epilogueSuffix(w.epilogue);
+    const bool mma = mmaTiles(appleGpuFamily_);
+    const uint32_t tileRows = mma ? kMmaPrefillRows : GGUF_PREFILL_ROWS;
     for (const QuantizedSegment &s : segments) {
       std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
       if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
-      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings),
+      graph.add(prefillKernel(s.name(), epilogue, mma), std::move(bindings),
                 GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
-                {plan.storageRows() / GGUF_PREFILL_ROWS, s.outputSize / GGUF_TILE_COLUMNS, 1},
-                {GGUF_PREFILL_THREADS, 1, 1});
+                {plan.storageRows() / tileRows, s.outputSize / GGUF_TILE_COLUMNS, 1},
+                {mma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS, 1, 1});
     }
   }
   if (stats && w.phase == LinearPhase::Decode) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
@@ -368,7 +387,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
+    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue, mmaTiles(appleGpuFamily_)), plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
               {GGUF_STAGED_THREADS, 1, 1});
@@ -396,7 +415,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   std::vector<metal::MetalBuffer> bindings{b.input};
   const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
   bindings.insert(bindings.end(), {b.output, partials, counters});
-  graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
+  graph.add(std::string(mmaTiles(appleGpuFamily_) ? "gguf_decode_mma_fused_m" : "gguf_decode_fused_m") +
+                std::to_string(rows), std::move(bindings), params,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
 }
 
@@ -447,7 +467,8 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 }
 
 // The neural accelerator tile needs one (Apple9's matrix operations share the
-// FP32 pipe, where three bf16 matmuls cost three fp32 ones) and a grid of its
+// FP32 pipe, where three bf16 matmuls cost three fp32 ones, and Apple7/8 run
+// its MPP matmul far below their simdgroup MMA rate) and a grid of its
 // 64-row by 32-column tiles of at least three threadgroups per two cores. A
 // tile runs K / 32 dependent steps (~50 us at the 35B's K = 2048), while the
 // fp32 kernel spreads fewer rows over 8-column tiles with 16 K partitions
@@ -459,7 +480,7 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // 0.81 -> 0.36 and 0.20 -> 0.083 on 16 cores.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
-  return appleGpuFamily_ != 9 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_ ? FloatTile::NeuralAccelerator
+  return appleGpuFamily_ >= 10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_ ? FloatTile::NeuralAccelerator
                                                                                      : FloatTile::Simdgroup;
 }
 

@@ -733,7 +733,10 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
-      for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
+      // Apple7/8 run the staged tiles' dispatches on their MMA kernels and never plan the Apple9 register tile.
+      std::vector<LinearTile> tiles{LinearTile::GgufStaged};
+      if (backend.capabilities().appleGpuFamily >= 9) tiles.insert(tiles.begin(), LinearTile::GgufRegister);
+      for (const LinearTile tile : tiles) {
         decodeTile(backend, linear, tile);
         fusedDecode(backend, linear, tile);
         gateUpPairs(backend, linear, tile);
@@ -744,7 +747,7 @@ int main(int argc, char **argv) {
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
       const SplitOperand gdn = splitOperand(backend, IQ4XS, {12288, 5120}, LinearEpilogue::None);
       const SplitOperand gateUp = splitOperand(backend, Q4K, {17408, 5120}, LinearEpilogue::GateUp);
-      for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
+      for (const LinearTile tile : tiles)
         for (const uint32_t lanes : {1u, kMaximumLanes}) {
           splitVisibility(backend, linear, tile, {&out, &down}, lanes);
           splitVisibility(backend, linear, tile, {&gdn, &gateUp}, lanes);

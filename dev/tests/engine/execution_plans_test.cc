@@ -265,9 +265,11 @@ void attentionDeviceTiles() {
 void ggufMoePlans() {
   MoeShape shape = routedShape;
   shape.weightLayout = WeightLayout::Block32;
-  for (uint32_t family : {0U, 9U, 10U, 11U}) {
+  for (uint32_t family : {0U, 7U, 9U, 10U, 11U}) {
     ExecutionPlans plans(device(family));
-    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
+    // Below Apple9 the staged tiles' plans run on the MMA kernels.
+    const MoeGgufTile stagedTile = family < 9 ? MoeGgufTile::Mma : MoeGgufTile::Staged;
+    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : stagedTile;
     require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
     // GGUF plans are not tuned: a table may not hold a choice for them.
     OperatorChoices choices;
@@ -294,22 +296,22 @@ void ggufMoePlans() {
     MoeShape staged = shape, q4k = shape;
     staged.expertFormat = GGUF_FMT_IQ2XS;
     q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(family, staged) == MoeGgufTile::Staged && moeGgufTile(family, q4k) == expected,
+    require(moeGgufTile(family, staged) == stagedTile && moeGgufTile(family, q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
-      require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
+      require(plan.configuration().ggufTile == stagedTile && plan.workspace().groupedSumsBytes == 0,
               "GGUF MoE plan of staged experts took the register tile");
       covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
     // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
     // routes average at most one row per expert (32 rows of 8 of 256
     // experts). The router's float tile follows Linear::ggufFloatTile (32
-    // assumed cores: the neural accelerator from 321 rows, never on Apple9).
+    // assumed cores: the neural accelerator from 321 rows, only from Apple10).
     for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 2048U}) {
       const MoePlan plan = plans.moePrefill(shape, rows);
       const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
-      const FloatTile router = family != 9 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
+      const FloatTile router = family >= 10 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
       require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
                   (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
                   plan.configuration().ggufRouterTile == router,

@@ -227,7 +227,10 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                      projection.routed.meta, projection.shared.plane0,
                      projection.shared.plane1Slot(), projection.shared.meta, output,
                      scratch.expertOutput});
-    const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+    const bool mma = plan.configuration().ggufTile == MoeGgufTile::Mma;
+    const std::string kernel = table16 ? "moe_expert_gguf_sg"
+                                       : (mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") +
+                                             std::to_string(plan.tileRows());
     graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
