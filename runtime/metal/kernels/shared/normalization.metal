@@ -151,7 +151,7 @@ inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *we
     output[row * vectors + column] = bfloat4((float4(stage[column]) * inverse) * float4(weight[column]));
 }
 #define NORM_RMS_STAGED(Name, WV) \
-  kernel void Name(device const bfloat4 *input [[buffer(0)]], \
+  [[max_total_threads_per_threadgroup(SPLASH_STAGED_NORM_THREADS)]] kernel void Name(device const bfloat4 *input [[buffer(0)]], \
       device const WV *weight [[buffer(1)]], device bfloat4 *output [[buffer(2)]], \
       constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
