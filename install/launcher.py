@@ -237,6 +237,8 @@ def serve(args):
         ]
         if args.kv_format != "int8":
             command.extend(("--kv-format", args.kv_format))
+        if args.prefill_mode != "bounded":
+            command.extend(("--prefill-mode", args.prefill_mode))
         for name in args.served_model_name:
             command.append(f"--served-model-name={name}")
         if args.default_reasoning_effort is not None:
@@ -511,6 +513,14 @@ def parse_args(argv=None):
         choices=("int8", "bf16"),
         default="int8",
         help="target KV cache storage (default: int8); bf16 uses more memory",
+    )
+    server.add_argument(
+        "--prefill-mode",
+        choices=("bounded", "full"),
+        default="bounded",
+        help="bounded (default) keeps each prefill GPU command within a few "
+        "seconds so macOS does not abort long-context prefill; full sends "
+        "whole 2048-token chunks as before",
     )
     server.add_argument(
         "--max-memory",

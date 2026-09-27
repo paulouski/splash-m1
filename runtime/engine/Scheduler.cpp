@@ -13,6 +13,12 @@ constexpr uint32_t kMaximumOvertakes =
     model::ExecutionLimits::maximumBatchWidth - 1;
 
 constexpr double kContendedPrefillMilliseconds = 500.0;
+// One prefill command runs as one GPU command buffer. On slower GPUs a full
+// budget over a long context takes a minute, and macOS aborts such a command
+// when it starves the display (ImpactingInteractivity). Isolated prefill keeps
+// each command within this bound; it is long enough that short contexts on
+// current GPUs keep the full budget.
+constexpr double kIsolatedPrefillMilliseconds = 5000.0;
 constexpr uint32_t kMinimumPrefillRows = 64;
 
 } // namespace
@@ -303,10 +309,17 @@ uint32_t Scheduler::prefillBudget(
   const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
-  uint32_t rows = maximum;
-  while (rows > kMinimumPrefillRows &&
-         rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
-    rows /= 2;
+  const auto boundedRows = [&](double milliseconds) {
+    uint32_t rows = maximum;
+    while (rows > kMinimumPrefillRows &&
+           rows * prefillMillisecondsPerToken_ > milliseconds)
+      rows /= 2;
+    return rows;
+  };
+  const uint32_t isolated = boundIsolatedPrefill_
+                                ? boundedRows(kIsolatedPrefillMilliseconds)
+                                : maximum;
+  const uint32_t rows = boundedRows(kContendedPrefillMilliseconds);
   const bool leaderFinishing =
       leader.request->spec.promptTokens - leader.promptProcessed <= rows;
   const bool contended = std::any_of(
@@ -322,7 +335,7 @@ uint32_t Scheduler::prefillBudget(
                                        peer.promptProcessed <= rows);
       });
   if (!contended)
-    return maximum;
+    return isolated;
 
   // Keep long prefills packed. Bound commands for peers decoding or waiting
   // for a CPU mask, and for peers that can finish prefill within this slice.

@@ -52,6 +52,7 @@ struct NativeArguments final {
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
+  bool boundPrefillCommands = true;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -122,7 +123,7 @@ void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
                " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-               " [--kv-format int8|bf16]\n";
+               " [--kv-format int8|bf16] [--prefill-mode bounded|full]\n";
 }
 
 template <typename T>
@@ -186,18 +187,31 @@ NativeArguments parseArguments(int argc, char **argv) {
   }
   NativeArguments result;
   int next = 6;
-  if (next < argc && std::string_view(argv[next]) != "--kv-format") {
+  if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
     if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
-  if (next < argc) {
-    if (argc - next != 2 || std::string_view(argv[next]) != "--kv-format")
-      throw UsageError("expected --kv-format int8 or bf16");
-    const std::string_view format(argv[next + 1]);
-    if (format != "int8" && format != "bf16")
-      throw UsageError("--kv-format requires int8 or bf16");
-    result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+  bool kvFormatSeen = false;
+  bool prefillModeSeen = false;
+  for (; next < argc; next += 2) {
+    const std::string_view option(argv[next]);
+    if (next + 1 == argc)
+      throw UsageError("expected a value after " + std::string(option));
+    const std::string_view value(argv[next + 1]);
+    if (option == "--kv-format" && !kvFormatSeen) {
+      if (value != "int8" && value != "bf16")
+        throw UsageError("--kv-format requires int8 or bf16");
+      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+      kvFormatSeen = true;
+    } else if (option == "--prefill-mode" && !prefillModeSeen) {
+      if (value != "bounded" && value != "full")
+        throw UsageError("--prefill-mode requires bounded or full");
+      result.boundPrefillCommands = value == "bounded";
+      prefillModeSeen = true;
+    } else {
+      throw UsageError("unexpected option " + std::string(option));
+    }
   }
   result.modelRoot = requireModelRoot(argv[2], argv[3]);
   result.model = model::inspectModelPackage(result.modelRoot);
@@ -247,6 +261,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
+  config.nativeLoop.engine.boundPrefillCommands = arguments.boundPrefillCommands;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch =

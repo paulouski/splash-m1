@@ -34,6 +34,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument(
         "prefill checkpoint interval must span a draft window and whole KV pages");
   }
+  scheduler_.boundIsolatedPrefill(config_.boundPrefillCommands);
 }
 
 void Engine::submit(EngineRequest value) {

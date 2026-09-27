@@ -126,8 +126,9 @@ void testWarmupTimingSeedsFirstContendedCommand() {
     scheduler.observePrefill(1, 10000.0);
     scheduler.submit(request(1, 8193));
     scheduler.resourcesReady(1, 0);
-    require(scheduler.next()->items[0].tokenCount == 2048,
-            "warmup shrank an uncontended prefill");
+    require(scheduler.next()->items[0].tokenCount ==
+                (sample == 6144.0 ? 1024 : 2048),
+            "warmup did not bound an uncontended prefill command");
     scheduler.submit(request(2, 1));
     scheduler.resourcesReady(2, 1);
     completeDecode(scheduler);
@@ -506,6 +507,39 @@ void testMeasuredBudgetOnlyLimitsContendedWork() {
   completeDecode(scheduler, true);
   require(scheduler.next()->items[0].tokenCount == 2048,
           "prefill did not recover isolated throughput after its peer ended");
+}
+
+void testIsolatedPrefillStaysWithinCommandBound() {
+  // A long context on a slow GPU: 32 ms per row keeps an isolated command
+  // near five seconds instead of a minute, and fast work keeps the budget.
+  engine::Scheduler scheduler;
+  scheduler.submit(request(1, 200'000));
+  scheduler.resourcesReady(1, 0);
+  completePrefill(scheduler, *scheduler.next(), 2048 * 32.0);
+  const BatchPlan slow = *scheduler.next();
+  require(slow.items[0].tokenCount == 128,
+          "slow isolated prefill exceeded the command time bound");
+  for (uint32_t sample = 0; sample < 16; ++sample) {
+    const BatchPlan plan = *scheduler.next();
+    completePrefill(scheduler, plan, plan.items[0].tokenCount * 1.0);
+  }
+  require(scheduler.next()->items[0].tokenCount == 2048,
+          "isolated prefill did not recover the full budget when fast");
+}
+
+void testFullPrefillModeKeepsWholeBudget() {
+  engine::Scheduler scheduler;
+  scheduler.boundIsolatedPrefill(false);
+  scheduler.submit(request(1, 200'000));
+  scheduler.resourcesReady(1, 0);
+  completePrefill(scheduler, *scheduler.next(), 2048 * 32.0);
+  require(scheduler.next()->items[0].tokenCount == 2048,
+          "full prefill mode shortened an isolated command");
+  scheduler.submit(request(2, 1));
+  scheduler.resourcesReady(2, 1);
+  completeDecode(scheduler);
+  require(scheduler.next()->items[0].tokenCount == 64,
+          "full prefill mode dropped the contended bound");
 }
 
 void testAuxiliaryWorkDoesNotTrainTextPrefillTiming() {
@@ -946,6 +980,8 @@ int main() {
     testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
     testMeasuredBudgetOnlyLimitsContendedWork();
+    testIsolatedPrefillStaysWithinCommandBound();
+    testFullPrefillModeKeepsWholeBudget();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();
     testMeasuredBudgetPreservesPriorityAndStateBoundaries();

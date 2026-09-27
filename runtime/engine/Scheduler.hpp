@@ -64,6 +64,11 @@ class Scheduler final {
 public:
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
+  // Isolated prefill commands stay within a few seconds of GPU time by
+  // default; false restores full-budget commands whatever their duration.
+  void boundIsolatedPrefill(bool bounded) noexcept {
+    boundIsolatedPrefill_ = bounded;
+  }
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -136,6 +141,7 @@ private:
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
+  bool boundIsolatedPrefill_ = true;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };

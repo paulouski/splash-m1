@@ -1917,6 +1917,14 @@ def parse_args(argv=None):
         help="target KV cache storage (default: int8); bf16 uses more memory",
     )
     parser.add_argument(
+        "--prefill-mode",
+        choices=("bounded", "full"),
+        default="bounded",
+        help="bounded (default) keeps each prefill GPU command within a few "
+        "seconds so macOS does not abort long-context prefill; full sends "
+        "whole 2048-token chunks as before",
+    )
+    parser.add_argument(
         "--max-request-size",
         type=_parse_request_size,
         default=DEFAULT_MAX_REQUEST_BYTES,
@@ -1981,6 +1989,8 @@ def _native_command(args):
         command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
+    if args.prefill_mode != "bounded":
+        command.extend(("--prefill-mode", args.prefill_mode))
     return command
 
 

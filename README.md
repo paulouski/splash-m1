@@ -157,6 +157,9 @@ that a long uncached prompt will reach its first token quickly.
   request that runs out of memory keeps its progress on SSD and replays far
   less of its prompt.
 - `--kv-format`: target KV cache storage, `int8` (default) or `bf16`.
+- `--prefill-mode`: `bounded` (default) splits long-context prefill into GPU
+  commands of a few seconds, so macOS does not abort them for stalling the
+  display; `full` sends whole 2048-token chunks as before.
 - `--max-image-pixels`: maximum resized pixels per image. Default: 4,194,304.
 - `--allowed-host`: extra HTTP `Host` name to accept, such as `mymac.local`;
   not a bind address. Repeatable.

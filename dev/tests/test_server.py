@@ -3392,6 +3392,17 @@ class ServerTest(unittest.TestCase):
         )
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             api.parse_args([*required, "--kv-format", "fp16"])
+        self.assertEqual(args.prefill_mode, "bounded")
+        self.assertNotIn("--prefill-mode", api._native_command(args))
+        full_args = api.parse_args(
+            [*required, "--kv-format", "bf16", "--prefill-mode", "full"]
+        )
+        self.assertEqual(
+            api._native_command(full_args)[-4:],
+            ["--kv-format", "bf16", "--prefill-mode", "full"],
+        )
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            api.parse_args([*required, "--prefill-mode", "fast"])
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )
