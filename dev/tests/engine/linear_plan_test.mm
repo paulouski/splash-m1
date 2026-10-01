@@ -740,9 +740,10 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 }
 
 // Apple7/8 have no bfloat arithmetic: every decode projection, wide batches
-// included, runs the fp32-operand register-matrix tile with Apple9's K
-// partitions, no candidate offers the bfloat-operand form, and every prefill
-// projection runs the register-matrix prefill tile.
+// included, runs the fp32-operand register-matrix tile. K partitions match
+// Apple9 except for the measured fused-GDN four-split override. No candidate
+// offers the bfloat-operand form, and every prefill projection runs the
+// register-matrix prefill tile.
 void apple7Plans() {
   for (const uint32_t family : {7U, 8U}) {
     const Linear linear = gpu(family, 32), reference = gpu(9, 32);
@@ -756,20 +757,31 @@ void apple7Plans() {
           const auto plan = linear.plan(workload);
           const auto config = plan.configuration();
           const uint32_t columns = epilogue == LinearEpilogue::GateUp ? 32 : 64;
+          const bool halfTable = lanes == 1 && matrix.inputSize == 5120 &&
+              ((epilogue == LinearEpilogue::GateUp && matrix.outputSize == 17408) ||
+               (epilogue == LinearEpilogue::None && matrix.outputSize == 16640));
           // One threadgroup covers every lane: each width has its own kernel.
           constexpr std::array widths{"", "_m16", "_m24", "_m32"};
           const std::string expected = std::string("decode_linear_q4_sgf") +
+              (halfTable ? "_halftable" : "") +
               (epilogue == LinearEpilogue::GateUp ? "_gate_up"
                : epilogue == LinearEpilogue::Residual ? "_residual" : "") + widths[lanes - 1];
+          const auto expectedInput =
+              halfTable ? LinearInput::Table64Half : LinearInput::Table64;
           require(config.tile == LinearTile::SimdgroupF32 &&
                       config.groups == matrix.outputSize / columns &&
                       config.simdgroups == LinearSimdgroups::Four &&
-                      plan.pipeline() == expected && plan.input() == LinearInput::Table64,
+                      plan.pipeline() == expected && plan.input() == expectedInput,
                   "Apple7 decode does not use the fp32 register-matrix tile");
-          const auto apple9Config = reference.plan(workload).configuration();
-          require(apple9Config.tile != LinearTile::Simdgroup ||
-                      config.splits == apple9Config.splits,
-                  "Apple7 K partitions differ from Apple9");
+          if (matrix.outputSize == 16640 && matrix.inputSize == 5120) {
+            require(config.splits == 4,
+                    "Apple7 fused GDN must use four K partitions");
+          } else {
+            const auto apple9Config = reference.plan(workload).configuration();
+            require(apple9Config.tile != LinearTile::Simdgroup ||
+                        config.splits == apple9Config.splits,
+                    "Apple7 K partitions differ from Apple9");
+          }
           for (const auto &candidate : linear.candidates(workload))
             require(candidate.configuration().tile != LinearTile::Simdgroup,
                     "Apple7 candidate uses bfloat simdgroup operands");

@@ -10,6 +10,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 
 using namespace splash;
@@ -574,6 +575,9 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   engine::Engine engine({}, cache, model, events);
   engine.submit(request(1, std::vector<uint32_t>(6530, 7)));
   runUntilIdle(engine);
+  // Keep the KV prefix while deliberately evicting its recurrent state.
+  while (cache.snapshot().stateCache.entries != 0)
+    require(cache.reclaimOneState(), "test could not leave a KV-only shared prefix");
   std::vector<uint32_t> branch(6575, 7);
   std::fill(branch.begin() + 6517, branch.end(), 8);
   {
@@ -3354,9 +3358,26 @@ void testCancelledColdPrefillResumesItsLatestCheckpoint() {
               executor.prefillRows - computed == prompt.size() - restored &&
               events.failedCount == 0,
           "cancelled cold prefill was recomputed before its completed checkpoint");
-  require(resources.snapshot().stateCache.entries == 1 &&
+  require(resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
-          "successful retry retained a temporary recovery point");
+          "successful retry did not retain its final ordinary states");
+  const uint32_t lastProgress =
+      (static_cast<uint32_t>(prompt.size() - 1) / defaultCheckpointTokens) *
+      defaultCheckpointTokens;
+  const uint32_t fullReplay =
+      (static_cast<uint32_t>(prompt.size() - 1) / KvCache::pageTokens) *
+      KvCache::pageTokens;
+  {
+    const auto lookup =
+        resources.lookup(std::span(prompt).first(lastProgress + 1));
+    require(lookup.resumeBoundary() == lastProgress,
+            "successful retry lost its latest progress state");
+  }
+  {
+    const auto lookup = resources.lookup(std::span(prompt));
+    require(lookup.resumeBoundary() == fullReplay,
+            "successful retry lost its full-prompt replay state");
+  }
 }
 
 void testConcurrentProgressRetainsAtMostOnePointPerLane() {
@@ -3382,7 +3403,8 @@ void testConcurrentProgressRetainsAtMostOnePointPerLane() {
               engine.snapshot().cacheHits == 1 &&
               executor.prefillRows == prompt.size() * 2 - 24992 &&
               maximumEntries <= 2 &&
-              resources.snapshot().stateCache.entries == 1,
+              resources.snapshot().stateCache.entries == 2 &&
+              resources.snapshot().stateCache.checkpointEntries == 0,
           "concurrent prompts accumulated progress states beyond their active lanes");
 }
 
@@ -3432,11 +3454,28 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
   }
   engine.submit(request(503, prompt));
   runUntilIdle(engine);
+  const uint32_t lastProgress =
+      (static_cast<uint32_t>(prompt.size() - 1) / defaultCheckpointTokens) *
+      defaultCheckpointTokens;
+  const uint32_t fullReplay =
+      (static_cast<uint32_t>(prompt.size() - 1) / KvCache::pageTokens) *
+      KvCache::pageTokens;
   require(events.starts.back().second == 3 * defaultCheckpointTokens &&
               executor.prefillRows == prompt.size() &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "successful retry recomputed or retained superseded recovery states");
+  {
+    const auto lookup =
+        resources.lookup(std::span(prompt).first(lastProgress + 1));
+    require(lookup.resumeBoundary() == lastProgress,
+            "successful retry lost its latest progress state");
+  }
+  {
+    const auto lookup = resources.lookup(std::span(prompt));
+    require(lookup.resumeBoundary() == fullReplay,
+            "successful retry lost its full-prompt replay state");
+  }
 }
 
 void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
@@ -3491,6 +3530,8 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       const uint32_t snapshots = executor.snapshots + executor.diskSnapshots;
       std::vector<uint32_t> shorter(
           prompt.begin(), prompt.begin() + defaultCheckpointTokens + suffix);
+      // Keep the terminal anchor out of KV so this fixture tests prefill state.
+      executor.decodeTokensWithoutKv = 1;
       engine.submit(request(521, shorter));
       runUntilIdle(engine);
       const auto states = resources.snapshot().stateCache;
@@ -3513,7 +3554,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
   }
 }
 
-void testRetryRetiresCheckpointAtDeeperJunction() {
+void testRetryRetainsCheckpointAtDeeperJunction() {
   Backing backing(2048);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -3522,6 +3563,12 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   engine::Engine engine({.prefillCheckpointTokens = 8192}, resources, executor,
                         events);
   const std::vector<uint32_t> prompt(30001, 34);
+  const auto requireResumeBoundary = [&](uint32_t boundary,
+                                         const char *message) {
+    const auto lookup =
+        resources.lookup(std::span(prompt).first(boundary + 1));
+    require(lookup.resumeBoundary() == boundary, message);
+  };
   engine.submit(request(530, prompt));
   runUntilCheckpoint(engine, 2);
   require(engine.tick(50) && engine.tick(51) && !engine.commandInFlight() &&
@@ -3533,13 +3580,30 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   require(engine.tick(1) && engine.tick(2) &&
               events.starts.back().second == 16384 &&
               engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
-          "retry kept an earlier recovery point after publishing its junction");
+          "retry did not retain its promoted progress and junction states");
+  requireResumeBoundary(16384,
+                        "retry lost its promoted checkpoint at the junction");
+  requireResumeBoundary(18432,
+                        "retry lost its shared-prefill junction state");
   runUntilIdle(engine);
-  require(resources.snapshot().stateCache.entries == 2 &&
+  require(resources.snapshot().stateCache.entries == 4 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "retry did not retain its normal junction and replay states");
+  const uint32_t lastProgress =
+      (static_cast<uint32_t>(prompt.size() - 1) / 8192) * 8192;
+  const uint32_t fullReplay =
+      (static_cast<uint32_t>(prompt.size() - 1) / KvCache::pageTokens) *
+      KvCache::pageTokens;
+  requireResumeBoundary(16384,
+                        "completed retry lost its earlier progress state");
+  requireResumeBoundary(18432,
+                        "completed retry lost its junction state");
+  requireResumeBoundary(lastProgress,
+                        "completed retry lost its latest progress state");
+  requireResumeBoundary(fullReplay,
+                        "completed retry lost its full-prompt replay state");
 }
 
 void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
@@ -3561,14 +3625,20 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
                   (prompt.size() / defaultCheckpointTokens) - 1 &&
               executor.snapshotAttempts == 2 &&
               resources.snapshot().stateCache.entries == 2 &&
-              resources.snapshot().stateCache.checkpointEntries == 1 &&
+              resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
           "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
+  {
+    const auto latest = resources.lookup(prompt);
+    require(latest.resumeBoundary() == 17984,
+            "latest ordinary state was not touched before reclaim");
+  }
   require(resources.reclaimOneState() &&
+              resources.snapshot().stateCache.entries == 1 &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 17984,
-          "released recovery pin did not rejoin the lower-priority queue");
+          "released recovery point was not eligible for ordinary LRU reclamation");
 }
 
 void testFailedReplacementContinuesWithoutRecoveryPoint() {
@@ -3591,9 +3661,26 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
           "denied replacement kept the retired checkpoint or failed inference");
   runUntilIdle(engine);
   require(events.completedCount == 1 && executor.prefillRows == prompt.size() &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "inference did not recover from a skipped checkpoint publication");
+  const uint32_t lastProgress =
+      (static_cast<uint32_t>(prompt.size() - 1) / defaultCheckpointTokens) *
+      defaultCheckpointTokens;
+  const uint32_t fullReplay =
+      (static_cast<uint32_t>(prompt.size() - 1) / KvCache::pageTokens) *
+      KvCache::pageTokens;
+  {
+    const auto lookup =
+        resources.lookup(std::span(prompt).first(lastProgress + 1));
+    require(lookup.resumeBoundary() == lastProgress,
+            "successful inference lost its latest progress state");
+  }
+  {
+    const auto lookup = resources.lookup(std::span(prompt));
+    require(lookup.resumeBoundary() == fullReplay,
+            "successful inference lost its full-prompt replay state");
+  }
 }
 
 void testRollingHandleCannotRetirePromotedState() {
@@ -3614,11 +3701,28 @@ void testRollingHandleCannotRetirePromotedState() {
   runUntilIdle(engine);
   const std::vector<uint32_t> prefix(
       prompt.begin(), prompt.begin() + defaultCheckpointTokens + 1);
-  require(resources.snapshot().stateCache.entries == 2 &&
+  require(resources.snapshot().stateCache.entries == 3 &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prefix).resumeBoundary() ==
                   defaultCheckpointTokens,
           "old rolling handle deleted a state promoted by another request");
+  const uint32_t lastProgress =
+      (static_cast<uint32_t>(prompt.size() - 1) / defaultCheckpointTokens) *
+      defaultCheckpointTokens;
+  const uint32_t fullReplay =
+      (static_cast<uint32_t>(prompt.size() - 1) / KvCache::pageTokens) *
+      KvCache::pageTokens;
+  {
+    const auto lookup =
+        resources.lookup(std::span(prompt).first(lastProgress + 1));
+    require(lookup.resumeBoundary() == lastProgress,
+            "rolling handle retired the latest progress state");
+  }
+  {
+    const auto lookup = resources.lookup(std::span(prompt));
+    require(lookup.resumeBoundary() == fullReplay,
+            "rolling handle retired the full-prompt replay state");
+  }
 }
 
 void testCheckpointDenialPreservesUnrelatedHotState() {
@@ -3694,7 +3798,7 @@ void testCancelAtCheckpointDoesNotPublishDrainingCommand() {
           "cancellation published a checkpoint from the draining command");
 }
 
-void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
+void testFinalStatePreservesItsCheckpointAndUnrelatedHotState() {
   Backing backing(1024);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -3708,17 +3812,28 @@ void testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState() {
   engine.submit(request(461, prompt));
   runUntilCheckpoint(engine, (prompt.size() / defaultCheckpointTokens));
   executor.snapshotObserver = [&] {
-    require(resources.snapshot().stateCache.entries == 1 &&
+    require(resources.snapshot().stateCache.entries == 2 &&
                 resources.lookup(hot).resumeBoundary() == 64,
-            "final state did not recycle its checkpoint before allocating");
+            "final state did not preserve progress and unrelated hot state");
   };
   runUntilIdle(engine);
-  require(resources.snapshot().stateCache.entries == 2 &&
+  require(resources.snapshot().stateCache.entries == 3 &&
               resources.lookup(hot).resumeBoundary() == 64,
-          "final state evicted unrelated hot state before its own checkpoint");
+          "final state evicted unrelated hot state or its promoted progress state");
+  {
+    const auto progress =
+        resources.lookup(std::span(prompt).first(16384 + 1));
+    require(progress.resumeBoundary() == 16384,
+            "final state lost the latest progress state");
+  }
+  {
+    const auto replay = resources.lookup(std::span(prompt));
+    require(replay.resumeBoundary() == 17984,
+            "final state lost the full-prompt replay state");
+  }
 }
 
-void testFinalJunctionRetiresEarlierProgressPoint() {
+void testFinalJunctionPromotesEarlierProgressPoint() {
   Backing backing(1024);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -3726,6 +3841,12 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   Events events;
   engine::Engine engine({}, resources, executor, events);
   const std::vector<uint32_t> prompt(20001, 29);
+  const auto requireResumeBoundary = [&](uint32_t boundary,
+                                         const char *message) {
+    const auto lookup =
+        resources.lookup(std::span(prompt).first(boundary + 1));
+    require(lookup.resumeBoundary() == boundary, message);
+  };
   resources.beginRequest(470);
   require(resources.ensureTokens(470, 20000).granted(),
           "junction fixture could not allocate its KV prefix");
@@ -3735,9 +3856,12 @@ void testFinalJunctionRetiresEarlierProgressPoint() {
   runUntilIdle(engine);
   require(engine.snapshot().checkpointPublications == (prompt.size() / defaultCheckpointTokens) &&
               engine.snapshot().junctionMaterializations == 1 &&
-              resources.snapshot().stateCache.entries == 1 &&
+              resources.snapshot().stateCache.entries == 2 &&
+              resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt).resumeBoundary() == 20000,
-          "prompt-end junction left a superseded progress checkpoint resident");
+          "prompt-end junction did not preserve its promoted progress state");
+  requireResumeBoundary(16384,
+                        "prompt-end junction lost its preceding progress state");
 }
 
 void testShortSuffixContinuesCheckpointDraftState() {
@@ -3813,11 +3937,17 @@ void testDefaultCheckpointRestoresLatestCommittedPrefix() {
           "branch replayed before its latest checkpoint or failed completion");
   require(finished.checkpointPublications == 5 &&
               finished.junctionMaterializations == 1 &&
-              finished.resources.stateCache.entries == 1 &&
+              finished.resources.stateCache.entries == 2 &&
               finished.resources.stateCache.checkpointEntries == 0 &&
-              finished.resources.stateCache.checkpointRetirements == 5 &&
+              finished.resources.stateCache.checkpointRetirements == 4 &&
               resources.lookup(branch).resumeBoundary() == 22528,
-          "branch completion retained its superseded temporary checkpoint");
+          "branch completion did not retain ordinary progress and junction states");
+  {
+    const auto lookup = resources.lookup(
+        std::span(branch).first(20480 + 1));
+    require(lookup.resumeBoundary() == 20480,
+            "branch completion lost its preceding ordinary progress state");
+  }
 }
 
 void testCheckpointIntervalValidationAndDisable() {
@@ -3957,6 +4087,7 @@ void testCancelledPrefillRecoversFromItsDiskCheckpoint() {
   executor.deniedSnapshots = 1000;
   executor.stateTier = std::make_shared<OffloadControl>();
   executor.stateTier->ready = true;
+  executor.restoreControl->promotionDenied = true;
   Events events;
   engine::Engine engine({}, cache, executor, events);
   const std::vector<uint32_t> donor(2 * defaultCheckpointTokens + 1, 61);
@@ -4008,6 +4139,7 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     executor.deniedSnapshots = 1000;
     executor.stateTier = std::make_shared<OffloadControl>();
     executor.stateTier->ready = true;
+    executor.restoreControl->promotionDenied = true;
     Events events;
     engine::Engine engine({}, cache, executor, events);
     const std::vector<uint32_t> prompt(2 * defaultCheckpointTokens + 1, 65);
@@ -4071,6 +4203,7 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
       executor.deniedSnapshots = denyRam ? 1000 : 0;
       executor.stateTier = std::make_shared<OffloadControl>();
       executor.stateTier->ready = true;
+      executor.restoreControl->promotionDenied = denyRam;
       Events events;
       engine::Engine engine({}, cache, executor, events);
       const std::vector<uint32_t> prompt(defaultCheckpointTokens + remaining + 1, 71);
@@ -4083,10 +4216,16 @@ void testNearFinalCheckpointAvoidsDiskWrite() {
                   counters.replayStatePublications == 1 &&
                   counters.replayStatePublicationFailures == 0 &&
                   executor.diskSnapshots == (denyRam ? 1 + checkpoint : 0) &&
-                  counters.resources.stateCache.entries == 1 &&
+                  counters.resources.stateCache.entries == (denyRam ? 1U : 2U) &&
                   counters.resources.stateCache.checkpointEntries == 0 &&
                   events.completedCount == 1 && events.failedCount == 0,
               "near-final disk checkpoint policy changed RAM checkpoints or lost final state");
+      if (!denyRam) {
+        const auto lookup = cache.lookup(
+            std::span(prompt).first(defaultCheckpointTokens + 1));
+        require(lookup.resumeBoundary() == defaultCheckpointTokens,
+                "near-final RAM checkpoint lost its progress state");
+      }
       executor.restoreControl->ready = true;
       engine.submit(request(2, prompt));
       runUntilIdle(engine);
@@ -4930,15 +5069,15 @@ int main() {
     testRepeatedRetriesRollTheRestoredCheckpoint();
     testRetryCancelledBeforeNextCheckpointKeepsItsSource();
     testRestoredCheckpointAtReplayEndBecomesOrdinary();
-    testRetryRetiresCheckpointAtDeeperJunction();
+    testRetryRetainsCheckpointAtDeeperJunction();
     testPinnedCheckpointSkipsReplacementButNotOrdinaryState();
     testFailedReplacementContinuesWithoutRecoveryPoint();
     testRollingHandleCannotRetirePromotedState();
     testCheckpointDenialPreservesUnrelatedHotState();
     testCheckpointRecyclesItsBufferBeforeReplacement();
     testCancelAtCheckpointDoesNotPublishDrainingCommand();
-    testFinalStateRecyclesItsCheckpointBeforeUnrelatedHotState();
-    testFinalJunctionRetiresEarlierProgressPoint();
+    testFinalStatePreservesItsCheckpointAndUnrelatedHotState();
+    testFinalJunctionPromotesEarlierProgressPoint();
     testShortSuffixContinuesCheckpointDraftState();
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointIntervalValidationAndDisable();
