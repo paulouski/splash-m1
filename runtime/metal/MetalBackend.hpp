@@ -290,6 +290,9 @@ public:
   MetalBackend &operator=(MetalBackend &&) noexcept;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
+  // Whether the loaded metallib defines this Metal function, e.g. to skip a
+  // variant absent from a build (MACOS15=1 drops MPP-only kernels).
+  [[nodiscard]] bool hasFunction(std::string_view name) const;
 
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
@@ -361,9 +364,13 @@ public:
   [[nodiscard]] CommandTicket
   submitAsync(const ComputeDispatch &dispatch,
               CommandCompletion completion = {});
+  // A zero dispatch limit keeps one fused command buffer. Otherwise, the
+  // requested size is a target child-buffer limit; large graphs may use a
+  // larger effective size to stay within the 32-child cap.
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
-                     CommandCompletion completion = {});
+                     CommandCompletion completion = {},
+                     size_t maxDispatchesPerCommandBuffer = 0);
 
   // Development profiling replays a multi-dispatch command synchronously,
   // one dispatch per command buffer. Even submitCommandAsync() then blocks,

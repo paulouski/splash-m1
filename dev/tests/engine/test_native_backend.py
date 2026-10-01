@@ -111,6 +111,7 @@ class FakeRuntime:
         self.complete_on_close = complete_on_close
         self.calls = []
         self.ready = True
+        self.unloaded = False
         self.last_status = None
         self.status_calls = 0
         self.status_event = wire.StatusJsonEvent(
@@ -719,6 +720,7 @@ class NativeBackendContractTests(unittest.TestCase):
             status["transport"],
             {
                 "ready": True,
+                "unloaded": False,
                 "recovering": False,
                 "pending": 0,
                 "pending_limit": 8,

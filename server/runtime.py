@@ -111,6 +111,10 @@ class ProtocolFatal(EngineRuntimeError):
     pass
 
 
+class EngineUnloaded(EngineUnhealthy):
+    """Engine stopped on purpose while idle; the next request reloads it."""
+
+
 class MaskComputationFailed(EngineRuntimeError):
     """A token mask was not delivered.
 
@@ -184,6 +188,8 @@ class GenerationRequest:
     return_progress: bool = False
     # Option token ids for score-only requests; empty means generation.
     score_tokens: tuple[int, ...] = ()
+    # 0 disables logprobs; otherwise top_logprobs + 1.
+    logprobs: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -560,6 +566,11 @@ class MultiplexedRuntime:
             )
 
     @property
+    def unloaded(self) -> bool:
+        with self._state_lock:
+            return not self._closed and isinstance(self._terminal_error, EngineUnloaded)
+
+    @property
     def last_status(self) -> wire.StatusJsonEvent | None:
         with self._state_lock:
             return self._last_status
@@ -621,6 +632,7 @@ class MultiplexedRuntime:
                 image_pixels=request.image_pixels,
                 return_progress=request.return_progress,
                 score_tokens=request.score_tokens,
+                logprobs=request.logprobs,
             )
             try:
                 encoded = wire.serialize_message(protocol_request)
@@ -707,6 +719,25 @@ class MultiplexedRuntime:
             self._reader_thread = None
             self._ready_message = None
         self._mask_executor.shutdown(wait=True, cancel_futures=True)
+
+    def unload_if_idle(self) -> bool:
+        """Stop the engine if no request is pending; submit() reloads it."""
+        with self._state_lock:
+            if (
+                self._closed
+                or self._pending
+                or not self.ready
+                or self._startup_attempt is not None
+                and not self._startup_attempt.event.is_set()
+            ):
+                return False
+            # Fails the generation under the same lock that admits requests.
+            finish = self._begin_generation_failure(
+                self._generation, EngineUnloaded("engine unloaded while idle")
+            )
+        if finish:
+            finish()
+        return finish is not None
 
     def kill(self) -> None:
         """SIGKILL the engine now, skipping its paced teardown.
@@ -1332,7 +1363,7 @@ class MultiplexedRuntime:
             returncode = process.poll() if process is not None else None
 
         def finish() -> None:
-            if not isinstance(failure, RuntimeClosed):
+            if not isinstance(failure, (RuntimeClosed, EngineUnloaded)):
                 self._crash_trace.dump(
                     generation,
                     failure,
@@ -1349,7 +1380,11 @@ class MultiplexedRuntime:
                     pass
                 self._arm_kill_fallback(process)
             listener = self.on_engine_failure
-            if served and listener and not isinstance(failure, RuntimeClosed):
+            if (
+                served
+                and listener
+                and not isinstance(failure, (RuntimeClosed, EngineUnloaded))
+            ):
                 # The failure is already delivered; a listener cannot change it.
                 try:
                     listener(failure)

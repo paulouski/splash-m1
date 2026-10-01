@@ -247,6 +247,96 @@ class PartialToolOutputTests(unittest.TestCase):
                 self.assertEqual(canonical, text)
                 self.assertEqual("".join(emitted), text)
 
+    def test_text_after_a_call_streams_and_survives_a_cut(self):
+        policy = ToolPolicy(
+            {"weather": Draft202012Validator(SCHEMA)}, {"weather": SCHEMA}, False, True
+        )
+        call = (
+            "<tool_call>\n<function=weather>\n<parameter=city>\n"
+            "Paris\n</parameter>\n</function>\n</tool_call>"
+        )
+        projector = model_output.StreamingToolCallProjector(policy, "after-call")
+
+        before = projector.put("Checking.\n" + call)
+        self.assertEqual(
+            [value for kind, value in before if kind == "content"], ["Checking.\n"]
+        )
+        after = projector.put("\nThe answer is 42.")
+        self.assertEqual(
+            [value for kind, value in after if kind == "content"],
+            ["\nThe answer is 42."],
+        )
+
+        canonical_content, canonical_calls = model_output.parse_tool_calls(
+            "Checking.\n" + call + "\nThe answer is 42.", "after-call", policy
+        )
+        self.assertEqual(canonical_content, "Checking.\n\nThe answer is 42.")
+        content, calls = projector.interrupted_result()
+        self.assertEqual((content, calls), (canonical_content, canonical_calls))
+        self.assertEqual(
+            "".join(value for kind, value in before + after if kind == "content"),
+            canonical_content,
+        )
+        self.assertEqual(
+            projector.finish(canonical_content, canonical_calls, incomplete=False), []
+        )
+
+    def test_call_framing_whitespace_is_trimmed_at_output_edges(self):
+        policy = ToolPolicy(
+            {"weather": Draft202012Validator(SCHEMA)}, {"weather": SCHEMA}, False, True
+        )
+        call = (
+            "<tool_call>\n<function=weather>\n<parameter=city>\n"
+            "Paris\n</parameter>\n</function>\n</tool_call>"
+        )
+        cases = (
+            (" \n" + call + "\nAnswer", "\nAnswer"),
+            (
+                "Before\n" + call + "\nBetween\n" + call + "\nAfter",
+                "Before\n\nBetween\n\nAfter",
+            ),
+            ("Before" + call + "\n \t", "Before"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                canonical_content, canonical_calls = model_output.parse_tool_calls(
+                    text, "framing", policy
+                )
+                self.assertEqual(canonical_content, expected)
+                for incomplete in (False, True):
+                    with self.subTest(incomplete=incomplete):
+                        projector = model_output.StreamingToolCallProjector(
+                            policy, "framing"
+                        )
+                        streamed = []
+                        for character in text:
+                            streamed.extend(
+                                value
+                                for kind, value in projector.put(character)
+                                if kind == "content"
+                            )
+                        if incomplete:
+                            self.assertEqual(
+                                projector.interrupted_result(),
+                                (canonical_content, canonical_calls),
+                            )
+                        streamed.extend(
+                            projector.finish(
+                                canonical_content,
+                                canonical_calls,
+                                incomplete=incomplete,
+                            )
+                        )
+                        self.assertEqual("".join(streamed), canonical_content)
+
+    def test_partial_tool_call_marker_stays_held_after_visible_text(self):
+        projector = model_output.StreamingToolCallProjector(None, "partial-marker")
+        events = projector.put("Answer<tool_cal")
+        self.assertEqual(
+            [value for kind, value in events if kind == "content"], ["Answer"]
+        )
+        self.assertEqual(projector.interrupted_result(), ("Answer", []))
+
     def test_every_json_prefix_can_be_returned_in_tool_history(self):
         objects = [
             {"city": '北京😀\\"\n'},

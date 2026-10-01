@@ -171,15 +171,29 @@ void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uin
       throw WeightStoreError("unsupported affine quantization for " + std::string(projection));
   }
 }
+uint32_t SafetensorsCheckpoint::quantizationBits(std::string_view projection) const {
+  @autoreleasepool {
+    NSString *key = [[NSString alloc] initWithBytes:projection.data() length:projection.size() encoding:NSUTF8StringEncoding];
+    NSDictionary *entry = impl_->quantization[key] ?: impl_->quantization;
+    id bits = [entry isKindOfClass:[NSDictionary class]] ? entry[@"bits"] ?: impl_->quantization[@"bits"]
+                                                          : impl_->quantization[@"bits"];
+    return static_cast<uint32_t>(number(bits));
+  }
+}
 namespace {
 id configValue(NSDictionary *config, std::string_view key) {
   id value = config;
+  std::string_view part;
   while (!key.empty()) {
     const auto dot = key.find('.');
-    const auto part = key.substr(0, dot);
+    part = key.substr(0, dot);
     if (![value isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *parent = value;
     NSString *name = [[NSString alloc] initWithBytes:part.data() length:part.size() encoding:NSUTF8StringEncoding];
-    value = value[name];
+    value = parent[name];
+    // An upstream MLX export names a rope schedule's kind "type"; Splash's
+    // own prepared packages already write the loader's "rope_type" field.
+    if (!value && dot == key.npos && part == "rope_type") value = parent[@"type"];
     if (dot == key.npos) break;
     key.remove_prefix(dot + 1);
   }

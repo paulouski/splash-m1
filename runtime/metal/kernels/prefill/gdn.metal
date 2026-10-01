@@ -9,18 +9,20 @@ constant constexpr uint GdnScanBlock = 16;
 // S = d S; m = S k; S += k (v - m) beta; o = S q. A lane owns sixteen key
 // columns of one row, so eight lanes share a row and each key-dimension dot
 // product costs three shuffle steps; a simdgroup covers four rows. Blocks of
-// GdnScanBlock tokens of q and k (widened to fp32), v, decay and beta are
-// staged in threadgroup memory while the following block is prefetched into
-// registers, so the dependent per-token chain reads only threadgroup memory.
+// GdnScanBlock tokens are staged in threadgroup memory while the following
+// block is prefetched into registers. The default kernels stage q, k and v as
+// fp32; the V48 Block16 variant keeps those inputs in bf16. Both paths use the
+// same fp32 recurrence, which reads only threadgroup memory during the scan.
 // The math is the decode recurrence; only the summation order of the dot
 // products differs from its per-lane form.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim>
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, typename StagingScalar,
+          typename StagingVector>
 inline void gdn_scan_prefill_phase(
     device const bfloat *q, device const bfloat *k, device const bfloat *v,
     device const float *decay, device const bfloat *beta,
     device const float *state_in, device float *state_out,
-    device bfloat *output, uint tokens, threadgroup float *keys,
-    threadgroup float *queries, threadgroup float *values,
+    device bfloat *output, uint tokens, threadgroup StagingScalar *keys,
+    threadgroup StagingScalar *queries, threadgroup StagingScalar *values,
     threadgroup float *gates, uint group, uint thread_index, uint lane,
     uint simd_group) {
   constexpr uint Columns = 16;
@@ -36,6 +38,11 @@ inline void gdn_scan_prefill_phase(
                 "every thread stages sixteen keys and sixteen queries");
   static_assert(Block * Rows == 32 * 8,
                 "the first simdgroup stages the value block");
+  constexpr uint ThreadgroupBytes =
+      2 * Block * HeadDim * sizeof(StagingScalar) +
+      Block * Rows * sizeof(StagingScalar) + 2 * Block * sizeof(float);
+  static_assert(ThreadgroupBytes <= 32 * 1024,
+                "the GDN scan staging must fit a 32 KiB threadgroup budget");
 
   const uint value_head = group / GroupsPerHead;
   const uint key_head = value_head / HeadsPerKey;
@@ -91,16 +98,16 @@ inline void gdn_scan_prefill_phase(
     for (uint n = 0; n < 2; ++n) {
       const uint element = (n * Threads + thread_index) * 8;
       for (uint h = 0; h < 2; ++h) {
-        reinterpret_cast<threadgroup float4 *>(keys + element)[h] =
-            float4(key_fetch[n][h]);
-        reinterpret_cast<threadgroup float4 *>(queries + element)[h] =
-            float4(query_fetch[n][h]);
+        reinterpret_cast<threadgroup StagingVector *>(keys + element)[h] =
+            StagingVector(key_fetch[n][h]);
+        reinterpret_cast<threadgroup StagingVector *>(queries + element)[h] =
+            StagingVector(query_fetch[n][h]);
       }
     }
     if (thread_index < 32) {
       for (uint h = 0; h < 2; ++h) {
-        reinterpret_cast<threadgroup float4 *>(values + thread_index * 8)[h] =
-            float4(value_fetch[h]);
+        reinterpret_cast<threadgroup StagingVector *>(values + thread_index * 8)[h] =
+            StagingVector(value_fetch[h]);
       }
     }
     if (thread_index < Block) {
@@ -119,24 +126,26 @@ inline void gdn_scan_prefill_phase(
     const uint count = min(Block, tokens - start);
     for (uint t = 0; t < count; ++t) {
       const float d = gates[t], b = gates[Block + t];
-      const threadgroup float4 *key = reinterpret_cast<const threadgroup float4 *>(
-          keys + t * HeadDim + column);
-      const threadgroup float4 *query =
-          reinterpret_cast<const threadgroup float4 *>(queries + t * HeadDim +
-                                                       column);
+      const threadgroup StagingVector *key =
+          reinterpret_cast<const threadgroup StagingVector *>(
+              keys + t * HeadDim + column);
+      const threadgroup StagingVector *query =
+          reinterpret_cast<const threadgroup StagingVector *>(
+              queries + t * HeadDim + column);
       float4 partial = 0.0f;
       for (uint c = 0; c < Columns / 4; ++c) {
         state[c] *= d;
-        partial = fma(state[c], key[c], partial);
+        partial = fma(state[c], float4(key[c]), partial);
       }
       float memory = (partial.x + partial.y) + (partial.z + partial.w);
       for (uint s = 1; s < LanesPerRow; s <<= 1)
         memory += simd_shuffle_xor(memory, s);
-      const float delta = (values[t * Rows + row] - memory) * b;
+      const float delta = (float(values[t * Rows + row]) - memory) * b;
       partial = 0.0f;
       for (uint c = 0; c < Columns / 4; ++c) {
-        state[c] = fma(key[c], delta, state[c]);
-        partial = fma(state[c], query[c], partial);
+        const float4 keyValue = float4(key[c]);
+        state[c] = fma(keyValue, delta, state[c]);
+        partial = fma(state[c], float4(query[c]), partial);
       }
       float result = (partial.x + partial.y) + (partial.z + partial.w);
       for (uint s = 1; s < LanesPerRow; s <<= 1)
@@ -157,7 +166,8 @@ inline void gdn_scan_prefill_phase(
   }
 }
 
-#define GDN_SCAN_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim)            \
+#define GDN_SCAN_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, Stage,    \
+                               StageVector)                                    \
   kernel void Name(                                                           \
       device const bfloat *q [[buffer(0)]],                                   \
       device const bfloat *k [[buffer(1)]],                                   \
@@ -172,17 +182,19 @@ inline void gdn_scan_prefill_phase(
       uint thread_index [[thread_index_in_threadgroup]],                      \
       uint lane [[thread_index_in_simdgroup]],                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
-    threadgroup float keys[GdnScanBlock * HeadDim];                           \
-    threadgroup float queries[GdnScanBlock * HeadDim];                        \
-    threadgroup float values[GdnScanBlock * SPLASH_GDN_SCAN_STATE_ROWS];    \
+    threadgroup Stage keys[GdnScanBlock * HeadDim];                           \
+    threadgroup Stage queries[GdnScanBlock * HeadDim];                        \
+    threadgroup Stage values[GdnScanBlock * SPLASH_GDN_SCAN_STATE_ROWS];      \
     threadgroup float gates[2 * GdnScanBlock];                                \
-    gdn_scan_prefill_phase<KeyHeads, ValueHeads, HeadDim>(                    \
+    gdn_scan_prefill_phase<KeyHeads, ValueHeads, HeadDim, Stage, StageVector>( \
         q, k, v, decay, beta, state_in, state_out, output, params.tokens,     \
         keys, queries, values, gates, group, thread_index, lane, simd_group); \
   }
 
-GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan, 16, 48, 128)
-GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_vh32, 16, 32, 128)
+GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan, 16, 48, 128, float, float4)
+GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_vh32, 16, 32, 128, float, float4)
+GDN_SCAN_PREFILL_ENTRY(prefill_gdn_scan_bf16_block16, 16, 48, 128, bfloat,
+                       bfloat4)
 #undef GDN_SCAN_PREFILL_ENTRY
 
 // Prepares one token of one key head: causal convolution, SiLU, q/k RMS

@@ -24,12 +24,21 @@ inline uint xt_offset(uint j, uint kp, uint m) {
 }
 
 
-inline void write_input(device bfloat *table, device float *sums,
+template <class TableValue>
+inline void write_input(device TableValue *table, device float *sums,
                         uint group, uint row, uint lane, bfloat a, bfloat b) {
   const uint2 logical = klogical(2 * lane);
-  table[group * kXtPerGroup + xt_offset(logical.x, logical.y, row)] = a;
-  table[group * kXtPerGroup + xt_offset(logical.x + 1, logical.y, row)] = b;
-  const float sum = simd_sum(float(a) + float(b));
+  float sum;
+  if constexpr (is_same_v<TableValue, half>) {
+    const half ha = half(float(a)), hb = half(float(b));
+    table[group * kXtPerGroup + xt_offset(logical.x, logical.y, row)] = ha;
+    table[group * kXtPerGroup + xt_offset(logical.x + 1, logical.y, row)] = hb;
+    sum = simd_sum(float(ha) + float(hb));
+  } else {
+    table[group * kXtPerGroup + xt_offset(logical.x, logical.y, row)] = TableValue(a);
+    table[group * kXtPerGroup + xt_offset(logical.x + 1, logical.y, row)] = TableValue(b);
+    sum = simd_sum(float(a) + float(b));
+  }
   if (lane == 0) sums[group * kRows + row] = sum;
 }
 
@@ -39,6 +48,16 @@ inline void write_input(device bfloat *table, device float *sums,
 struct Table64 {
   static ulong sums_per_tile(uint width) { return width / 8; }
   static void write(device bfloat *table, device float *sums, uint, uint group, uint row,
+                    uint lane, bfloat a, bfloat b) {
+    write_input(table, sums, group, row, lane, a, b);
+  }
+};
+
+// The selected Apple7/8 SimdgroupF32 decode path stores FP16 conversions of
+// BF16-rounded values; conversion can further round, overflow, or underflow.
+struct Table64Half {
+  static ulong sums_per_tile(uint width) { return width / 8; }
+  static void write(device half *table, device float *sums, uint, uint group, uint row,
                     uint lane, bfloat a, bfloat b) {
     write_input(table, sums, group, row, lane, a, b);
   }

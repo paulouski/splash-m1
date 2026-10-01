@@ -231,6 +231,9 @@ private:
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
   ops::Sampling selector_;
+  // Per layer, the K and V output rows of qkvProjection when their decode
+  // slice is supported by every batch-width plan.
+  std::vector<ops::Projection> contextKv_;
 };
 
 } // namespace splash::model

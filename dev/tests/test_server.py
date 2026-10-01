@@ -284,6 +284,7 @@ class Plan:
         after_terminal=False,
         matched_tokens=1,
         logits=None,
+        logprobs=(),
     ):
         self.batches = list(batches)
         self.reason = reason
@@ -292,6 +293,7 @@ class Plan:
         self.delay = delay
         self.matched_tokens = matched_tokens
         self.logits = logits
+        self.logprobs = tuple(logprobs)
         self.started = threading.Event()
         self.release = threading.Event()
         if not block:
@@ -371,6 +373,7 @@ class FakeRuntime:
         self.cancel_count = 0
         self.closed = False
         self.ready = True
+        self.unloaded = False
         self.pending_limit = 32
         self.restart_count = 0
         self.last_crash_trace = None
@@ -467,7 +470,14 @@ class FakeRuntime:
                 if plan.cancelled.is_set():
                     break
                 tokens = tuple(batch)
-                call.emit(native_wire.TokensEvent(call.request_id, offset, tokens))
+                call.emit(
+                    native_wire.TokensEvent(
+                        call.request_id,
+                        offset,
+                        tokens,
+                        plan.logprobs[offset : offset + len(tokens)],
+                    )
+                )
                 offset += len(tokens)
                 completion += len(tokens)
                 plan.cancelled.wait(plan.delay)
@@ -983,6 +993,50 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(stopped, [True])
         self.assertEqual(streamer.stop_sequence, "<STOP>")
 
+    def test_chat_logprobs_nonstream_and_stream(self):
+        rows = (
+            (-0.1, (4, 1), (-0.1, -2.5)),
+            (-0.2, (4, 1), (-0.2, -3.5)),
+        )
+        runtime = FakeRuntime(
+            Plan([[4], [4]], logprobs=rows), Plan([[4], [4]], logprobs=rows)
+        )
+        harness = self.harness(runtime)
+        body = self.body(logprobs=True, top_logprobs=1)
+        status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(runtime.requests[0].logprobs, 2)
+        content = json.loads(payload)["choices"][0]["logprobs"]["content"]
+        self.assertEqual([entry["token_id"] for entry in content], [4, 4])
+        self.assertEqual(content[1]["logprob"], -0.2)
+        self.assertEqual(
+            [top["token"] for top in content[0]["top_logprobs"]],
+            ["plain answer\n", "because "],
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", {**body, "stream": True}
+        )
+        self.assertEqual(status, 200)
+        chunks = [
+            json.loads(line[6:])
+            for line in payload.decode().splitlines()
+            if line.startswith("data: {")
+        ]
+        streamed = [
+            chunk["choices"][0]["logprobs"]["content"]
+            for chunk in chunks
+            if chunk["choices"] and chunk["choices"][0].get("logprobs")
+        ]
+        self.assertEqual(len(streamed), 1)
+        self.assertEqual(streamed[0][0]["top_logprobs"][1]["logprob"], -2.5)
+        for bad in (
+            self.body(top_logprobs=1),
+            self.body(logprobs=True, top_logprobs=21),
+            self.body(logprobs=True, top_logprobs=True),
+        ):
+            status, _, _ = harness.request("POST", "/v1/chat/completions", bad)
+            self.assertEqual(status, 400)
+
     def test_models_and_nonstream_reasoning(self):
         runtime = FakeRuntime(Plan([[1], [2], [3]]))
         harness = self.harness(runtime)
@@ -1032,6 +1086,7 @@ class ServerTest(unittest.TestCase):
             snapshot["transport"],
             {
                 "ready": True,
+                "unloaded": False,
                 "recovering": False,
                 "pending": 0,
                 "pending_limit": 4,
@@ -4555,7 +4610,7 @@ class ServerTest(unittest.TestCase):
         tokenizer.fragments[40] = "Fix the </parameter> and <function= handling.\n"
         tokenizer.backend_tokenizer = _byte_backend(tokenizer.fragments)
         tools = [{"type": "function", "function": {"name": "weather"}}]
-        prose = tokenizer.fragments[40] + "\n"
+        prose = tokenizer.fragments[40]
         for stream in (False, True):
             with self.subTest(stream=stream):
                 harness = self.harness(
@@ -5556,6 +5611,44 @@ class ServerTest(unittest.TestCase):
         template = tokenizer.templates[-1][1]
         self.assertFalse(template["enable_thinking"])
         self.assertNotIn("reasoning_effort", template)
+
+    def test_chat_template_kwargs_enable_thinking(self):
+        tokenizer = FakeTokenizer()
+        backend = backend_api.NativeBackend(FakeRuntime(), tokenizer)
+        self.addCleanup(backend.close)
+        app = make_frontend(
+            tokenizer,
+            backend,
+            "test-model",
+            128,
+            16,
+            1,
+            2,
+            vision=True,
+            default_reasoning_effort="medium",
+        )
+        # Pi-style client: enable_thinking false pins thinking off.
+        app.prepare(self.body(chat_template_kwargs={"enable_thinking": False}))
+        template = tokenizer.templates[-1][1]
+        self.assertFalse(template["enable_thinking"])
+        self.assertNotIn("reasoning_effort", template)
+        # enable_thinking true defers to the server default reasoning_effort.
+        app.prepare(self.body(chat_template_kwargs={"enable_thinking": True}))
+        template = tokenizer.templates[-1][1]
+        self.assertTrue(template["enable_thinking"])
+        self.assertEqual(template["reasoning_effort"], "medium")
+        # An explicit reasoning_effort wins over chat_template_kwargs.
+        app.prepare(
+            self.body(
+                reasoning_effort="low",
+                chat_template_kwargs={"enable_thinking": False},
+            )
+        )
+        template = tokenizer.templates[-1][1]
+        self.assertTrue(template["enable_thinking"])
+        self.assertEqual(template["reasoning_effort"], "low")
+        with self.assertRaises(api_errors.APIError):
+            app.prepare(self.body(chat_template_kwargs={"enable_thinking": "yes"}))
 
     @staticmethod
     def reasoning_template(*, default=True, efforts=None):
@@ -8122,8 +8215,8 @@ class ServerTest(unittest.TestCase):
                 "required": ["city"],
             },
         }
-        # Text, a tool call, then the template newline that follows the call.
-        harness = self.harness(FakeRuntime(Plan([[4, 5]]), Plan([[1, 2, 3, 5]])))
+        # Text, a tool call, then text after the call.
+        harness = self.harness(FakeRuntime(Plan([[4, 5, 4]]), Plan([[1, 2, 3, 5]])))
         status, _, payload = harness.request(
             "POST",
             "/v1/responses",

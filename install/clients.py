@@ -392,7 +392,8 @@ def _write_pi_provider(path, provider, server, environment):
         "thinkingLevelMap": {"off": "none"},
         "input": ["text", "image"] if vision else ["text"],
         "contextWindow": server.context,
-        "maxTokens": server.response_tokens,
+        # Pi lowers this per request to the context that remains.
+        "maxTokens": MAX_RESPONSE_TOKENS,
     }
     config["providers"] = {
         **providers,

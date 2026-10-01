@@ -5,14 +5,20 @@ RELEASE_VERSION ?= $(shell git describe --tags --always)
 .PHONY: package package-bottle package-check
 package: install-environment all
 	$(PYTHON) dev/tools/package.py --version "$(RELEASE_VERSION)" \
-		--macos-min "$(MACOS_MIN_VERSION)"
+		--macos-min "$(MACOS_MIN_VERSION)" --build-dir "$(BUILD)"
+	$(PYTHON) dev/tools/package_app.py --version "$(RELEASE_VERSION)" \
+		--macos-min "$(MACOS_MIN_VERSION)" \
+		--runtime-archive "dist/splash-m1-$(RELEASE_VERSION)-arm64-macos$(firstword $(subst ., ,$(MACOS_MIN_VERSION))).tar.gz" \
+		--build-dir "$(BUILD)"
 
 package-bottle:
-	$(PYTHON) dev/tools/package_brew.py build --version "$(RELEASE_VERSION)"
+	$(PYTHON) dev/tools/package_brew.py build --version "$(RELEASE_VERSION)" \
+		--macos-min "$(MACOS_MIN_VERSION)"
 
 # Both Homebrew targets use a temporary tap and remove their installation.
 package-check:
-	$(PYTHON) dev/tools/package_brew.py check --version "$(RELEASE_VERSION)"
+	$(PYTHON) dev/tools/package_brew.py check --version "$(RELEASE_VERSION)" \
+		--macos-min "$(MACOS_MIN_VERSION)"
 
 # Uploads the built RELEASE_VERSION archive, its checksum, the tester installer
 # and the `latest` pointer to the private Hugging Face repo testers install
@@ -22,7 +28,7 @@ TEST_RELEASE_REPO ?=
 publish-test:
 	@test -n "$(TEST_RELEASE_REPO)" || { echo "set TEST_RELEASE_REPO=owner/repo"; exit 1; }
 	$(PYTHON) dev/tools/publish_test.py --version "$(RELEASE_VERSION)" \
-		--repo "$(TEST_RELEASE_REPO)"
+		--repo "$(TEST_RELEASE_REPO)" --macos-min "$(MACOS_MIN_VERSION)"
 
 ENGINE_PYTHON_TEST_PATTERN ?= test_*.py
 # Comma-separated subset of claude,opencode,codex,hermes,pi for the real client

@@ -18,6 +18,7 @@
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
       uint lane [[thread_index_in_simdgroup]]) {                               \
+    threadgroup uint query_words[Group * 1024];                                \
     constexpr uint D = SplashQ8HeadDimension;                                  \
     const uint kv_head = group.x, tile = group.y, split = group.z;             \
     const uint tile_start = tile * SplashPrefillTileRows;                      \
@@ -35,7 +36,7 @@
         queries + tile_offset, cache_keys, key_scales_buffer, cache_values,    \
         value_scales_buffer, page_table, kv_head,                              \
         params.committed_tokens + tile_start, active_rows, params.split_count, \
-        split, partials, statistics, slot, sg, lane);                          \
+        split, partials, statistics, slot, sg, lane, query_words);           \
   }
 
 Q8_SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf, 4, 6)

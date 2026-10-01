@@ -39,6 +39,12 @@ struct ModelMemoryFootprint final {
 struct ModelMemoryProfile final {
   std::string name;
   uint32_t maximumContextTokens = 0;
+  // The operator's --max-context request, zero when unset. Without placement
+  // sparse the whole virtual KV pool is committed physically up front, so
+  // sizing it past this leaves no headroom for prefix-cache state snapshots;
+  // sparse devices grow backing on demand and stay unaffected. Zero keeps the
+  // prior fill-the-budget sizing.
+  uint32_t requestedContextTokens = 0;
   kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
 

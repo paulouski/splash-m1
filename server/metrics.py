@@ -135,6 +135,20 @@ def prometheus_metrics(status):
             "restore_skipped",
         ),
         "splash_draft_state_resets_total": ("draft_context", "resets"),
+        "splash_policy_speculative_cycles_total": (
+            "decode_ladder",
+            "speculative_cycles",
+        ),
+        "splash_policy_ar_cycles_total": ("decode_ladder", "ar_cycles"),
+        "splash_policy_switches_to_ar_total": (
+            "decode_ladder",
+            "switches_to_ar",
+        ),
+        "splash_policy_switches_to_speculative_total": (
+            "decode_ladder",
+            "switches_to_speculative",
+        ),
+        "splash_policy_probes_total": ("decode_ladder", "probes"),
         "splash_constraint_mask_overlap_batches_total": (
             "constraint_masks",
             "overlap_batches",

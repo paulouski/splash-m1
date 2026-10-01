@@ -71,10 +71,16 @@ void requireLoadedModel(const model::ModelPackage &package);
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
   std::filesystem::path metallibPath;
+  // A legacy installed package's root (target/, draft/, vision/ subdirectories);
+  // ignored when modelPaths names its own directories instead.
   std::filesystem::path modelRoot;
+  model::ModelPaths modelPaths;
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
+  // --max-context; zero leaves the non-sparse KV pool sized to fill the
+  // dynamic budget (see ModelMemoryProfile::requestedContextTokens).
+  uint32_t requestedContextTokens = 0;
   // Disk quota shared by cached KV pages and states; zero disables the tier.
   uint64_t maximumCacheDiskBytes = 0;
   // Patches per image the vision scratch covers. The engine admits images up

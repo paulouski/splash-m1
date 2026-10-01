@@ -4,8 +4,8 @@
 template <uint Hidden>
 inline void q4_embedding_impl(device const uint *tokens,
                               device const uchar *weights,
-                              device const bfloat *scales,
-                              device const bfloat *biases,
+                              device const half *scales,
+                              device const half *biases,
                               device bfloat *output,
                               constant Q4EmbeddingParams &params, uint index,
                               uint grid_size) {
@@ -30,8 +30,8 @@ inline void q4_embedding_impl(device const uint *tokens,
   kernel void Name(                                                          \
       device const uint *tokens [[buffer(0)]],                               \
       device const uchar *weights [[buffer(1)]],                             \
-      device const bfloat *scales [[buffer(2)]],                             \
-      device const bfloat *biases [[buffer(3)]],                             \
+      device const half *scales [[buffer(2)]],                             \
+      device const half *biases [[buffer(3)]],                             \
       device bfloat *output [[buffer(4)]],                                   \
       constant Q4EmbeddingParams &params [[buffer(5)]],                      \
       uint index [[thread_position_in_grid]],                                \

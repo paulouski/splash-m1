@@ -1,27 +1,10 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/q4_mpp_tiles.h"
 
-kernel void prefill_linear_q4_sums32(device const bfloat *input [[buffer(0)]],
-                              device float *sums [[buffer(1)]],
-                              constant Q4PrefillParams &params [[buffer(2)]],
-                              uint tile [[threadgroup_position_in_grid]],
-                              uint simd_lane [[thread_index_in_simdgroup]],
-                              uint simd_group
-                              [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint TileM = 32;
-  uint quant_groups = params.input_size / 64;
-  input += ulong(tile) * TileM * params.input_size;
-  sums += ulong(tile) * TileM * quant_groups;
-  for (uint quant_group = 0; quant_group < quant_groups; ++quant_group) {
-    for (uint row = simd_group; row < TileM; row += 8) {
-      uint origin = row * params.input_size + quant_group * 64 + simd_lane;
-      float sum = simd_sum(float(input[origin]) + float(input[origin + 32]));
-      if (simd_lane == 0) {
-        sums[quant_group * TileM + row] = sum;
-      }
-    }
-  }
-}
+// prefill_linear_q4_sums32 moved to linear_q4_sums.metal: it needs no MPP
+// (unlike every other kernel in this file) and Apple7/8 production paths
+// (QwenTarget.cpp, DFlashDraft.cpp addPrefillSums) call it unconditionally,
+// so it must survive the MACOS15_EXCLUDED_KERNELS drop of this file.
 
 // Eligible Apple9/Apple10 devices allow 32 KiB of static threadgroup memory.
 // Keeping 256 row sums resident lets the 5120/6144-wide projections run with
@@ -34,7 +17,7 @@ constant constexpr ushort PrefillSumBatch = 256;
 template <ushort TileM, ushort TileN, ushort Simdgroups, bool AddResidual,
           bool MultiplySiluGate>
 inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
-                                device bfloat *scales, device bfloat *biases,
+                                device half *scales, device half *biases,
                                 device bfloat *output, device bfloat *auxiliary,
                                 uint output_size, uint input_size,
                                 device const float *precomputed_sums,
@@ -138,7 +121,7 @@ inline void q4_mpp_prefill_tile(device bfloat *input, device uchar *weights,
 
 kernel void prefill_linear_q4_n128(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
     constant Q4PrefillParams &params [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -159,7 +142,7 @@ kernel void prefill_linear_q4_n128(
 
 kernel void prefill_linear_q4_n256(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
     constant Q4PrefillParams &params [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -180,7 +163,7 @@ kernel void prefill_linear_q4_n256(
 
 kernel void prefill_linear_q4_n128_residual(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     constant Q4PrefillParams &params [[buffer(7)]],
@@ -202,7 +185,7 @@ kernel void prefill_linear_q4_n128_residual(
 
 kernel void prefill_linear_q4_n256_residual(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     constant Q4PrefillParams &params [[buffer(7)]],
@@ -245,7 +228,7 @@ inline void q4_prefill_write_output_sums(device const bfloat *output,
 
 kernel void prefill_linear_q4_n256_up_silu_sums(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     device float *output_sums [[buffer(7)]],
@@ -272,7 +255,7 @@ kernel void prefill_linear_q4_n256_up_silu_sums(
 
 kernel void prefill_linear_q4_n128_sg4(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
     constant Q4PrefillParams &params [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -291,7 +274,7 @@ kernel void prefill_linear_q4_n128_sg4(
 
 kernel void prefill_linear_q4_n128_residual_sg4(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     constant Q4PrefillParams &params [[buffer(7)]],
@@ -312,7 +295,7 @@ kernel void prefill_linear_q4_n128_residual_sg4(
 
 kernel void prefill_linear_q4_n128_up_silu_sums_sg4(
     device bfloat *input [[buffer(0)]], device uchar *weights [[buffer(1)]],
-    device bfloat *scales [[buffer(2)]], device bfloat *biases [[buffer(3)]],
+    device half *scales [[buffer(2)]], device half *biases [[buffer(3)]],
     device bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]],
     device float *output_sums [[buffer(7)]],

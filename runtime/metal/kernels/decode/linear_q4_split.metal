@@ -19,10 +19,10 @@
 // (ops::Projection::destination), which keeps the sum unrounded.
 template <ushort TileN, ushort Simdgroups, bool Residual, bool GateUp = false, class Out>
 inline void q4_split(device bfloat *input, device uchar *weights,
-                     device bfloat *scales, device bfloat *biases,
+                     device half *scales, device half *biases,
                      device bfloat *residual, device Out *output,
-                     device uchar *upWeights, device bfloat *upScales,
-                     device bfloat *upBiases, constant Q4Params &p, uint group,
+                     device uchar *upWeights, device half *upScales,
+                     device half *upBiases, constant Q4Params &p, uint group,
                      uint lane, uint simd, threadgroup float *sums,
                      threadgroup float *partials) {
   constexpr uint Parts = 4;
@@ -64,8 +64,8 @@ inline void q4_split(device bfloat *input, device uchar *weights,
 #define Q4_SPLIT_OUTPUT(Name, TileN, Simdgroups, Out)                          \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
-                   device bfloat *scales [[buffer(2)]],                        \
-                   device bfloat *biases [[buffer(3)]],                        \
+                   device half *scales [[buffer(2)]],                        \
+                   device half *biases [[buffer(3)]],                        \
                    device Out *output [[buffer(4)]],                           \
                    constant Q4Params &params [[buffer(5)]],                    \
                    uint group [[threadgroup_position_in_grid]],                \
@@ -84,8 +84,8 @@ inline void q4_split(device bfloat *input, device uchar *weights,
 #define Q4_SPLIT_RESIDUAL(Name, TileN, Simdgroups)                             \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
-                   device bfloat *scales [[buffer(2)]],                        \
-                   device bfloat *biases [[buffer(3)]],                        \
+                   device half *scales [[buffer(2)]],                        \
+                   device half *biases [[buffer(3)]],                        \
                    device bfloat *residual [[buffer(4)]],                      \
                    device bfloat *output [[buffer(5)]],                        \
                    constant Q4Params &params [[buffer(6)]],                    \
@@ -113,10 +113,10 @@ Q4_SPLIT_RESIDUAL(decode_linear_q4_n64_split4_residual, 64, 2)
 // 128 threads: four single-simdgroup partitions, two weight streams.
 kernel void decode_linear_q4_n32_split4_gate_up(
     device bfloat *input [[buffer(0)]], device uchar *weights_0 [[buffer(1)]],
-    device bfloat *scales_0 [[buffer(2)]],
-    device bfloat *biases_0 [[buffer(3)]], device bfloat *output [[buffer(4)]],
-    device uchar *weights_1 [[buffer(5)]], device bfloat *scales_1 [[buffer(6)]],
-    device bfloat *biases_1 [[buffer(7)]], constant Q4Params &params [[buffer(8)]],
+    device half *scales_0 [[buffer(2)]],
+    device half *biases_0 [[buffer(3)]], device bfloat *output [[buffer(4)]],
+    device uchar *weights_1 [[buffer(5)]], device half *scales_1 [[buffer(6)]],
+    device half *biases_1 [[buffer(7)]], constant Q4Params &params [[buffer(8)]],
     uint group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd [[simdgroup_index_in_threadgroup]]) {

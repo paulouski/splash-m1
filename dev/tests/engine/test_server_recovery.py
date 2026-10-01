@@ -10,13 +10,21 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.engine.test_native_backend import FakeTokenizer as NativeTokenizer
-from dev.tests.engine.test_runtime import READY_FEATURES, FakeFactory
+from dev.tests.engine.test_runtime import READY_FEATURES, FakeFactory, request
 from dev.tests.test_server import FakeRuntime, Harness, Plan, main_args
 from install import launcher
 from server import backend as backend_api
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
+
+
+def finish(process, call):
+    process.send(
+        wire.StartEvent(call.request_id, wire.CacheDisposition.MISS, 0, 0, 4096)
+    )
+    process.send(wire.DoneEvent(call.request_id, wire.FinishReason.STOP, 2, 0, 1, 1, 2))
+    call.result(1.0)
 
 
 class RecoveringRuntime(FakeRuntime):
@@ -320,6 +328,42 @@ class ServerRecoveryTests(unittest.TestCase):
         self.wait_until(lambda: len(factory.processes) == 2 and runtime.ready, 2)
         self.assertEqual(runtime.restart_count, 1)
         self.assertTrue(backend.can_submit())
+
+    def test_idle_unload_stops_engine_and_next_request_reloads_it(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        backend = backend_api.NativeBackend(runtime, NativeTokenizer(), idle_unload=0.3)
+        self.addCleanup(backend.close)
+        held = runtime.submit(request(1))
+        time.sleep(0.6)
+        self.assertTrue(runtime.ready)
+        finish(factory.processes[0], held)
+        self.wait_until(lambda: runtime.unloaded, 3)
+        self.assertIsNotNone(factory.processes[0].poll())
+        time.sleep(0.6)
+        self.assertEqual(len(factory.processes), 1)
+        self.assertTrue(backend.can_submit())
+        transport = backend.status()["transport"]
+        self.assertTrue(transport["unloaded"])
+        self.assertFalse(transport["recovering"])
+        self.assertIsNone(backend.engine_error)
+        runtime.submit(request(2))
+        self.assertEqual(len(factory.processes), 2)
+        self.assertTrue(runtime.ready)
+        self.assertFalse(runtime.unloaded)
+
+    def test_unload_refused_while_request_pending(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        call = runtime.submit(request(1))
+        self.assertFalse(runtime.unload_if_idle())
+        self.assertTrue(runtime.ready)
+        finish(factory.processes[0], call)
+        self.wait_until(lambda: runtime.pending_count == 0, 2)
+        self.assertTrue(runtime.unload_if_idle())
+        self.assertFalse(runtime.unload_if_idle())
 
     def test_engine_failure_and_failed_restart_are_reported(self):
         factory = FakeFactory()

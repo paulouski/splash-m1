@@ -24,6 +24,7 @@ INSTALL_FILES = (
     "clients.py",
     "paths.py",
     "models.py",
+    "desktop.py",
     "hub.py",
     "families.py",
     "assembly.py",
@@ -66,6 +67,8 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "web_tools.py",
+    "user_settings.py",
     "chat.html",
 )
 # Splash's license and the notices of the third-party code it ships.
@@ -77,7 +80,38 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def stage_runtime(destination, version):
+def remove_staged_entrypoints(python, staging):
+    binary_dir = python.parent
+    if not binary_dir.is_dir():
+        return
+    staging_prefix = str(staging).encode()
+    for entry in binary_dir.iterdir():
+        if entry.name.startswith("python") or entry.is_symlink() or not entry.is_file():
+            continue
+        if staging_prefix in entry.read_bytes():
+            entry.unlink()
+
+
+def filter_archive_member(item):
+    if "__pycache__" in Path(item.name).parts:
+        return None
+    item.uid = item.gid = 0
+    item.uname = item.gname = ""
+    return item
+
+
+def macos_major(macos_min):
+    match = re.fullmatch(
+        r"(?P<major>0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?",
+        macos_min,
+    )
+    if not match or int(match.group("major")) < 15:
+        raise ValueError("minimum macOS must be 15.0 or newer, such as 15.0")
+    return int(match.group("major"))
+
+
+def stage_runtime(destination, version, build_dir=None, macos_min="15.0"):
+    build_dir = Path(build_dir or ROOT / "build")
     for folder, names in (
         ("install", INSTALL_FILES),
         ("install/completions", COMPLETION_FILES),
@@ -85,15 +119,29 @@ def stage_runtime(destination, version):
         ("engine", ("splash", "splash.metallib")),
     ):
         (destination / folder).mkdir()
-        source = ROOT / ("build" if folder == "engine" else folder)
+        source = build_dir if folder == "engine" else ROOT / folder
         for name in names:
             shutil.copy2(source / name, destination / folder / name)
+    shutil.copytree(ROOT / "server/static", destination / "server/static")
     for name in LICENSE_FILES:
         shutil.copy2(ROOT / name, destination / name)
+    launcher = destination / "splash-m1"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
+        "export PYTHONDONTWRITEBYTECODE=1\n"
+        'exec "$HERE/python/bin/python3" -u "$HERE/install/launcher.py" "$@"\n'
+    )
+    launcher.chmod(0o755)
     (destination / "release.json").write_text(
         json.dumps(
             {
+                "product": "splash-m1",
                 "version": version,
+                "architecture": "arm64",
+                "minimum_macos": macos_min,
+                "features": ["affine Qwen text checkpoints", "int8 KV cache"],
                 "binary_sha256": digest(destination / "engine/splash"),
                 "metallib_sha256": digest(destination / "engine/splash.metallib"),
             },
@@ -111,48 +159,47 @@ def formula(version, url, checksum, macos_min):
         escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("#{", "\\#{")
         return '"' + escaped + '"'
 
-    return f"""class SplashMacOSRequirement < Requirement
+    return f"""class SplashM1MacOSRequirement < Requirement
   fatal true
   satisfy(build_env: false) {{ OS.mac? && MacOS.full_version >= {quote(macos_min)} }}
 
   def message
-    {quote(f"Splash requires macOS {macos_min} or newer.")}
+    {quote(f"Splash M1 requires macOS {macos_min} or newer.")}
   end
 end
 
-class Splash < Formula
-  desc "Local inference engine for Apple silicon, built around the model"
-  homepage "https://github.com/incoai/splash"
+class SplashM1 < Formula
+  desc "Local text inference engine for Apple silicon"
+  homepage "https://github.com/paulouski/splash-m1"
   url {quote(url)}
+  version {quote(version)}
   sha256 {quote(checksum)}
   license "Apache-2.0"
 
   depends_on arch: :arm64
-  depends_on macos: :tahoe
-  depends_on SplashMacOSRequirement
+  depends_on SplashM1MacOSRequirement
 
   def install
     libexec.install Dir["*"]
-    (bin/"splash").write <<~SH
+    (bin/"splash-m1").write <<~SH
       #!/bin/sh
-      export PYTHONDONTWRITEBYTECODE=1
-      exec "#{{opt_libexec}}/python/bin/python3" -u "#{{opt_libexec}}/install/launcher.py" "$@"
+      exec "#{{opt_libexec}}/splash-m1" "$@"
     SH
-    chmod 0755, bin/"splash"
-    zsh_completion.install_symlink libexec/"install/completions/_splash"
-    bash_completion.install_symlink libexec/"install/completions/splash.bash" => "splash"
+    chmod 0755, bin/"splash-m1"
+    zsh_completion.install_symlink libexec/"install/completions/_splash" => "_splash-m1"
+    bash_completion.install_symlink libexec/"install/completions/splash.bash" => "splash-m1"
   end
 
   def caveats
     <<~CAVEAT
       Serve a model:
-        splash serve --model mlx-community/Qwen3.8-27B-4bit
+        splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit --language-only --max-context 32K
     CAVEAT
   end
 
   test do
-    assert_match version.to_s, shell_output("#{{bin}}/splash --version")
-    assert_match "serve", shell_output("#{{bin}}/splash --help")
+    assert_match version.to_s, shell_output("#{{bin}}/splash-m1 --version")
+    assert_match "serve", shell_output("#{{bin}}/splash-m1 --help")
   end
 end
 """
@@ -161,19 +208,30 @@ end
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--macos-min", required=True, help="minimum macOS, e.g. 26.4")
+    parser.add_argument("--macos-min", default="15.0", help="minimum macOS, e.g. 15.0")
+    parser.add_argument(
+        "--build-dir", type=Path, default=ROOT / "build", help="runtime build directory"
+    )
     parser.add_argument(
         "--url", help="published tarball URL; defaults to GitHub Releases"
     )
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.version):
         parser.error("invalid release version")
+    try:
+        platform_major = macos_major(args.macos_min)
+    except ValueError as error:
+        parser.error(str(error))
+    build_dir = args.build_dir.resolve()
+    for name in ("splash", "splash.metallib"):
+        if not (build_dir / name).is_file():
+            parser.error(f"missing {build_dir / name}")
     dist = ROOT / "dist"
-    dist.mkdir(exist_ok=True)
-    name = f"splash-{args.version}-arm64-macos26"
+    name = f"splash-m1-{args.version}-arm64-macos{platform_major}"
     archive = dist / f"{name}.tar.gz"
     if archive.exists():
         parser.error(f"release already exists: {archive}")
+    dist.mkdir(exist_ok=True)
     cached = ROOT / "build/release/python-runtime.tar.gz"
     cached.parent.mkdir(parents=True, exist_ok=True)
     if not cached.exists() or digest(cached) != PYTHON_SHA256:
@@ -187,7 +245,7 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(prefix=".package-", dir=dist) as temporary:
         stage = Path(temporary) / name
         stage.mkdir()
-        stage_runtime(stage, args.version)
+        stage_runtime(stage, args.version, build_dir, args.macos_min)
         with tarfile.open(cached) as python:
             python.extractall(stage, filter="data")
         python = stage / "python/bin/python3"
@@ -205,6 +263,7 @@ def main(argv=None):
             ],
             check=True,
         )
+        remove_staged_entrypoints(python, stage)
         # Exercise imports and the public entry point from the actual staged
         # runtime, not the developer's virtualenv or source PYTHONPATH.
         subprocess.run(
@@ -229,20 +288,20 @@ def main(argv=None):
             release.add(
                 stage,
                 arcname=name,
-                filter=lambda item: (
-                    None if "__pycache__" in Path(item.name).parts else item
-                ),
+                filter=filter_archive_member,
             )
         packed.replace(archive)
     checksum = digest(archive)
     archive.with_suffix(archive.suffix + ".sha256").write_text(checksum + "\n")
     url = (
         args.url
-        or f"https://github.com/incoai/splash/releases/download/{args.version}/{archive.name}"
+        or f"https://github.com/paulouski/splash-m1/releases/download/{args.version}/{archive.name}"
     )
-    (dist / "splash.rb").write_text(
+    (dist / "splash-m1.rb").write_text(
         formula(args.version, url, checksum, args.macos_min)
     )
+    shutil.copy2(ROOT / "dev/tools/install.sh", dist / "install.sh")
+    (dist / "latest").write_text(args.version + "\n")
     print(
         f"Built {archive}; run make package-bottle RELEASE_VERSION={args.version} "
         "before publishing the Homebrew formula."

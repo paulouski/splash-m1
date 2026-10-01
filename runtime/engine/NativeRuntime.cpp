@@ -277,6 +277,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.maxNewTokens = request.logicalMaxOutputTokens;
     engineRequest.scoreTokens = std::move(request.scoreTokens);
+    engineRequest.logprobs = request.logprobs;
     engineRequest.sampling = {request.sampling.temperature,
                               request.sampling.topP, request.sampling.topK,
                               request.seed};
@@ -524,6 +525,11 @@ void NativeRuntime::promptProgress(uint64_t requestId,
                      clocks_.monotonicMilliseconds())});
 }
 
+void NativeRuntime::tokenLogprobs(
+    uint64_t requestId, std::span<const ops::TokenLogprobs> values) {
+  telemetry_.at(requestId).pendingLogprobs.assign(values.begin(), values.end());
+}
+
 void NativeRuntime::tokens(uint64_t requestId,
                            std::span<const uint32_t> values) {
   RequestTelemetry &telemetry = telemetry_.at(requestId);
@@ -540,7 +546,9 @@ void NativeRuntime::tokens(uint64_t requestId,
   }
   telemetry.lastTokenMilliseconds = now;
   send(protocol::TokensEvent{
-      requestId, offset, std::vector<uint32_t>(values.begin(), values.end())});
+      requestId, offset, std::vector<uint32_t>(values.begin(), values.end()),
+      std::move(telemetry.pendingLogprobs)});
+  telemetry.pendingLogprobs.clear();
 }
 
 void NativeRuntime::maskRequested(uint64_t requestId,

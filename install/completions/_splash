@@ -1,4 +1,4 @@
-#compdef splash
+#compdef splash splash-m1
 
 # Keep the stable install path so an already-running shell survives upgrades.
 typeset -g _splash_completion_source=${${(%):-%x}:a}
@@ -28,8 +28,12 @@ _splash() {
     return 0
 }
 
+_splash-m1() {
+    _splash "$@"
+}
+
 if [[ $zsh_eval_context[-1] == loadautofunc ]]; then
     _splash "$@"
 elif (( $+functions[compdef] )); then
-    compdef _splash splash
+    compdef _splash splash splash-m1
 fi

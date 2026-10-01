@@ -53,6 +53,12 @@ public:
   // One section of the parts' total bytes, as a view of each part in order.
   [[nodiscard]] std::vector<metal::MetalBuffer> split(std::initializer_list<uint64_t> parts,
                                                       std::string_view label);
+  // The next entry of an affine image's per-projection-section bits table
+  // (WeightLayout.hpp's parseAffineBitsTable), parsed from the header block
+  // on first use: readAffineProjection calls this once per projection, in
+  // the order AffinePreparation.cpp's writer built the table. Throws once
+  // every entry is read.
+  [[nodiscard]] uint32_t nextAffineProjectionBits();
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
 

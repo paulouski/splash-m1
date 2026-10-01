@@ -311,29 +311,10 @@ void requireNumbers(NSDictionary *object, std::initializer_list<GeometryField> f
     requireEqual(requireUnsigned(object, [NSString stringWithUTF8String:field.name], field.name), field.value, field.name);
 }
 
-ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
-  NSDictionary *record = readObject(root / "model.json", "resolved model");
-  requireEqual(requireUnsigned(record, @"version", "model record version"), 1, "model record version");
-  NSDictionary *config = readObject(root / "config.json", "upstream model config");
-  NSDictionary *text = requireObject(config, @"text_config", "text config");
-  const auto type = requireString(text, @"model_type", "text model type");
-  const auto name = requireString(record, @"model", "model name");
-  ModelDescriptor result;
-  if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
-  else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
-  else throw std::invalid_argument("unsupported model architecture: " + type);
-  std::visit([&](const auto &layout) {
-    requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-        {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
-        {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
-        {"head_dim", layout.attentionHeadDimension}});
-  }, result.target);
-  const auto target = requireString(record, @"target_format", "target format");
-  if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
-  else if (target == "gguf") result.targetSource = TargetSource::Gguf;
-  else throw std::invalid_argument("unsupported target source format: " + target);
-
-  NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+// Validates a DFlash2 draft's own config.json against the target it was
+// distilled for, and marks it a checkpoint draft. Shared by an installed
+// package's resolved model record and a local directory pair.
+void validateSourceDraft(NSDictionary *draft, ModelDescriptor &result) {
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1 || ![architectures[0] isEqual:@"DFlash2DraftModel"])
     throw std::invalid_argument("draft is not a DFlash2 model");
@@ -366,6 +347,55 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
     }
   }, result.target);
   result.draftSource = DraftSource::Checkpoint;
+}
+
+// A target directory's own config.json, with a VLM wrapper's text_config
+// unwrapped exactly as SafetensorsCheckpoint.mm does (falling back to the
+// whole document for a plain text-only export).
+NSDictionary *textConfigOf(const std::filesystem::path &directory) {
+  NSDictionary *config = readObject(directory / "config.json", "target config");
+  NSDictionary *text = config[@"text_config"];
+  return [text isKindOfClass:[NSDictionary class]] ? text : config;
+}
+
+// A local target directory's own weight format: a GGUF file, else safetensors
+// shards. No manifest names it; the files present do.
+TargetSource detectTargetFormat(const std::filesystem::path &directory) {
+  bool sawSafetensors = false;
+  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
+    if (!entry.is_regular_file() && !entry.is_symlink()) continue;
+    const auto extension = entry.path().extension();
+    if (extension == ".gguf") return TargetSource::Gguf;
+    if (extension == ".safetensors") sawSafetensors = true;
+  }
+  if (sawSafetensors) return TargetSource::Mlx;
+  throw std::invalid_argument("target directory contains neither safetensors nor gguf weights");
+}
+
+ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
+  NSDictionary *record = readObject(root / "model.json", "resolved model");
+  requireEqual(requireUnsigned(record, @"version", "model record version"), 1, "model record version");
+  NSDictionary *config = readObject(root / "config.json", "upstream model config");
+  NSDictionary *text = requireObject(config, @"text_config", "text config");
+  const auto type = requireString(text, @"model_type", "text model type");
+  const auto name = requireString(record, @"model", "model name");
+  ModelDescriptor result;
+  if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
+  else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
+  else throw std::invalid_argument("unsupported model architecture: " + type);
+  std::visit([&](const auto &layout) {
+    requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+        {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+        {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
+        {"head_dim", layout.attentionHeadDimension}});
+  }, result.target);
+  const auto target = requireString(record, @"target_format", "target format");
+  if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
+  else if (target == "gguf") result.targetSource = TargetSource::Gguf;
+  else throw std::invalid_argument("unsupported target source format: " + target);
+
+  NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+  validateSourceDraft(draft, result);
 
   const auto vision = requireString(record, @"vision_format", "vision format");
   if (vision == "none") result.visionSource = VisionSource::None;
@@ -466,6 +496,36 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
     if (!descriptor.valid())
       throw std::logic_error("built-in model descriptor is inconsistent");
     return descriptor;
+  }
+}
+
+ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
+                                  const std::filesystem::path &draftDirectory) {
+  @autoreleasepool {
+    NSDictionary *text = textConfigOf(targetDirectory);
+    const auto type = requireString(text, @"model_type", "text model type");
+    std::string name = targetDirectory.filename().string();
+    if (name.empty()) name = targetDirectory.parent_path().filename().string();
+    if (name.empty()) name = "local-model";
+    ModelDescriptor result;
+    if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
+    else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
+    else throw std::invalid_argument("unsupported model architecture: " + type);
+    std::visit([&](const auto &layout) {
+      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+          {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+          {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
+          {"head_dim", layout.attentionHeadDimension}});
+    }, result.target);
+    result.targetSource = detectTargetFormat(targetDirectory);
+
+    NSDictionary *draft = readObject(draftDirectory / "config.json", "draft config");
+    validateSourceDraft(draft, result);
+
+    // Local serving loads no vision tower.
+    result.visionSource = VisionSource::None;
+    if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
+    return result;
   }
 }
 

@@ -76,6 +76,52 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
       !weights_.layout.stateLayout().valid()) {
     throw std::invalid_argument("draft weights do not match state geometry");
   }
+
+  const ops::DraftAttentionShape expectedContextShape{
+      5120, 1280, 6144, 4096, 32, 8, 128};
+  if (backend_.capabilities().appleGpuFamily != 7 || weights_.layout.layers != 5 ||
+      weights_.layout.attentionShape() != expectedContextShape)
+    return;
+
+  const uint32_t contextSize = weights_.layout.attentionShape().contextSize();
+  const uint32_t skippedRows = weights_.layout.qkvSize - contextSize;
+  for (const DFlashDraftLayerWeights &layer : weights_.layers) {
+    const ops::Projection &qkv = layer.qkvProjection;
+    if (qkv.layout() != ops::WeightLayout::Affine64 || qkv.bits != 4 ||
+        qkv.outputSize != weights_.layout.qkvSize ||
+        qkv.inputSize != weights_.layout.hiddenSize || skippedRows % 256)
+      return;
+  }
+
+  std::vector<ops::Projection> contextKv;
+  contextKv.reserve(weights_.layers.size());
+  for (const DFlashDraftLayerWeights &layer : weights_.layers) {
+    const ops::Projection &qkv = layer.qkvProjection;
+    const uint64_t skippedElements = uint64_t{skippedRows} * qkv.inputSize;
+    const ops::AffineWeights &weights = qkv.affine();
+    const auto tail = [&](const metal::MetalBuffer &plane, uint64_t offset) {
+      return backend_.view(plane, offset, plane.sizeBytes() - offset);
+    };
+    ops::Projection slice{
+        contextSize, qkv.inputSize,
+        ops::AffineWeights{tail(weights.weights, skippedElements / 2),
+                           tail(weights.scales, skippedElements / 32),
+                           tail(weights.biases, skippedElements / 32)}};
+    slice.bits = qkv.bits;
+    slice.destination = qkv.destination;
+    contextKv.push_back(std::move(slice));
+  }
+
+  const ops::Linear &linear = operators_.linear();
+  for (uint32_t layer = 0; layer < weights_.layout.layers; ++layer) {
+    for (uint32_t lanes = 1; lanes <= ExecutionLimits::maximumBatchWidth;
+         ++lanes) {
+      if (!linear.decodeBatchSlicePlan(
+              weights_.layers[layer].qkvProjection, contextKv[layer], lanes))
+        return;
+    }
+  }
+  contextKv_ = std::move(contextKv);
 }
 
 void DFlashDraft::addSelection(
@@ -99,6 +145,9 @@ void DFlashDraft::addContextPrefill(
   if (!rows || rows > ExecutionLimits::prefillTokenBudget || spans.empty())
     throw std::invalid_argument("invalid draft context prefill");
   const DFlashDraftLayout &layout = weights_.layout;
+  const bool kvOnly = !contextKv_.empty();
+  const uint32_t contextWidth = kvOnly
+      ? layout.attentionShape().contextSize() : layout.qkvSize;
   for (const DFlashPrefillSpan &span : spans) {
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
@@ -112,18 +161,19 @@ void DFlashDraft::addContextPrefill(
       buffers.projectionSums, layout.hiddenSize, rows);
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const ops::Projection &qkv = kvOnly
+        ? contextKv_[layer] : weights_.layers[layer].qkvProjection;
     operators_.linear().addPrefill(graph, buffers.hidden,
-                      weights_.layers[layer].qkvProjection, buffers.qkv,
-                      buffers.projectionSums, rows);
+                      qkv, buffers.qkv, buffers.projectionSums, rows);
     for (const DFlashPrefillSpan &span : spans) {
-      const uint64_t qkvOffset =
-          uint64_t{span.compactRow} * layout.qkvSize * sizeof(uint16_t);
+      const uint64_t qkvOffset = uint64_t{span.compactRow} * contextWidth *
+                                 sizeof(uint16_t);
       const uint64_t ropeOffset =
           uint64_t{span.compactRow} * (layout.attentionHeadDimension / 2) * sizeof(float);
       ops::DraftAttention::addContextPrefill(
           graph,
           backend_.view(buffers.qkv, qkvOffset,
-                        uint64_t{span.rows} * layout.qkvSize *
+                        uint64_t{span.rows} * contextWidth *
                             sizeof(uint16_t)),
           weights_.layers[layer].keyNorm,
           backend_.view(buffers.ropeCos, ropeOffset,
@@ -132,7 +182,7 @@ void DFlashDraft::addContextPrefill(
                         uint64_t{span.rows} * (layout.attentionHeadDimension / 2) * sizeof(float)),
           span.ring[layer].keys, span.ring[layer].values, span.rows,
           layout.stateLayout().tokens, span.startPosition,
-          layout.attentionShape());
+          layout.attentionShape(), kvOnly);
     }
   }
 }
@@ -246,6 +296,7 @@ void DFlashDraft::addContextCommit(
     throw std::invalid_argument("invalid draft context batch");
   }
   const DFlashDraftLayout &layout = weights_.layout;
+  const bool kvOnly = !contextKv_.empty();
   const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
   operators_.linear().addDecodeBatch(graph,
                      buffers.capturedTargetHidden, weights_.contextProjection,
@@ -256,15 +307,23 @@ void DFlashDraft::addContextCommit(
       buffers.linearScratch, operators_.linear().decodePlan(weights_.layers[0].qkvProjection, lanes).input());
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    hidden = operators_.linear().addDecodeBatch(graph, buffers.hidden,
-                       weights_.layers[layer].qkvProjection, buffers.qkv,
-                       lanes, stats, buffers.linearScratch, hidden);
+    const ops::Projection &qkv = kvOnly
+        ? contextKv_[layer] : weights_.layers[layer].qkvProjection;
+    if (kvOnly) {
+      hidden = operators_.linear().addDecodeBatchSlice(
+          graph, buffers.hidden, weights_.layers[layer].qkvProjection, qkv,
+          buffers.qkv, lanes, stats, buffers.linearScratch, hidden);
+    } else {
+      hidden = operators_.linear().addDecodeBatch(
+          graph, buffers.hidden, qkv, buffers.qkv, lanes, stats,
+          buffers.linearScratch, hidden);
+    }
     ops::DraftAttention::addContextCommit(
         graph, buffers.qkv, weights_.layers[layer].keyNorm, buffers.ropeCos,
         buffers.ropeSin, buffers.persistentKeys[layer],
         buffers.persistentValues[layer], buffers.retainedCounts,
         startPositions, layout.stateLayout().tokens, layout.attentionShape(),
-        lanes);
+        lanes, kvOnly);
   }
 }
 

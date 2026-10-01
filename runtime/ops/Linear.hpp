@@ -8,6 +8,7 @@
 #include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -77,6 +78,8 @@ struct LinearWorkload final {
   LinearPhase phase = LinearPhase::Decode;
   LinearEpilogue epilogue = LinearEpilogue::None;
   WeightLayout weightLayout = WeightLayout::Affine64;
+  // Affine only: 4 or 5 (Q5Pack.hpp). Part of the plan cache key via <=>.
+  uint32_t bits = 4;
   auto operator<=>(const LinearWorkload &) const = default;
 };
 
@@ -142,10 +145,14 @@ enum class LinearInput : uint8_t {
   Plain,    // bf16 [rows][K]
   Table64,  // affine simdgroup table, one sum per 64 inputs (kernels/common/q4_sgmatrix.h)
   Table16,  // GGUF simdgroup table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  Table64Half, // SimdgroupF32 table with FP16 conversion of BF16-rounded values
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
   return uint64_t{width} * rows * 2;
+}
+[[nodiscard]] constexpr uint64_t tableBytes(LinearInput, uint32_t width, uint64_t rows) noexcept {
+  return tableBytes(width, rows);
 }
 [[nodiscard]] uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept;
 // The scratch table currently holds `source` in `layout`. Plain means the
@@ -252,6 +259,10 @@ public:
   [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
+  // Returns the full projection's simdgroup plan adapted to a whole-tile
+  // output slice, or no plan when this tile/grid cannot be sliced safely.
+  [[nodiscard]] std::optional<LinearPlan> decodeBatchSlicePlan(
+      const Projection &full, const Projection &slice, uint32_t lanes) const;
   [[nodiscard]] LinearScratchSize decodeScratchSize(LinearWorkload workload) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the GGUF
@@ -294,6 +305,11 @@ public:
                                const Projection &projection, metal::MetalBuffer output, uint32_t lanes,
                                LinearDispatchStats &stats, LinearScratch scratch = {},
                                PreparedInput prepared = {}) const;
+  PreparedInput addDecodeBatchSlice(
+      metal::CommandGraph &graph, metal::MetalBuffer input,
+      const Projection &full, const Projection &slice,
+      metal::MetalBuffer output, uint32_t lanes, LinearDispatchStats &stats,
+      LinearScratch scratch = {}, PreparedInput prepared = {}) const;
   PreparedInput addGateUpBatch(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &gate,
                                const Projection &up, metal::MetalBuffer gateScratch, metal::MetalBuffer output,
                                uint32_t lanes, LinearDispatchStats &stats, LinearScratch scratch = {},

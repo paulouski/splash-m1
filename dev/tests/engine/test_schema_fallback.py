@@ -110,6 +110,53 @@ class SchemaFallbackTests(unittest.TestCase):
                 )
                 self.verify(schema, '"red"', ['"blue"', "red", "7"], "red")
 
+    def test_compilable_patterns_constrain_generation(self):
+        order = {"type": "string", "pattern": "^ORD-[0-9]{4}$"}
+        nested = {"type": "object", "properties": {"id": order}, "required": ["id"]}
+        self.verify(
+            {"type": "object", "properties": {"value": nested}, "required": ["value"]},
+            '{"id":"ORD-1234"}',
+            ['{"id":"ORD-2024-8892"}', '{"id":"ord-1234"}'],
+            {"id": "ORD-1234"},
+        )
+        # Unanchored patterns keep search semantics; unsupported look-around
+        # remains enforced when the completed output is validated.
+        schema = {
+            "type": "object",
+            "properties": {
+                "order": order,
+                "code": {"type": "string", "pattern": "[A-Z]{3}"},
+                "path": {"type": "string", "pattern": r"^(?!\.\.)[a-z/.]+$"},
+            },
+            "required": ["order", "code", "path"],
+            "additionalProperties": False,
+        }
+        grammar = tool_schema.json_grammar(schema, False)
+        self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
+        for order_id, code, valid in (
+            ("ORD-1234", "xABCx", True),
+            ("ORD-2024-8892-GOLD", "ABC", False),
+            ("ORD-1234", "abc", False),
+        ):
+            with self.subTest(order=order_id, code=code):
+                text = json.dumps({"order": order_id, "code": code, "path": "../x"})
+                tokens = self.tokenizer.encode(text).ids
+                matcher = LLMatcher(self.guidance, grammar)
+                accepted = matcher.validate_tokens(tokens) == len(tokens)
+                if accepted:
+                    self.assertTrue(matcher.consume_tokens(tokens))
+                    accepted = matcher.is_accepting()
+                self.assertEqual(accepted, valid)
+        _, validator = tool_schema.normalize_response_format(
+            {"type": "json_schema", "json_schema": {"schema": schema}}
+        )
+        with self.assertRaises(api.APIError) as caught:
+            model_output.validate_response_content(
+                json.dumps({"order": "ORD-1234", "code": "ABC", "path": "../x"}),
+                validator,
+            )
+        self.assertEqual(caught.exception.code, "invalid_model_output")
+
     def test_local_reference_and_sibling_constraints_are_both_retained(self):
         schema = {
             "type": "object",

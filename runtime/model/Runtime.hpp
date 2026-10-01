@@ -3,9 +3,20 @@
 #include "model/ModelFactory.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 
 namespace splash::model {
+
+// Gate tooling only: when set, raw fp32 target logit rows are appended here.
+inline std::FILE *gLogitsDump = nullptr;
+
+// Analysis tooling only: SPLASH_ACCEPT_LOG=<path> appends one TSV line per
+// verify cycle (see Runtime.mm finalizeDecode).
+inline std::FILE *gAcceptLog = std::getenv("SPLASH_ACCEPT_LOG")
+                                   ? std::fopen(std::getenv("SPLASH_ACCEPT_LOG"), "a")
+                                   : nullptr;
 
 class Runtime final : public RuntimeModel {
 public:

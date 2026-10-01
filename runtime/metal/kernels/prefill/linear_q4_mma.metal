@@ -23,23 +23,26 @@ using namespace metal;
 // MPP prefill kernels of the same epilogue, including the 32-row input sums.
 namespace q4mm {
 
-constexpr constant uint kRows = 32;       // prompt rows per threadgroup
+constexpr constant uint kStorageRows = 32; // storage rows per threadgroup
 constexpr constant uint kGroup = 64;      // inputs per quant group
 constexpr constant uint kStorageN = 256;  // weight tile width of the packing
-constexpr constant uint FN = 4, FM = 2;   // fragments per simdgroup: columns, rows
-constexpr constant uint SGN = 2, SGM = 2; // simdgroups per threadgroup: columns, rows
+constexpr constant uint FN = 4;           // fragments per simdgroup: columns
+constexpr constant uint SGN = 2;          // simdgroups per threadgroup: columns
 constexpr constant uint kColumns = SGN * FN * 8;
-constexpr constant uint kSimdgroups = SGN * SGM;
-static_assert(SGM * FM * 8 == kRows && kStorageN % kColumns == 0 && kColumns % kGroup == 0);
+static_assert(kStorageN % kColumns == 0 && kColumns % kGroup == 0);
 
 enum class Epilogue { Affine, Residual, UpWithGate };
 
-template <Epilogue E>
+template <uint ActiveRows, Epilogue E>
 inline void project(device const bfloat *input, device const uchar *weights,
-                    device const bfloat *scales, device const bfloat *biases,
+                    device const half *scales, device const half *biases,
                     device bfloat *output, device const bfloat *auxiliary,
                     device const float *sums, uint N, uint K, uint2 tg,
                     uint sg, uint lane) {
+  constexpr uint FM = ActiveRows == 32 ? 2 : 1;
+  constexpr uint SGM = ActiveRows / (FM * 8);
+  static_assert((ActiveRows == 8 || ActiveRows == 16 || ActiveRows == 32) &&
+                SGM * FM * 8 == ActiveRows);
   const uint groups = K / kGroup;
   const uint n0 = tg.y * kColumns;
   const uint tile = n0 / kStorageN;
@@ -53,12 +56,12 @@ inline void project(device const bfloat *input, device const uchar *weights,
   const uint nLocal = (n0 + nBase) % kStorageN + fm;
   device const uchar *laneWeights = weights +
       (ulong(tile) * groups * kStorageN + nLocal) * (kGroup / 2) + (fn / 2) * 8;
-  device const bfloat *laneScales = scales + ulong(tile) * groups * kStorageN + nLocal;
-  device const bfloat *laneBiases = biases + ulong(tile) * groups * kStorageN + nLocal;
-  input += (ulong(tg.x) * kRows + rowBase) * K + 8 * fm;
-  sums += ulong(tg.x) * kRows * groups + rowBase;
-  output += ulong(tg.x) * kRows * N;
-  auxiliary += ulong(tg.x) * kRows * N;
+  device const half *laneScales = scales + ulong(tile) * groups * kStorageN + nLocal;
+  device const half *laneBiases = biases + ulong(tile) * groups * kStorageN + nLocal;
+  input += (ulong(tg.x) * kStorageRows + rowBase) * K + 8 * fm;
+  sums += ulong(tg.x) * kStorageRows * groups + rowBase;
+  output += ulong(tg.x) * kStorageRows * N;
+  auxiliary += ulong(tg.x) * kStorageRows * N;
 
   float2 acc[FN][FM];
 #pragma unroll
@@ -132,7 +135,8 @@ inline void project(device const bfloat *input, device const uchar *weights,
     }
 #pragma unroll
     for (uint j = 0; j < FM; ++j) {
-      const float2 sum = float2(sums[g * kRows + j * 8], sums[g * kRows + j * 8 + 1]);
+      const float2 sum = float2(sums[g * kStorageRows + j * 8],
+                                sums[g * kStorageRows + j * 8 + 1]);
 #pragma unroll
       for (uint i = 0; i < FN; ++i) {
         acc[i][j] = fma(dot[i][j], scale[i], acc[i][j]);
@@ -164,18 +168,21 @@ inline void project(device const bfloat *input, device const uchar *weights,
 
 // Row sums of the fused up output: the next (down) projection's input sums,
 // in the prefill 32-row tile layout. Reads back this threadgroup's own stores.
+template <uint ActiveRows>
 inline void write_output_sums(device const bfloat *output, device float *outputSums,
                               uint N, uint2 tg, uint sg, uint lane) {
   constexpr uint Groups = kColumns / kGroup;
+  constexpr uint FM = ActiveRows == 32 ? 2 : 1;
+  constexpr uint kSimdgroups = SGN * (ActiveRows / (FM * 8));
   threadgroup_barrier(mem_flags::mem_device);
-  output += ulong(tg.x) * kRows * N;
-  outputSums += ulong(tg.x) * kRows * (N / kGroup);
+  output += ulong(tg.x) * kStorageRows * N;
+  outputSums += ulong(tg.x) * kStorageRows * (N / kGroup);
   const uint n0 = tg.y * kColumns;
-  for (uint task = sg; task < kRows * Groups; task += kSimdgroups) {
+  for (uint task = sg; task < ActiveRows * Groups; task += kSimdgroups) {
     const uint row = task / Groups, local = task % Groups;
     const uint origin = row * N + n0 + local * kGroup + lane;
     const float sum = simd_sum(float(output[origin]) + float(output[origin + 32]));
-    if (lane == 0) outputSums[(n0 / kGroup + local) * kRows + row] = sum;
+    if (lane == 0) outputSums[(n0 / kGroup + local) * kStorageRows + row] = sum;
   }
 }
 
@@ -188,32 +195,105 @@ inline void write_output_sums(device const bfloat *output, device float *outputS
 
 kernel void prefill_linear_q4_mma64(
     device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
-    device const bfloat *scales [[buffer(2)]], device const bfloat *biases [[buffer(3)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
     constant Q4PrefillParams &p [[buffer(6)]], Q4MM_THREADS) {
-  q4mm::project<q4mm::Epilogue::Affine>(input, weights, scales, biases, output, output,
+  q4mm::project<32, q4mm::Epilogue::Affine>(input, weights, scales, biases, output, output,
                                         sums, p.output_size, p.input_size, tg, sg, lane);
 }
 
 kernel void prefill_linear_q4_mma64_residual(
     device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
-    device const bfloat *scales [[buffer(2)]], device const bfloat *biases [[buffer(3)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
     device const bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]], constant Q4PrefillParams &p [[buffer(7)]],
     Q4MM_THREADS) {
-  q4mm::project<q4mm::Epilogue::Residual>(input, weights, scales, biases, output, residual,
+  q4mm::project<32, q4mm::Epilogue::Residual>(input, weights, scales, biases, output, residual,
                                           sums, p.output_size, p.input_size, tg, sg, lane);
 }
 
 kernel void prefill_linear_q4_mma64_up_silu_sums(
     device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
-    device const bfloat *scales [[buffer(2)]], device const bfloat *biases [[buffer(3)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
     device const bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]], device float *outputSums [[buffer(7)]],
     constant Q4PrefillParams &p [[buffer(8)]], Q4MM_THREADS) {
-  q4mm::project<q4mm::Epilogue::UpWithGate>(input, weights, scales, biases, output, gate,
+  q4mm::project<32, q4mm::Epilogue::UpWithGate>(input, weights, scales, biases, output, gate,
                                             sums, p.output_size, p.input_size, tg, sg, lane);
-  q4mm::write_output_sums(output, outputSums, p.output_size, tg, sg, lane);
+  q4mm::write_output_sums<32>(output, outputSums, p.output_size, tg, sg, lane);
 }
+
+#define Q4MM_TAIL_THREADS                                                     \
+  uint2 tg [[threadgroup_position_in_grid]],                                  \
+      uint sg [[simdgroup_index_in_threadgroup]],                             \
+      uint lane [[thread_index_in_simdgroup]]
+
+kernel void prefill_linear_q4_mma64_m8(
+    device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
+    device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
+    constant Q4PrefillTailParams &p [[buffer(6)]], Q4MM_TAIL_THREADS) {
+  tg.x += p.row_tile_offset;
+  q4mm::project<8, q4mm::Epilogue::Affine>(input, weights, scales, biases, output, output,
+      sums, p.projection.output_size, p.projection.input_size, tg, sg, lane);
+}
+
+kernel void prefill_linear_q4_mma64_m16(
+    device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
+    device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
+    constant Q4PrefillTailParams &p [[buffer(6)]], Q4MM_TAIL_THREADS) {
+  tg.x += p.row_tile_offset;
+  q4mm::project<16, q4mm::Epilogue::Affine>(input, weights, scales, biases, output, output,
+      sums, p.projection.output_size, p.projection.input_size, tg, sg, lane);
+}
+
+kernel void prefill_linear_q4_mma64_residual_m8(
+    device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
+    device const bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
+    device const float *sums [[buffer(6)]], constant Q4PrefillTailParams &p [[buffer(7)]],
+    Q4MM_TAIL_THREADS) {
+  tg.x += p.row_tile_offset;
+  q4mm::project<8, q4mm::Epilogue::Residual>(input, weights, scales, biases, output, residual,
+      sums, p.projection.output_size, p.projection.input_size, tg, sg, lane);
+}
+
+kernel void prefill_linear_q4_mma64_residual_m16(
+    device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
+    device const bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
+    device const float *sums [[buffer(6)]], constant Q4PrefillTailParams &p [[buffer(7)]],
+    Q4MM_TAIL_THREADS) {
+  tg.x += p.row_tile_offset;
+  q4mm::project<16, q4mm::Epilogue::Residual>(input, weights, scales, biases, output, residual,
+      sums, p.projection.output_size, p.projection.input_size, tg, sg, lane);
+}
+
+kernel void prefill_linear_q4_mma64_up_silu_sums_m8(
+    device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
+    device const bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
+    device const float *sums [[buffer(6)]], device float *outputSums [[buffer(7)]],
+    constant Q4PrefillTailParams &p [[buffer(8)]], Q4MM_TAIL_THREADS) {
+  tg.x += p.row_tile_offset;
+  q4mm::project<8, q4mm::Epilogue::UpWithGate>(input, weights, scales, biases, output, gate,
+      sums, p.projection.output_size, p.projection.input_size, tg, sg, lane);
+  q4mm::write_output_sums<8>(output, outputSums, p.projection.output_size, tg, sg, lane);
+}
+
+kernel void prefill_linear_q4_mma64_up_silu_sums_m16(
+    device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
+    device const bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
+    device const float *sums [[buffer(6)]], device float *outputSums [[buffer(7)]],
+    constant Q4PrefillTailParams &p [[buffer(8)]], Q4MM_TAIL_THREADS) {
+  tg.x += p.row_tile_offset;
+  q4mm::project<16, q4mm::Epilogue::UpWithGate>(input, weights, scales, biases, output, gate,
+      sums, p.projection.output_size, p.projection.input_size, tg, sg, lane);
+  q4mm::write_output_sums<16>(output, outputSums, p.projection.output_size, tg, sg, lane);
+}
+
+#undef Q4MM_TAIL_THREADS
 
 #undef Q4MM_THREADS

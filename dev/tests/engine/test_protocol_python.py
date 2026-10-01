@@ -15,10 +15,10 @@ ROOT = Path(__file__).parents[3]
 
 
 REQUEST_GOLDEN = (
-    "53504c480600180001000000540000000000000000000000efcdab8967452301"
+    "53504c480600180001000000550000000000000000000000efcdab8967452301"
     "000201008098281765060040a5ae0200000000008000000500000000000000cd"
-    "cc4c3f3333733f200000001032547698badcfe00000000000000000001000000"
-    "2a00000000000080ffffffff"
+    "cc4c3f3333733f200000001032547698badcfe00000000000000000000010000"
+    "002a00000000000080ffffffff"
 )
 ERROR_GOLDEN = (
     "53504c4806001800050100002700000000000000000000000200000000000000"
@@ -410,7 +410,7 @@ class ProtocolPythonTests(unittest.TestCase):
             struct.unpack_from("<I", wire, 24 + 60)[0], len(request.score_tokens)
         )
         self.assertEqual(
-            struct.unpack_from("<3I", wire, 24 + 64 + 4 * 3),
+            struct.unpack_from("<3I", wire, 24 + 65 + 4 * 3),
             request.score_tokens,
         )
         self.assertEqual(
@@ -440,6 +440,36 @@ class ProtocolPythonTests(unittest.TestCase):
         for message in (request, done):
             encoded = p.serialize_message(message)
             self.assertEqual(p.decode_frame(parse_all(encoded)[0]), message)
+
+    def test_logprobs_request_and_tokens_roundtrip(self):
+        request = replace(
+            example_request(),
+            cohort=p.Cohort.SAMPLING,
+            constraint=p.ConstraintMode.NONE,
+            logprobs=21,
+        )
+        tokens = p.TokensEvent(
+            7,
+            3,
+            (5, 9),
+            (
+                (-0.5, (5, 1, 2), (-0.5, -1.0, -2.0)),
+                (-0.25, (9, 4, 8), (-0.25, -3.0, -4.0)),
+            ),
+        )
+        for message in (request, tokens):
+            encoded = p.serialize_message(message)
+            self.assertEqual(p.decode_frame(parse_all(encoded)[0]), message)
+        constrained = replace(
+            request,
+            cohort=p.Cohort.CONSTRAINED,
+            constraint=p.ConstraintMode.TOKEN_MASK,
+        )
+        for bad in (replace(request, logprobs=22), constrained):
+            with self.assertRaises(p.ProtocolError):
+                p.serialize_message(bad)
+        plain = p.serialize_message(p.TokensEvent(7, 0, (5,)))
+        self.assertEqual(p.decode_frame(parse_all(plain)[0]).logprobs, ())
 
     def test_score_request_rejects_generation_combinations(self):
         base = example_score_request()
@@ -493,7 +523,7 @@ class ProtocolPythonTests(unittest.TestCase):
     def test_malformed_score_frames_preserve_request_error_codes(self):
         request = example_score_request()
         payload = p.encode_message(request).payload
-        score_offset = 64 + 4 * len(request.prompt_tokens)
+        score_offset = 65 + 4 * len(request.prompt_tokens)
         for tokens, output_tokens in (
             ((101,), 0),
             ((101, 101), 0),
@@ -637,18 +667,18 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(wire[:4], b"SPLH")
         self.assertEqual(
             struct.unpack_from("<HHHHQI", wire, 4),
-            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 84, 0),
+            (p.PROTOCOL_VERSION, 24, int(p.FrameType.REQUEST), 0, 85, 0),
         )
         self.assertEqual(struct.unpack_from("<Q", wire, 24)[0], request.request_id)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 31)[0], 5)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 0)
         self.assertEqual(
-            struct.unpack_from("<5I", wire, 24 + 64), request.prompt_tokens
+            struct.unpack_from("<5I", wire, 24 + 65), request.prompt_tokens
         )
 
         image = example_image_request()
         wire = p.serialize_message(image)
-        span_offset = 24 + 64 + 4 * len(image.prompt_tokens)
+        span_offset = 24 + 65 + 4 * len(image.prompt_tokens)
         self.assertEqual(struct.unpack_from("<I", wire, 24 + 35)[0], 1)
         self.assertEqual(
             struct.unpack_from("<IIIIQQ", wire, span_offset),

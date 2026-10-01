@@ -16,7 +16,11 @@
 
 namespace splash::model::affine {
 
-enum class SectionKind { Copy, Decay, Projection, Quantize };
+// HalfCopy is Copy's scale/bias counterpart: the canonical prepared dtype of
+// a scale or bias is half, so a BF16 source is converted (Copy leaves any
+// accepted dtype's bytes untouched, correct only for tensors a kernel reads
+// in their stored type, never a scale or bias).
+enum class SectionKind { Copy, Decay, Projection, Quantize, HalfCopy };
 
 // A checkpoint tensor a section reads: its name, the dtypes it is read in and
 // its shape, planned from the layout; tensor is bound once the checkpoint is
@@ -29,10 +33,16 @@ struct Input {
 };
 
 // Source rows of a fused projection: its MLX weight, scales and biases
-// (Projection), or its BF16 weight (Quantize).
+// (Projection), or its BF16 weight (Quantize). A Projection part's own bits
+// may be less than its Section's bits: a fused section (for example the GDN
+// in_proj_qkv/z/b/a parts, or q/k/v) can mix widths in this checkpoint, and a
+// lower-bits part is promoted losslessly into the section's wider storage
+// (Q5Pack.hpp's promoteQ4Group): its low 4 bits are its existing codes
+// unchanged, its 5th bit is zero, at the same scale and bias.
 struct ProjectionPart {
   uint32_t rows = 0;
   std::vector<Input> fields;
+  uint32_t bits = 4;
 };
 
 struct Section {
@@ -41,6 +51,8 @@ struct Section {
   Input input; // Copy and Decay
   // Projection and Quantize: the parts in row order. A Projection's rows past
   // them are zero; a Quantize section has none, nor experts, and 4 bits.
+  // bits is the section's stored width: the widest of its parts' own bits
+  // (ProjectionPart::bits), 5 if any part is Q5.
   std::vector<ProjectionPart> parts;
   uint32_t rows = 0, columns = 0, experts = 1, bits = 4;
 };

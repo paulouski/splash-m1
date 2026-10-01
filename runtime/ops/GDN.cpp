@@ -36,7 +36,8 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
 } // namespace
 
 void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
-                     GdnShape shape, uint32_t tokens, GdnHeadOrder order) {
+                     GdnShape shape, uint32_t tokens, GdnHeadOrder order,
+                     bool bf16Staging) {
   if (!tokens)
     throw std::invalid_argument("invalid GDN prefill geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -51,8 +52,11 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
              buffers.timeBias, buffers.decay, buffers.beta},
             prepare, {uint64_t{tokens} * shape.keyHeads, 1, 1},
             {shape.headDimension, 1, 1});
-  graph.add(kernelName(kernel, "prefill_gdn_scan",
-                       "prefill_gdn_scan_vh32"),
+  const char *scan = bf16Staging && kernel == KernelLayout::Value48
+                         ? "prefill_gdn_scan_bf16_block16"
+                         : kernelName(kernel, "prefill_gdn_scan",
+                                      "prefill_gdn_scan_vh32");
+  graph.add(scan,
             {buffers.queries, buffers.keys, buffers.values, buffers.decay,
              buffers.beta, buffers.recurrentIn, buffers.recurrentOut,
              buffers.recurrentRows},
@@ -71,7 +75,8 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
 
 PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffers,
                              GdnShape shape, uint32_t lanes, uint32_t layer,
-                             GdnStateStrides state, GdnHeadOrder order, LinearInput input) {
+                             GdnStateStrides state, GdnHeadOrder order,
+                             LinearInput input, bool qkOnce) {
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid())
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -99,7 +104,19 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};
-  const std::string name = !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
+  const bool prepareQkOnce = qkOnce && lanes == 1 &&
+                             kernel == KernelLayout::Value48 && prepare &&
+                             input == LinearInput::Table64 &&
+                             !buffers.mixerNorm.float32;
+  if (prepareQkOnce) {
+    graph.add("verify_gdn_qk_prepare_once",
+              {buffers.packed, buffers.convolutionWeights,
+               buffers.currentStates[0], buffers.nextStates[0], buffers.mixed},
+              params, {shape.keyHeads, SPLASH_TARGET_VERIFY_ROWS, 1},
+              {32, 1, 1});
+  }
+  const std::string name = prepareQkOnce ? "verify_gdn_fused_table64_qk_once"
+      : !prepare ? kernelName(kernel, "verify_gdn_fused", "verify_gdn_fused_vh32")
       : input == LinearInput::Table16 ? kernelName(kernel, "verify_gdn_fused_table16", "verify_gdn_fused_table16_vh32")
                                       : kernelName(kernel, "verify_gdn_fused_table64", "verify_gdn_fused_table64_vh32");
   graph.add(normKernel(name, buffers.mixerNorm, shape.headDimension), std::move(bindings), params,

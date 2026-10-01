@@ -10,9 +10,9 @@
 // per MMA rather than by weight bandwidth:
 //   A  the weights as exact half: nibble | 0x6400 is 1024 + q (ulp 1), and
 //      subtracting 1024 leaves q;
-//   B  the shared X^T table widened from bfloat to exact fp32;
-//   C  fp32, so every q*x product is exact and only the summation order
-//      differs from the sequential tiles.
+//   B  shared X^T table values widened to fp32; selected decode shapes stage
+//      their BF16-rounded values through FP16, which can round, overflow, or underflow;
+//   C  fp32 accumulation, preserving products for the values actually read.
 // One threadgroup covers every request lane of a batch: each unpacked weight
 // fragment feeds one MMA per lane, instead of a threadgroup per lane unpacking
 // the same weights again. A simdgroup computes 16 columns (8 for each of the
@@ -25,6 +25,30 @@ using namespace q4sg;
 using sgmatrix::te;
 enum class Epilogue { Affine, Residual, GateUp };
 
+template <class Input> struct InputFragment;
+template <> struct InputFragment<bfloat> { vec<bfloat, 8> values; };
+template <> struct InputFragment<half> { float4 values[2]; };
+
+template <class Input>
+__attribute__((always_inline)) inline void decodeInput(
+    device const Input *table, uint base, uint fragIndex, thread InputFragment<Input> &out) {
+  if constexpr (is_same_v<Input, bfloat>) {
+    out.values = reinterpret_cast<device const vec<bfloat, 8> *>(table + base)[fragIndex];
+  } else {
+    device const half4 *x = reinterpret_cast<device const half4 *>(table + base) + fragIndex * 2;
+    out.values[0] = float4(x[0]);
+    out.values[1] = float4(x[1]);
+  }
+}
+
+template <class Input>
+__attribute__((always_inline)) inline float2 inputPair(thread InputFragment<Input> &input, uint s) {
+  if constexpr (is_same_v<Input, bfloat>)
+    return float2(reinterpret_cast<thread bfloat2 *>(&input.values)[s]);
+  else
+    return reinterpret_cast<thread float2 *>(&input.values[0])[s];
+}
+
 // c += a x b for exact half weights and fp32 activations.
 __attribute__((always_inline)) inline void mma(thread float2 &c, half2 a, float2 b) {
   simdgroup_half8x8 A;
@@ -36,13 +60,13 @@ __attribute__((always_inline)) inline void mma(thread float2 &c, half2 a, float2
   c = te(D);
 }
 
-template <Epilogue E, uint L, class Out>
-__attribute__((always_inline)) inline void decode(device const bfloat *table, device const uchar *w0,
-                   device const bfloat *sc0, device const bfloat *bi0,
+template <Epilogue E, uint L, class Out, class Input = bfloat>
+__attribute__((always_inline)) inline void decode(device const Input *table, device const uchar *w0,
+                   device const half *sc0, device const half *bi0,
                    device Out *out, device const float *sums,
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
-                   device const bfloat *sc1, device const bfloat *bi1,
+                   device const half *sc1, device const half *bi1,
                    constant Q4Params &p, uint2 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
@@ -59,64 +83,103 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
   // eight columns apart in one stream.
   auto stream = [&](uint f) { return gateUp ? f : 0u; };
   auto column = [&](uint f) { return base + fm + (gateUp ? 0u : f * 8); };
-  device const uchar *tile0 = w0 + ulong(tile) * groups * 8192;
-  device const uchar *tile1 = w1 + ulong(tile) * groups * 8192;
-  uint2 words[2];
-  auto load = [&](uint g) __attribute__((always_inline)) {
+  // Per-lane weight pointers (tile and column folded in once); the group offset stays 32-bit.
+  device const uchar *lanes[2] = {
+      w0 + ulong(tile) * groups * 8192 + (column(0) % 256) * 32 + c * 8,
+      (gateUp ? w1 : w0) + ulong(tile) * groups * 8192 + (column(1) % 256) * 32 + c * 8};
+  // 32-bit element offsets relative to the projection's own buffers.
+  const uint prmTile = tile * groups * 256;
+  uint2 words[2][2];
+  auto load = [&](uint j, uint g) __attribute__((always_inline)) {
 #pragma unroll
     for (uint f = 0; f < 2; ++f)
-      words[f] = *reinterpret_cast<device const uint2 *>(
-          (stream(f) ? tile1 : tile0) + ulong(g) * 8192 + (column(f) % 256) * 32 + c * 8);
+      words[j][f] = *reinterpret_cast<device const uint2 *>(lanes[f] + g * 8192u);
   };
   float2 acc[2][L];
 #pragma unroll
   for (uint f = 0; f < 2; ++f)
 #pragma unroll
     for (uint r = 0; r < L; ++r) acc[f][r] = float2(0);
-  load(first);
-  for (uint g = first; g < end; ++g) {
-    uint2 w[2] = {words[0], words[1]};
-    if (g + 1 < end) load(g + 1);
+  // GateUp: two groups per iteration (independent MMA chains, folded in group order).
+  uint2 w[2][2];
+  auto run = [&](auto count, uint g) __attribute__((always_inline)) {
+    constexpr uint J = decltype(count)::value;
     // Zeroed as a whole, as in decode_linear_q4_sg (GPU validation).
-    float2 dot[2][L];
+    float2 dot[J][2][L];
 #pragma unroll
-    for (uint f = 0; f < 2; ++f)
+    for (uint j = 0; j < J; ++j)
 #pragma unroll
-      for (uint r = 0; r < L; ++r) dot[f][r] = float2(0);
+      for (uint f = 0; f < 2; ++f)
+#pragma unroll
+        for (uint r = 0; r < L; ++r) dot[j][f][r] = float2(0);
 #pragma unroll
     for (uint h = 0; h < 2; ++h) {
-      // k-steps 4h .. 4h + 3 of every lane's table: one 16-byte load each.
-      vec<bfloat, 8> x[L];
+      // k-steps 4h .. 4h + 3 of every lane's table.
+      InputFragment<Input> x[J][L];
 #pragma unroll
-      for (uint r = 0; r < L; ++r)
-        x[r] = reinterpret_cast<device const vec<bfloat, 8> *>(
-            table + ulong(r) * K * kRows + ulong(g) * kXtPerGroup)[(h * 8 + fm) * 4 + c];
+      for (uint j = 0; j < J; ++j)
+#pragma unroll
+        for (uint r = 0; r < L; ++r)
+          decodeInput(table, r * K * kRows + (g + j) * kXtPerGroup,
+                      (h * 8 + fm) * 4 + c, x[j][r]);
 #pragma unroll
       for (uint s = 0; s < 4; ++s) {
-        float2 b[L];
 #pragma unroll
-        for (uint r = 0; r < L; ++r) b[r] = float2(reinterpret_cast<thread bfloat2 *>(&x[r])[s]);
+        for (uint j = 0; j < J; ++j) {
+          float2 b[L];
 #pragma unroll
-        for (uint f = 0; f < 2; ++f) {
-          const uint nibbles = ((h ? w[f].y : w[f].x) >> (4 * s)) & 0x000F000Fu;
-          const half2 a = as_type<half2>(nibbles | 0x64006400u) - half2(1024.0h);
+          for (uint r = 0; r < L; ++r) b[r] = inputPair(x[j][r], s);
 #pragma unroll
-          for (uint r = 0; r < L; ++r) mma(dot[f][r], a, b[r]);
+          for (uint f = 0; f < 2; ++f) {
+            const uint nibbles = ((h ? w[j][f].y : w[j][f].x) >> (4 * s)) & 0x000F000Fu;
+            const half2 a = as_type<half2>(nibbles | 0x64006400u);
+#pragma unroll
+            for (uint r = 0; r < L; ++r) mma(dot[j][f][r], a, b[r]);
+          }
         }
       }
     }
 #pragma unroll
-    for (uint f = 0; f < 2; ++f) {
-      const ulong prm = (ulong(tile) * groups + g) * 256 + column(f) % 256;
-      const float scale = float((stream(f) ? sc1 : sc0)[prm]);
-      const float bias = float((stream(f) ? bi1 : bi0)[prm]);
+    for (uint j = 0; j < J; ++j)
 #pragma unroll
-      for (uint r = 0; r < L; ++r) {
-        device const float *rowSums = sums + ulong(r) * K / 8 + g * kRows + fn;
-        acc[f][r] = fma(dot[f][r], scale, acc[f][r]);
-        acc[f][r] = fma(float2(rowSums[0], rowSums[1]), bias, acc[f][r]);
+      for (uint f = 0; f < 2; ++f) {
+        const uint prm = prmTile + (g + j) * 256 + column(f) % 256;
+        const float scale = float((stream(f) ? sc1 : sc0)[prm]);
+        // weights are 1024 + q: fold -1024 * scale into the bias (rowSums * bias).
+        const float bias = fma(-1024.0f, scale, float((stream(f) ? bi1 : bi0)[prm]));
+#pragma unroll
+        for (uint r = 0; r < L; ++r) {
+          device const float *rowSums = sums + r * (K / 8) + (g + j) * kRows + fn;
+          acc[f][r] = fma(dot[j][f][r], scale, acc[f][r]);
+          acc[f][r] = fma(float2(rowSums[0], rowSums[1]), bias, acc[f][r]);
+        }
       }
+  };
+  uint g = first;
+  if constexpr (gateUp) {
+    if (g + 1 < end) {
+      load(0, g);
+      load(1, g + 1);
+    } else if (g < end) {
+      load(0, g);
     }
+    for (; g + 1 < end; g += 2) {
+      w[0][0] = words[0][0], w[0][1] = words[0][1], w[1][0] = words[1][0], w[1][1] = words[1][1];
+      if (g + 2 < end) load(0, g + 2);
+      if (g + 3 < end) load(1, g + 3);
+      run(integral_constant<uint, 2>{}, g);
+    }
+  } else {
+    load(0, g);
+    for (; g < end; ++g) {
+      w[0][0] = words[0][0], w[0][1] = words[0][1];
+      if (g + 1 < end) load(0, g + 1);
+      run(integral_constant<uint, 1>{}, g);
+    }
+  }
+  if (gateUp && g < end) {
+    w[0][0] = words[0][0], w[0][1] = words[0][1];
+    run(integral_constant<uint, 1>{}, g);
   }
   if (splits > 1) {
     // Each lane's tile owns splits x two streams of eight fp32 rows.
@@ -169,11 +232,12 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 }
 } // namespace q4sgf
 
-#define Q4_SGF_INPUTS(Out) \
-    device const bfloat *table [[buffer(0)]], device const uchar *weights [[buffer(1)]], \
-    device const bfloat *scales [[buffer(2)]], device const bfloat *biases [[buffer(3)]], \
+#define Q4_SGF_TYPED_INPUTS(Out, Table) \
+    device const Table *table [[buffer(0)]], device const uchar *weights [[buffer(1)]], \
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]], \
     device Out *output [[buffer(4)]], device const float *sums [[buffer(5)]], \
     device coherent(device) float *partials [[buffer(6)]], device atomic_uint *counters [[buffer(7)]]
+#define Q4_SGF_INPUTS(Out) Q4_SGF_TYPED_INPUTS(Out, bfloat)
 #define Q4_SGF_THREADS \
     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
@@ -190,7 +254,7 @@ kernel void Name(Q4_SGF_INPUTS(Out), constant Q4Params &p [[buffer(8)]], Q4_SGF_
 #define Q4_SGF_KERNELS(SUFFIX, L) \
 Q4_SGF_AFFINE(decode_linear_q4_sgf##SUFFIX, L, bfloat) \
 Q4_SGF_AFFINE(decode_linear_q4_sgf##SUFFIX##_f32, L, float) \
-kernel void decode_linear_q4_sgf_residual##SUFFIX(Q4_SGF_INPUTS(bfloat), \
+[[max_total_threads_per_threadgroup(128)]] kernel void decode_linear_q4_sgf_residual##SUFFIX(Q4_SGF_INPUTS(bfloat), \
     device const bfloat *residual [[buffer(8)]], constant Q4Params &p [[buffer(9)]], \
     Q4_SGF_THREADS) { \
   threadgroup uint arrival; \
@@ -198,8 +262,8 @@ kernel void decode_linear_q4_sgf_residual##SUFFIX(Q4_SGF_INPUTS(bfloat), \
       partials, counters, residual, weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
 } \
 kernel void decode_linear_q4_sgf_gate_up##SUFFIX(Q4_SGF_INPUTS(bfloat), \
-    device const uchar *up [[buffer(8)]], device const bfloat *upScales [[buffer(9)]], \
-    device const bfloat *upBiases [[buffer(10)]], constant Q4Params &p [[buffer(11)]], \
+    device const uchar *up [[buffer(8)]], device const half *upScales [[buffer(9)]], \
+    device const half *upBiases [[buffer(10)]], constant Q4Params &p [[buffer(11)]], \
     Q4_SGF_THREADS) { \
   threadgroup uint arrival; \
   q4sgf::decode<q4sgf::Epilogue::GateUp, L, bfloat>(table, weights, scales, biases, output, sums, \
@@ -209,7 +273,25 @@ Q4_SGF_KERNELS(, 1)
 Q4_SGF_KERNELS(_m16, 2)
 Q4_SGF_KERNELS(_m24, 3)
 Q4_SGF_KERNELS(_m32, 4)
+#define Q4_SGF_TYPED_AFFINE(Name, Out, Table) \
+kernel void Name(Q4_SGF_TYPED_INPUTS(Out, Table), constant Q4Params &p [[buffer(8)]], Q4_SGF_THREADS) { \
+  threadgroup uint arrival; \
+  q4sgf::decode<q4sgf::Epilogue::Affine, 1, Out, Table>(table, weights, scales, biases, output, sums, \
+      partials, counters, reinterpret_cast<device const bfloat *>(table), weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
+}
+Q4_SGF_TYPED_AFFINE(decode_linear_q4_sgf_halftable, bfloat, half)
+Q4_SGF_TYPED_AFFINE(decode_linear_q4_sgf_halftable_f32, float, half)
+#undef Q4_SGF_TYPED_AFFINE
+kernel void decode_linear_q4_sgf_halftable_gate_up(
+    Q4_SGF_TYPED_INPUTS(bfloat, half), device const uchar *up [[buffer(8)]],
+    device const half *upScales [[buffer(9)]], device const half *upBiases [[buffer(10)]],
+    constant Q4Params &p [[buffer(11)]], Q4_SGF_THREADS) {
+  threadgroup uint arrival;
+  q4sgf::decode<q4sgf::Epilogue::GateUp, 1, bfloat, half>(table, weights, scales, biases, output, sums,
+      partials, counters, output, up, upScales, upBiases, p, tg, tid, sg, lane, &arrival);
+}
 #undef Q4_SGF_KERNELS
 #undef Q4_SGF_AFFINE
 #undef Q4_SGF_INPUTS
+#undef Q4_SGF_TYPED_INPUTS
 #undef Q4_SGF_THREADS

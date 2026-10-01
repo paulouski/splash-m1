@@ -19,6 +19,9 @@ struct DraftAttentionShape final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
 
+  [[nodiscard]] constexpr uint32_t contextSize() const noexcept {
+    return 2 * kvHeads * headDimension;
+  }
   auto operator<=>(const DraftAttentionShape &) const = default;
 };
 
@@ -52,16 +55,23 @@ public:
   [[nodiscard]] DraftAttentionConfiguration configuration() const noexcept {
     return configuration_;
   }
+  // Apple7/8 have no MetalPerformancePrimitives (macOS 15 build) and no
+  // bfloat arithmetic; addDecode dispatches the register-matrix split kernel
+  // (draft_sgf.metal) instead of the MPP one (draft.metal) when set.
+  [[nodiscard]] bool registerTile() const noexcept { return registerTile_; }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
   DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes,
-                     DraftAttentionConfiguration configuration)
-      : shape_(shape), lanes_(lanes), configuration_(configuration) {}
+                     DraftAttentionConfiguration configuration,
+                     bool registerTile)
+      : shape_(shape), lanes_(lanes), configuration_(configuration),
+        registerTile_(registerTile) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
   DraftAttentionConfiguration configuration_;
+  bool registerTile_;
 
   friend class DraftAttention;
 };
@@ -101,7 +111,8 @@ public:
   candidates(DraftAttentionShape shape);
   [[nodiscard]] static DraftAttentionPlan
   plan(DraftAttentionShape shape, uint32_t lanes,
-       DraftAttentionConfiguration configuration = {});
+       DraftAttentionConfiguration configuration = {},
+       bool registerTile = false);
 
   static void captureTargetHidden(
       metal::CommandGraph &graph, metal::MetalBuffer source,
@@ -132,7 +143,8 @@ public:
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
       metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+      uint32_t startPosition, DraftAttentionShape shape,
+      bool kvOnly = false);
   static void addContextCommit(
       metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
@@ -141,7 +153,7 @@ public:
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
       std::span<const uint32_t> startPositions, uint32_t cacheStride,
-      DraftAttentionShape shape, uint32_t lanes);
+      DraftAttentionShape shape, uint32_t lanes, bool kvOnly = false);
 };
 
 } // namespace splash::ops

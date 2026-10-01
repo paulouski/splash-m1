@@ -1,5 +1,6 @@
 import contextlib
 import fcntl
+import importlib
 import io
 import json
 import os
@@ -53,6 +54,37 @@ class LauncherTests(unittest.TestCase):
         )
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             launcher.parse_args(base + ["--kv-format", "fp16"])
+
+    def test_packaged_help_uses_product_command_and_language_model_example(self):
+        outputs = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "release.json").write_text('{"version":"test"}')
+            try:
+                with (
+                    mock.patch.object(launcher.paths, "ROOT", root),
+                    mock.patch.object(launcher.paths, "PACKAGED", True),
+                ):
+                    importlib.reload(launcher)
+                    for arguments in (["--help"], ["serve", "--help"]):
+                        with (
+                            mock.patch("sys.stdout", io.StringIO()) as output,
+                            self.assertRaises(SystemExit) as help_exit,
+                        ):
+                            launcher.parse_args(arguments)
+                        self.assertEqual(help_exit.exception.code, 0)
+                        outputs.append(output.getvalue())
+            finally:
+                importlib.reload(launcher)
+
+        self.assertIn("usage: splash-m1", outputs[0])
+        example = (
+            "splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit "
+            "--language-only --max-context 32K"
+        )
+        self.assertIn(example, outputs[0])
+        self.assertIn(example, outputs[1])
+        self.assertNotIn("GGUF", "\n".join(outputs))
 
     def test_prefill_mode_defaults_to_bounded_commands(self):
         base = ["serve", "--model", MODEL_ID]

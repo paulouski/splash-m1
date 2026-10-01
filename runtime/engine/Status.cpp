@@ -234,6 +234,13 @@ std::string runtimeStatusJson(
       << ",\"avoided_rows\":" << executorTelemetry.draftContextRowsAvoided
       << ",\"restore_skipped\":" << executorTelemetry.draftStateRestoreSkipped
       << ",\"resets\":" << executorTelemetry.draftStateResets << "}"
+      << ",\"decode_ladder\":{\"speculative_cycles\":"
+      << executorTelemetry.decodeLadderSpeculativeCycles
+      << ",\"ar_cycles\":" << executorTelemetry.decodeLadderArCycles
+      << ",\"switches_to_ar\":" << executorTelemetry.decodeLadderSwitchesToAr
+      << ",\"switches_to_speculative\":"
+      << executorTelemetry.decodeLadderSwitchesToSpeculative
+      << ",\"probes\":" << executorTelemetry.decodeLadderProbes << "}"
       // Model-lifetime timings include warmup; request metrics do not.
       << ",\"model_timing\":{\"scope\":\"model_lifetime\""
       << ",\"prefill\":{\"last_gpu_ms\":"

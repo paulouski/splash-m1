@@ -20,7 +20,7 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kRequestFixedBytes = 64;
+constexpr uint64_t kRequestFixedBytes = 65;
 constexpr uint64_t kImageSpanBytes = 32;
 constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
@@ -111,8 +111,12 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
   case FrameType::Start:
     return bounded(kStartFixedBytes, kStartFixedBytes);
   case FrameType::Tokens:
-    if (!checkedMultiply(limits.maxTokenBatch, sizeof(uint32_t), variable) ||
-        !checkedAdd(kTokensFixedBytes, variable, maximum)) {
+    // Words, then optional top-k width and per-token logprob rows.
+    if (!checkedMultiply(limits.maxTokenBatch,
+                         sizeof(uint32_t) + sizeof(uint32_t) +
+                             (ops::kMaximumTopLogprobs + 1) * 8,
+                         variable) ||
+        !checkedAdd(kTokensFixedBytes + sizeof(uint32_t), variable, maximum)) {
       return std::nullopt;
     }
     return bounded(kTokensFixedBytes, maximum);
@@ -539,6 +543,19 @@ std::optional<ProtocolIssue> validateTokens(const TokensEvent &event,
     return makeIssue(failureClass, IssueCode::IntegerOverflow, event.requestId,
                      "tokens event sequence range overflows uint32");
   }
+  if (!event.logprobs.empty()) {
+    const size_t width = event.logprobs.front().topIds.size();
+    bool consistent = event.logprobs.size() == event.tokens.size() &&
+                      width <= ops::kMaximumTopLogprobs;
+    for (const ops::TokenLogprobs &entry : event.logprobs) {
+      consistent = consistent && entry.topIds.size() == width &&
+                   entry.topLogprobs.size() == width;
+    }
+    if (!consistent) {
+      return makeIssue(failureClass, IssueCode::InvalidCount, event.requestId,
+                       "tokens event logprobs do not match its tokens");
+    }
+  }
   return std::nullopt;
 }
 
@@ -695,6 +712,7 @@ ProtocolResult<Frame> encodeRequest(const RequestFrame &request,
   writer.u64(request.seed);
   writer.u8(request.returnProgress);
   writer.u32(static_cast<uint32_t>(request.scoreTokens.size()));
+  writer.u8(request.logprobs);
   for (uint32_t token : request.promptTokens)
     writer.u32(token);
   for (const ImageSpanFrame &span : request.imageSpans) {
@@ -800,6 +818,16 @@ ProtocolResult<Frame> encodeTokens(const TokensEvent &event,
   writer.u32(static_cast<uint32_t>(event.tokens.size()));
   for (uint32_t token : event.tokens)
     writer.u32(token);
+  if (!event.logprobs.empty()) {
+    writer.u32(static_cast<uint32_t>(event.logprobs.front().topIds.size()));
+    for (const ops::TokenLogprobs &entry : event.logprobs) {
+      writer.f32(entry.logprob);
+      for (uint32_t id : entry.topIds)
+        writer.u32(id);
+      for (float value : entry.topLogprobs)
+        writer.f32(value);
+    }
+  }
   return success(Frame{FrameType::Tokens, writer.take()});
 }
 
@@ -903,7 +931,8 @@ ProtocolResult<Message> decodeRequest(const Frame &frame,
       !reader.f32(request.sampling.temperature) ||
       !reader.f32(request.sampling.topP) ||
       !reader.u32(request.sampling.topK) || !reader.u64(request.seed) ||
-      !reader.u8(returnProgress) || !reader.u32(scoreCount)) {
+      !reader.u8(returnProgress) || !reader.u32(scoreCount) ||
+      !reader.u8(request.logprobs)) {
     return failure<Message>(makeIssue(FailureClass::ProtocolFatal,
                                       IssueCode::InvalidPayloadLength, 0,
                                       "request fixed payload is truncated"));

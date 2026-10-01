@@ -94,6 +94,7 @@ private:
     std::optional<double> firstTokenMilliseconds;
     std::optional<double> lastTokenMilliseconds;
     uint32_t emittedTokens = 0;
+    std::vector<ops::TokenLogprobs> pendingLogprobs;
   };
 
   struct PendingMask {
@@ -121,6 +122,8 @@ private:
                       uint32_t acceptedDraftTokens,
                       double wallMilliseconds) override;
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
+  void tokenLogprobs(uint64_t requestId,
+                     std::span<const ops::TokenLogprobs> values) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;

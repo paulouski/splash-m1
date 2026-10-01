@@ -9,8 +9,8 @@
 #define Q4_DECODE_OUTPUT(Name, TileCall, Sums, TileN, Out)                     \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
-                   device bfloat *scales [[buffer(2)]],                        \
-                   device bfloat *biases [[buffer(3)]],                        \
+                   device half *scales [[buffer(2)]],                        \
+                   device half *biases [[buffer(3)]],                        \
                    device Out *output [[buffer(4)]],                           \
                    constant Q4Params &params [[buffer(5)]],                    \
                    uint group [[threadgroup_position_in_grid]],                \
@@ -33,8 +33,8 @@
 #define Q4_DECODE_AUXILIARY(Name, Auxiliary, TileCall, Sums, TileN)            \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights [[buffer(1)]],                        \
-                   device bfloat *scales [[buffer(2)]],                        \
-                   device bfloat *biases [[buffer(3)]],                        \
+                   device half *scales [[buffer(2)]],                        \
+                   device half *biases [[buffer(3)]],                        \
                    device bfloat *Auxiliary [[buffer(4)]],                     \
                    device bfloat *output [[buffer(5)]],                        \
                    constant Q4Params &params [[buffer(6)]],                    \
@@ -53,12 +53,12 @@
 #define Q4_DECODE_GATE_UP(Name, TileCall, Sums, TileN)                         \
   kernel void Name(device bfloat *input [[buffer(0)]],                         \
                    device uchar *weights_0 [[buffer(1)]],                      \
-                   device bfloat *scales_0 [[buffer(2)]],                      \
-                   device bfloat *biases_0 [[buffer(3)]],                      \
+                   device half *scales_0 [[buffer(2)]],                      \
+                   device half *biases_0 [[buffer(3)]],                      \
                    device bfloat *output [[buffer(4)]],                        \
                    device uchar *weights_1 [[buffer(5)]],                      \
-                   device bfloat *scales_1 [[buffer(6)]],                      \
-                   device bfloat *biases_1 [[buffer(7)]],                      \
+                   device half *scales_1 [[buffer(6)]],                      \
+                   device half *biases_1 [[buffer(7)]],                      \
                    constant Q4Params &params [[buffer(8)]],                    \
                    uint group [[threadgroup_position_in_grid]],                \
                    uint simd_lane [[thread_index_in_simdgroup]],               \

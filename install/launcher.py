@@ -27,6 +27,10 @@ ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
 PROFILES_DIR = paths.PROFILES
 PORT = 8000
+COMMAND = "splash-m1" if paths.PACKAGED else "splash"
+MODEL_EXAMPLE = "mlx-community/Qwen3.8-27B-4bit"
+MODEL_EXAMPLE_OPTIONS = " --language-only --max-context 32K"
+HELP_EXAMPLE = f"{COMMAND} serve --model {MODEL_EXAMPLE}{MODEL_EXAMPLE_OPTIONS}"
 # A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -274,7 +278,7 @@ def coding_client(args):
     if snapshot is None:
         raise LauncherError(
             f"No ready Splash server at {_base_url(args.port)}. "
-            "Run 'splash serve --model <HF_REPO_ID>' "
+            f"Run '{COMMAND} serve --model <HF_REPO_ID>' "
             "in another terminal first."
         )
     listing = _request_json("/v1/models", port=args.port)
@@ -434,15 +438,16 @@ def parse_args(argv=None):
     elif "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
+    server_examples = f"Examples:\n  {HELP_EXAMPLE}\n\n"
     parser = argparse.ArgumentParser(
-        prog="splash",
+        prog=COMMAND,
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Quick start:\n"
-            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
-            "  splash opencode  # in another terminal, after Ready\n\n"
-            "Use splash serve --help for server settings. Client arguments,\n"
+            f"  {HELP_EXAMPLE}\n"
+            f"  {COMMAND} opencode  # in another terminal, after Ready\n\n"
+            f"Use {COMMAND} serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent."
         ),
     )
@@ -454,10 +459,8 @@ def parse_args(argv=None):
         description="Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Examples:\n"
-            "  splash serve --model mlx-community/Qwen3.8-27B-4bit\n"
-            "  splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M --max-context 128K\n\n"
-            "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
+            server_examples
+            + "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
             "The startup summary and /status report the effective context limit.\n"
             "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
         ),
@@ -478,8 +481,8 @@ def parse_args(argv=None):
         "--model",
         type=model_artifacts.parse_model_id,
         required=True,
-        metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        metavar="OWNER/REPO",
+        help="upstream Hugging Face model ID",
     )
     server.add_argument(
         "--revision",

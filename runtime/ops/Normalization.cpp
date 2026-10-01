@@ -20,11 +20,13 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
                                     uint32_t rows, LinearScratch scratch,
                                     LinearInput layout) {
   if (layout != LinearInput::Plain && scratch.input && rows && rows % 8 == 0) {
-    if (scratch.input.sizeBytes() < tableBytes(width, rows) ||
+    if (scratch.input.sizeBytes() < tableBytes(layout, width, rows) ||
         scratch.sums.sizeBytes() < tableSumsBytes(layout, width, rows) || width % 64)
       throw std::invalid_argument("Q4 normalization scratch is below requirement");
-    graph.add(normKernel(layout == LinearInput::Table16 ? "norm_rms_table16_decode" : "norm_rms_table64_decode",
-                         weight, width),
+    const std::string_view tableKernel = layout == LinearInput::Table16 ? "norm_rms_table16_decode"
+        : layout == LinearInput::Table64Half ? "norm_rms_table64_halftable_decode"
+                                            : "norm_rms_table64_decode";
+    graph.add(normKernel(tableKernel, weight, width),
               {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
     return {std::move(output), layout};
   }

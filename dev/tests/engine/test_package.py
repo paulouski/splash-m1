@@ -19,6 +19,57 @@ from install import paths
 
 
 class PackageTests(unittest.TestCase):
+    def test_release_inputs_are_rejected_before_network_or_distribution_writes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / "selected-build"
+            build.mkdir()
+            for name in ("splash", "splash.metallib"):
+                (build / name).write_bytes(b"fixture")
+            for arguments, expected in (
+                (("../latest", "15.0"), "invalid release version"),
+                (("1.0", "15;bad"), "minimum macOS must be 15.0"),
+            ):
+                error = io.StringIO()
+                with (
+                    self.subTest(version=arguments[0], macos_min=arguments[1]),
+                    mock.patch.object(package, "ROOT", root),
+                    mock.patch.object(
+                        package.urllib.request,
+                        "urlopen",
+                        side_effect=AssertionError("unexpected network access"),
+                    ) as urlopen,
+                    contextlib.redirect_stderr(error),
+                    self.assertRaises(SystemExit),
+                ):
+                    package.main(
+                        [
+                            "--version",
+                            arguments[0],
+                            "--macos-min",
+                            arguments[1],
+                            "--build-dir",
+                            str(build),
+                        ]
+                    )
+                self.assertIn(expected, error.getvalue())
+                urlopen.assert_not_called()
+                self.assertFalse((root / "dist").exists())
+
+    def test_staging_absolute_console_launchers_are_removed_but_python_is_kept(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            staging = Path(temporary) / "package/.package-stage"
+            binary_dir = staging / "python/bin"
+            binary_dir.mkdir(parents=True)
+            python = binary_dir / "python3"
+            python.write_bytes(b"bundled python executable")
+            (binary_dir / "pip3").write_text(f"#!{python}\n# pip launcher\n")
+            (binary_dir / "safe-tool").write_text("#!/usr/bin/env python3\n")
+            package.remove_staged_entrypoints(python, staging)
+            self.assertTrue(python.is_file())
+            self.assertFalse((binary_dir / "pip3").exists())
+            self.assertTrue((binary_dir / "safe-tool").is_file())
+
     def test_build_needs_no_hub_access_and_never_ships_credentials(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -26,13 +77,23 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("install/completions", package.COMPLETION_FILES),
                 ("server", package.SERVER_FILES),
-                ("build", ("splash", "splash.metallib")),
+                ("build-macos15", ("splash", "splash.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
                     (root / folder / name).write_text("fixture")
             for name in package.LICENSE_FILES:
                 (root / name).write_text("fixture")
+            (root / "dev/tools").mkdir(parents=True)
+            shutil.copy2(
+                package.ROOT / "dev/tools/install.sh", root / "dev/tools/install.sh"
+            )
+            static = root / "server/static"
+            static.mkdir()
+            (static / "fixture.js").write_text("static fixture")
+            (root / "build").mkdir()
+            for name in ("splash", "splash.metallib"):
+                (root / "build" / name).write_text("wrong default build")
             (root / "install/completions/official-models.txt").write_text(
                 "company/Published\n"
             )
@@ -62,19 +123,56 @@ class PackageTests(unittest.TestCase):
                     mock.patch.dict(os.environ, environment, clear=True),
                     mock.patch("sys.stdout"),
                 ):
-                    package.main(["--version", version, "--macos-min", "26.4"])
+                    package.main(
+                        [
+                            "--version",
+                            version,
+                            "--macos-min",
+                            "15.0",
+                            "--build-dir",
+                            str(root / "build-macos15"),
+                        ]
+                    )
                 self.assertEqual(run.call_count, 3)
-                with tarfile.open(
-                    root / f"dist/splash-{version}-arm64-macos26.tar.gz"
-                ) as archive:
+                name = f"splash-m1-{version}-arm64-macos15"
+                self.assertEqual((root / "dist/latest").read_text(), version + "\n")
+                self.assertEqual(
+                    (root / "dist/install.sh").read_bytes(),
+                    (root / "dev/tools/install.sh").read_bytes(),
+                )
+                self.assertTrue((root / "dist/splash-m1.rb").is_file())
+                with tarfile.open(root / f"dist/{name}.tar.gz") as archive:
+                    self.assertEqual(
+                        archive.extractfile(f"{name}/engine/splash").read(),
+                        b"fixture",
+                    )
+                    self.assertEqual(
+                        archive.extractfile(f"{name}/engine/splash.metallib").read(),
+                        b"fixture",
+                    )
+                    launcher = archive.getmember(f"{name}/splash-m1")
+                    self.assertTrue(launcher.mode & 0o111)
+                    with archive.extractfile(f"{name}/release.json") as manifest:
+                        metadata = json.load(manifest)
+                    self.assertEqual(metadata["product"], "splash-m1")
+                    self.assertEqual(metadata["architecture"], "arm64")
+                    self.assertEqual(metadata["minimum_macos"], "15.0")
+                    self.assertEqual(
+                        metadata["features"],
+                        ["affine Qwen text checkpoints", "int8 KV cache"],
+                    )
                     for member in archive.getmembers():
+                        self.assertEqual(member.uid, 0)
+                        self.assertEqual(member.gid, 0)
+                        self.assertEqual(member.uname, "")
+                        self.assertEqual(member.gname, "")
                         self.assertNotIn("download-token", member.name)
                         if member.isfile():
                             content = archive.extractfile(member).read()
                             self.assertNotIn(b"hf_legacycredential", content)
                             self.assertNotIn(b"hf_testcredential", content)
                     with archive.extractfile(
-                        f"splash-{version}-arm64-macos26/install/completions/official-models.txt"
+                        f"{name}/install/completions/official-models.txt"
                     ) as catalog:
                         self.assertEqual(catalog.read(), b"company/Published\n")
 
@@ -93,6 +191,8 @@ class PackageTests(unittest.TestCase):
                     (root / folder / name).write_text("fixture")
             for name in package.LICENSE_FILES:
                 (root / name).write_text("license")
+            (root / "server/static").mkdir()
+            (root / "server/static/fixture.js").write_text("static fixture")
             completions = root / "install/completions"
             completions.mkdir()
             completion_names = {
@@ -121,6 +221,7 @@ class PackageTests(unittest.TestCase):
                     "LICENSE",
                     "THIRD_PARTY_NOTICES",
                     "release.json",
+                    "splash-m1",
                 },
             )
             self.assertEqual(
@@ -136,7 +237,7 @@ class PackageTests(unittest.TestCase):
                 )
             self.assertEqual(
                 {p.name for p in (stage / "server").iterdir()},
-                set(package.SERVER_FILES),
+                {*package.SERVER_FILES, "static"},
             )
             self.assertNotIn(
                 "hf_testdistributiontoken", (stage / "release.json").read_text()
@@ -144,6 +245,24 @@ class PackageTests(unittest.TestCase):
             self.assertFalse((stage / "install/model-catalog.json").exists())
             self.assertNotIn(
                 "catalog_sha256", json.loads((stage / "release.json").read_text())
+            )
+            metadata = json.loads((stage / "release.json").read_text())
+            self.assertEqual(metadata["product"], "splash-m1")
+            self.assertEqual(metadata["minimum_macos"], "15.0")
+            self.assertTrue(os.access(stage / "splash-m1", os.X_OK))
+            bundled_python = stage / "python/bin/python3"
+            bundled_python.parent.mkdir(parents=True)
+            bundled_python.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            bundled_python.chmod(0o755)
+            result = subprocess.run(
+                [str(stage / "splash-m1"), "--help"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(
+                result.stdout.splitlines(),
+                ["-u", str(stage / "install/launcher.py"), "--help"],
             )
 
     def test_every_installer_module_ships(self):
@@ -174,24 +293,29 @@ class PackageTests(unittest.TestCase):
 
     def test_formula_invokes_bundled_runtime_without_build_or_dependency_install(self):
         text = package.formula(
-            "1.0", "https://example.org/release.tar.gz", "a" * 64, "26.4"
+            "1.0", "https://example.org/release.tar.gz", "a" * 64, "15.0"
         )
-        self.assertIn("depends_on macos: :tahoe", text)
-        self.assertIn("depends_on SplashMacOSRequirement", text)
+        self.assertNotIn("depends_on macos:", text)
+        self.assertIn("class SplashM1 < Formula", text)
+        self.assertIn("depends_on SplashM1MacOSRequirement", text)
+        self.assertIn('version "1.0"', text)
         self.assertIn(
-            'satisfy(build_env: false) { OS.mac? && MacOS.full_version >= "26.4" }',
+            'satisfy(build_env: false) { OS.mac? && MacOS.full_version >= "15.0" }',
             text,
         )
         self.assertLess(
             text.index("satisfy(build_env: false)"), text.index("def install")
         )
-        self.assertIn("python/bin/python3", text)
-        self.assertIn("install/launcher.py", text)
+        self.assertIn('libexec.install Dir["*"]', text)
+        self.assertIn('exec "#{opt_libexec}/splash-m1" "$@"', text)
         self.assertNotIn("make", text)
         self.assertNotIn("pip install", text)
         self.assertNotIn("download-token", text)
         self.assertIn('"$@"', text)
-        self.assertIn('chmod 0755, bin/"splash"', text)
+        self.assertIn('chmod 0755, bin/"splash-m1"', text)
+        self.assertIn('=> "_splash-m1"', text)
+        self.assertIn('=> "splash-m1"', text)
+        self.assertIn("--language-only --max-context 32K", text)
 
     @unittest.skipUnless(shutil.which("ruby"), "Ruby is needed to exercise the formula")
     def test_formula_checks_minimum_os_without_running_install(self):
@@ -219,16 +343,16 @@ module MacOS
   def self.full_version; Version.new(ENV.fetch("TEST_VERSION")); end
 end
 eval STDIN.read
-puts SplashMacOSRequirement.check
+            puts SplashM1MacOSRequirement.check
 """
         formula = package.formula(
-            "1.0", "https://example.org/a.tar.gz", "a" * 64, "26.4"
+            "1.0", "https://example.org/a.tar.gz", "a" * 64, "15.0"
         )
         for mac, version, allowed in (
-            (True, "26.3", False),
-            (True, "26.4", True),
-            (True, "26.10", True),
-            (True, "27.0", True),
+            (True, "14.9", False),
+            (True, "15.0", True),
+            (True, "15.7", True),
+            (True, "26.0", True),
             (False, "27.0", False),
         ):
             with self.subTest(mac=mac, version=version):
@@ -251,14 +375,14 @@ puts SplashMacOSRequirement.check
         with tempfile.TemporaryDirectory(prefix="splash formula ") as temporary:
             root = Path(temporary)
             brew = root / "homebrew prefix"
-            previous = brew / "Cellar/splash/old"
-            prefix = brew / "Cellar/splash/new"
-            opt = brew / "opt/splash"
+            previous = brew / "Cellar/splash-m1/old"
+            prefix = brew / "Cellar/splash-m1/new"
+            opt = brew / "opt/splash-m1"
             opt.parent.mkdir(parents=True)
             opt.symlink_to(previous)
             completion_entries = (
-                ("share/zsh/site-functions/_splash", "_splash"),
-                ("etc/bash_completion.d/splash", "splash.bash"),
+                ("share/zsh/site-functions/_splash-m1", "_splash"),
+                ("etc/bash_completion.d/splash-m1", "splash.bash"),
             )
             old_assets = previous / "libexec/install/completions"
             old_assets.mkdir(parents=True)
@@ -282,10 +406,10 @@ puts SplashMacOSRequirement.check
             (assets / "models").write_text("#!/bin/sh\nprintf '%s\\n' new/model\n")
             (assets / "models").chmod(0o755)
             prefix.mkdir()
-            formula = root / "splash.rb"
+            formula = root / "splash-m1.rb"
             formula.write_text(
                 package.formula(
-                    "test", "https://example.org/splash.tar.gz", "a" * 64, "26.4"
+                    "test", "https://example.org/splash-m1.tar.gz", "a" * 64, "15.0"
                 )
             )
             # Match Homebrew's parent realpath and relative install_symlink
@@ -333,7 +457,7 @@ class Formula
   def odie(message); raise message; end
 end
 load ARGV[0]
-Splash.new(Pathname(ARGV[1]), Pathname(ARGV[2])).install
+            SplashM1.new(Pathname(ARGV[1]), Pathname(ARGV[2])).install
 """
             subprocess.run(
                 ["ruby", "-e", driver, str(formula), str(prefix), str(opt)],
@@ -376,11 +500,11 @@ class InstallerTests(unittest.TestCase):
         self.bin = self.root / "bin"
         for folder in (self.root / "home", self.releases, self.bin):
             folder.mkdir()
-        self.app = self.root / "home/Library/Application Support/Splash/app"
-        self.command = self.bin / "splash"
+        self.app = self.root / "home/Library/Application Support/Splash M1/app"
+        self.command = self.bin / "splash-m1"
 
     def publish(self, version, help_status=0, completions=True):
-        name = f"splash-{version}-arm64-macos26"
+        name = f"splash-m1-{version}-arm64-macos15"
         staging = self.root / "staging"
         release = staging / name
         (release / "python/bin").mkdir(parents=True)
@@ -417,18 +541,59 @@ class InstallerTests(unittest.TestCase):
         (self.releases / "latest").write_text(f"{version}\n")
 
     def install(self):
+        return self.run_installer()
+
+    def run_installer(self, public=False, extra_environment=None):
+        environment = {
+            "PATH": str(self.root / "commands") + os.pathsep + os.environ["PATH"],
+            "HOME": str(self.root / "home"),
+            "SPLASH_BIN_DIR": str(self.bin),
+        }
+        if not public:
+            environment["SPLASH_BASE_URL"] = self.releases.as_uri()
+        if extra_environment:
+            environment.update(extra_environment)
         return subprocess.run(
             ["/bin/sh", str(package.ROOT / "dev/tools/install.sh")],
-            env={
-                "PATH": str(self.root / "commands") + os.pathsep + os.environ["PATH"],
-                "HOME": str(self.root / "home"),
-                "SPLASH_TOKEN": "test-token",
-                "SPLASH_BIN_DIR": str(self.bin),
-                "SPLASH_BASE_URL": self.releases.as_uri(),
-            },
+            env=environment,
             capture_output=True,
             text=True,
         )
+
+    def test_unsafe_version_is_rejected_before_creating_the_install_prefix(self):
+        result = self.run_installer(extra_environment={"SPLASH_VERSION": "../1.0"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("invalid release version", result.stderr)
+        self.assertFalse(self.app.exists())
+        self.assertFalse(self.command.exists())
+
+    def test_public_github_default_installs_without_a_token(self):
+        self.publish("1.0")
+        commands = self.root / "commands"
+        commands.mkdir()
+        curl = commands / "curl"
+        curl.write_text(
+            f"#!{sys.executable}\n"
+            "import shutil, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "if '--config' in arguments: sys.exit('public download used auth config')\n"
+            "url = arguments[-1]\n"
+            "prefix = 'https://github.com/paulouski/splash-m1/releases/'\n"
+            "if not url.startswith(prefix): sys.exit('unexpected URL: ' + url)\n"
+            "asset = url[len(prefix):]\n"
+            "if asset.startswith('latest/download/'):\n"
+            "    asset = asset.removeprefix('latest/download/')\n"
+            "else:\n"
+            "    asset = asset.split('download/', 1)[1].split('/', 1)[1]\n"
+            f"source = open({str(self.releases)!r} + '/' + asset, 'rb')\n"
+            "target = open(arguments[arguments.index('-o') + 1], 'wb')\n"
+            "shutil.copyfileobj(source, target)\n"
+        )
+        curl.chmod(0o755)
+        result = self.run_installer(public=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
+        self.assertIn("Downloading Splash M1 1.0", result.stdout)
 
     def installed(self):
         return sorted(
@@ -458,7 +623,7 @@ class InstallerTests(unittest.TestCase):
 
     def assertKeepsFirstVersion(self, result, command):
         self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
         self.assertEqual(self.command.read_text(), command)
         self.assertEqual(self.completion_version(), "1.0")
 
@@ -466,21 +631,23 @@ class InstallerTests(unittest.TestCase):
         self.publish("1.0")
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
-        self.assertIn("app/current/install/launcher.py", self.command.read_text())
+        self.assertEqual(self.installed(), ["splash-m1-1.0-arm64-macos15"])
+        self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
+        self.assertIn(
+            "Splash M1/app/current/install/launcher.py", self.command.read_text()
+        )
         self.assertTrue(os.access(self.command, os.X_OK))
         self.assertEqual(self.completion_version(), "1.0")
         self.assertIn(
-            'source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"',
+            'source "$HOME/Library/Application Support/Splash M1/app/current/install/completions/splash.bash"',
             first.stdout,
         )
         self.assertIn("Zsh needs compinit initialized", first.stdout)
         self.publish("2.0")
         upgrade = self.install()
         self.assertEqual(upgrade.returncode, 0, upgrade.stderr)
-        self.assertEqual(self.installed(), ["splash-2.0-arm64-macos26"])
-        self.assertEqual(self.current(), "splash-2.0-arm64-macos26")
+        self.assertEqual(self.installed(), ["splash-m1-2.0-arm64-macos15"])
+        self.assertEqual(self.current(), "splash-m1-2.0-arm64-macos15")
         self.assertEqual(self.completion_version(), "2.0")
         self.assertTrue(
             os.access(self.app / "current/install/completions/models", os.X_OK)
@@ -500,16 +667,16 @@ class InstallerTests(unittest.TestCase):
                     fcntl.flock(lock, mode | fcntl.LOCK_NB)
                     blocked = self.install()
                     self.assertKeepsFirstVersion(blocked, command)
-                    self.assertIn("stop the running Splash server", blocked.stderr)
-                    self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+                    self.assertIn("stop the running Splash M1 server", blocked.stderr)
+                    self.assertEqual(self.installed(), ["splash-m1-1.0-arm64-macos15"])
                     fcntl.flock(lock, fcntl.LOCK_UN)
         self.assertEqual(self.install().returncode, 0)
-        self.assertEqual(self.current(), "splash-2.0-arm64-macos26")
+        self.assertEqual(self.current(), "splash-m1-2.0-arm64-macos15")
 
     def test_running_incomplete_same_version_is_not_replaced(self):
         self.publish("1.0")
         self.assertEqual(self.install().returncode, 0)
-        release = self.app / "splash-1.0-arm64-macos26"
+        release = self.app / "splash-m1-1.0-arm64-macos15"
         (release / "release.json").unlink()
         marker = release / "in-use"
         marker.write_text("preserve")
@@ -517,7 +684,7 @@ class InstallerTests(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             blocked = self.install()
         self.assertEqual(blocked.returncode, 1, blocked.stderr)
-        self.assertIn("stop the running Splash server", blocked.stderr)
+        self.assertIn("stop the running Splash M1 server", blocked.stderr)
         self.assertEqual(marker.read_text(), "preserve")
         self.assertFalse((release / "release.json").exists())
         self.assertEqual(self.current(), release.name)
@@ -529,7 +696,7 @@ class InstallerTests(unittest.TestCase):
         commands = self.root / "commands"
         commands.mkdir()
         proof = self.root / "lock-proof"
-        old = self.app / "splash-1.0-arm64-macos26"
+        old = self.app / "splash-m1-1.0-arm64-macos15"
         lock = self.app.parent / "runtime/serve.lock"
         shim = commands / "rm"
         shim.write_text(
@@ -559,14 +726,14 @@ class InstallerTests(unittest.TestCase):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("source ", result.stdout)
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
+        self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
 
     def test_failed_same_version_check_preserves_absolute_and_relative_current(self):
         self.publish("1.0")
         first = self.install()
         self.assertEqual(first.returncode, 0, first.stderr)
         command = self.command.read_text()
-        release = self.app / "splash-1.0-arm64-macos26"
+        release = self.app / "splash-m1-1.0-arm64-macos15"
         (release / "python/bin/python3").write_text("#!/bin/sh\nexit 1\n")
         current = self.app / "current"
 
@@ -576,7 +743,7 @@ class InstallerTests(unittest.TestCase):
                 current.symlink_to(target)
                 failed = self.install()
                 self.assertKeepsFirstVersion(failed, command)
-                self.assertIn("fails 'splash --help'", failed.stderr)
+                self.assertIn("fails 'splash-m1 --help'", failed.stderr)
                 self.assertEqual(os.readlink(current), target)
                 self.assertTrue(release.is_dir())
                 self.assertEqual(current.resolve(strict=True), release.resolve())
@@ -585,7 +752,7 @@ class InstallerTests(unittest.TestCase):
         self.publish("1.0", help_status=1)
         failed = self.install()
         self.assertEqual(failed.returncode, 1, failed.stderr)
-        self.assertIn("fails 'splash --help'", failed.stderr)
+        self.assertIn("fails 'splash-m1 --help'", failed.stderr)
         self.assertEqual(self.installed(), [])
         self.assertFalse((self.app / "current").exists())
         self.assertFalse(self.command.exists())
@@ -599,8 +766,8 @@ class InstallerTests(unittest.TestCase):
         self.publish("2.0", help_status=1)
         smoke = self.install()
         self.assertKeepsFirstVersion(smoke, command)
-        self.assertIn("fails 'splash --help'", smoke.stderr)
-        self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+        self.assertIn("fails 'splash-m1 --help'", smoke.stderr)
+        self.assertEqual(self.installed(), ["splash-m1-1.0-arm64-macos15"])
 
         self.publish("3.0")
         foreign = "#!/bin/sh\necho not the installer's\n"
@@ -608,24 +775,24 @@ class InstallerTests(unittest.TestCase):
         conflict = self.install()
         self.assertKeepsFirstVersion(conflict, foreign)
         self.assertIn("was not created by this installer", conflict.stderr)
-        self.assertEqual(self.installed(), ["splash-1.0-arm64-macos26"])
+        self.assertEqual(self.installed(), ["splash-m1-1.0-arm64-macos15"])
         self.command.write_text(command)
 
-        (self.bin / "splash.tmp").mkdir()
+        (self.bin / "splash-m1.tmp").mkdir()
         blocked = self.install()
         self.assertKeepsFirstVersion(blocked, command)
         self.assertIn("could not write", blocked.stderr)
         self.assertEqual(
             self.installed(),
-            ["splash-1.0-arm64-macos26", "splash-3.0-arm64-macos26"],
+            ["splash-m1-1.0-arm64-macos15", "splash-m1-3.0-arm64-macos15"],
         )
 
     def test_printed_tester_instructions_install_from_the_published_repo(self):
         self.publish("1.0")
         (self.root / "dist").symlink_to(self.releases)
-        installer = self.root / "dev/tools/install.sh"
-        installer.parent.mkdir(parents=True)
-        shutil.copy(package.ROOT / "dev/tools/install.sh", installer)
+        shutil.copy2(
+            package.ROOT / "dev/tools/install.sh", self.releases / "install.sh"
+        )
         hub = self.root / "hub"
         hub.mkdir()
 
@@ -677,8 +844,10 @@ class InstallerTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.current(), "splash-1.0-arm64-macos26")
-        self.assertIn("app/current/install/launcher.py", self.command.read_text())
+        self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
+        self.assertIn(
+            "Splash M1/app/current/install/launcher.py", self.command.read_text()
+        )
 
 
 if __name__ == "__main__":

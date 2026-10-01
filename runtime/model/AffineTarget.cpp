@@ -6,38 +6,69 @@
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <algorithm>
+#include <functional>
+
 namespace splash::model {
 namespace {
 
 using affine::append;
 using affine::copy;
+using affine::halfCopy;
 using affine::image;
 using affine::Image;
 using affine::ProjectionPart;
 using affine::Section;
 using affine::SectionKind;
 
-// Projection parts, stacked in row order, padded with zero rows to `rows`.
+// Per-tensor bits of a dense (non-MoE) projection, queried from the
+// checkpoint's quantization map (SafetensorsCheckpoint::quantizationBits).
+// images() plans without a checkpoint (preparedBytes, memory sizing), so the
+// default reports every part at the checkpoint's global default bits; only
+// AffineTargetLoader's real lookup can see a per-tensor override.
+using BitsLookup = std::function<uint32_t(std::string_view)>;
+uint32_t defaultBits(std::string_view) { return 4; }
+
+// Projection parts, stacked in row order, padded with zero rows to `rows`. A
+// part whose own bits are less than the section's widest part is promoted
+// losslessly into the wider storage (AffinePreparation.cpp, Q5Pack.hpp).
 void projection(Image &image, std::initializer_list<std::pair<std::string, uint32_t>> parts,
-                uint32_t rows, uint32_t columns, uint32_t bits = 4, uint32_t experts = 1) {
+                uint32_t rows, uint32_t columns, uint32_t bits = 4, uint32_t experts = 1,
+                const BitsLookup &bitsOf = defaultBits) {
   validateQ4Layout(rows, columns);
+  // The checkpoint's per-tensor quantization only overrides the ordinary
+  // 4-bit dense path (bits == 4, no experts): a caller that already asked for
+  // a specific width (the MoE router/gate's 8-bit projections) is exact, not
+  // a lookup default.
+  const bool perTensor = bits == 4 && experts == 1;
+  std::vector<uint32_t> partBits;
+  for (const auto &[name, count] : parts) {
+    static_cast<void>(count);
+    partBits.push_back(perTensor ? bitsOf(name) : bits);
+  }
+  const uint32_t sectionBits = *std::max_element(partBits.begin(), partBits.end());
+  if (perTensor && sectionBits != 4 && sectionBits != 5)
+    throw WeightStoreError("unsupported affine projection bits");
   Section section;
   section.kind = SectionKind::Projection;
   section.rows = rows;
   section.columns = columns;
-  section.bits = bits;
+  section.bits = sectionBits;
   section.experts = experts;
-  section.bytes = checkedWeightMultiply(uint64_t(rows) * columns * bits / 8 +
+  section.bytes = checkedWeightMultiply(uint64_t(rows) * columns * sectionBits / 8 +
                                         uint64_t(rows) * columns / 16, experts, "affine projection");
   uint64_t sourceRows = 0;
+  size_t index = 0;
   for (const auto &[name, count] : parts) {
-    image.quantized.emplace_back(name, bits);
-    ProjectionPart part{count, {}};
+    const uint32_t partBitsValue = partBits[index++];
+    image.quantized.emplace_back(name, partBitsValue);
+    ProjectionPart part{count, {}, partBitsValue};
     for (size_t field = 0; field < 3; ++field) { // weight, scales, biases
-      std::vector<uint64_t> shape{count, field ? columns / kQ4GroupElements : columns * bits / 32};
+      std::vector<uint64_t> shape{count, field ? columns / kQ4GroupElements : columns * partBitsValue / 32};
       if (experts > 1) shape.insert(shape.begin(), experts);
       part.fields.push_back({name + (field == 0 ? ".weight" : field == 1 ? ".scales" : ".biases"),
-                             {field ? "BF16" : "U32"}, std::move(shape)});
+                             field ? std::vector<std::string>{"BF16", "F16"} : std::vector<std::string>{"U32"},
+                             std::move(shape)});
     }
     sourceRows += count;
     section.parts.push_back(std::move(part));
@@ -76,7 +107,7 @@ void validateConfiguration(const SafetensorsCheckpoint &source, const Layout &la
 }
 
 template<class Layout>
-Image layerImage(const Layout &layout, uint32_t layer) {
+Image layerImage(const Layout &layout, uint32_t layer, const BitsLookup &bitsOf) {
   const bool full = layout.isFullAttentionLayer(layer);
   Image result = image("layer-" + std::to_string(layer) + ".bin", Layout::layerMagic, layer, full ? 1u : 0u);
   const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
@@ -86,26 +117,28 @@ Image layerImage(const Layout &layout, uint32_t layer) {
     projection(result, {{attention + "q_proj", 2 * layout.attentionWidth},
                                 {attention + "k_proj", layout.attentionKvHeads * layout.attentionHeadDimension},
                                 {attention + "v_proj", layout.attentionKvHeads * layout.attentionHeadDimension}},
-               layout.packedFullWidth, layout.hiddenSize);
+               layout.packedFullWidth, layout.hiddenSize, 4, 1, bitsOf);
     copy(result, attention + "q_norm.weight", {layout.attentionHeadDimension});
     copy(result, attention + "k_norm.weight", {layout.attentionHeadDimension});
-    projection(result, {{attention + "o_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+    projection(result, {{attention + "o_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth, 4, 1,
+              bitsOf);
   } else {
     const std::string gdn = prefix + "linear_attn.";
     projection(result, {{gdn + "in_proj_qkv", layout.convolutionDimension},
                                 {gdn + "in_proj_z", layout.attentionWidth},
                                 {gdn + "in_proj_b", layout.gdnValueHeads},
                                 {gdn + "in_proj_a", layout.gdnValueHeads}},
-               layout.packedGdnWidth, layout.hiddenSize);
+               layout.packedGdnWidth, layout.hiddenSize, 4, 1, bitsOf);
     copy(result, gdn + "conv1d.weight", {layout.convolutionDimension, kGdnConvolutionTaps, 1});
     Section decay;
     decay.kind = SectionKind::Decay;
-    decay.input = {gdn + "A_log", {"BF16", "F32"}, {layout.gdnValueHeads}};
+    decay.input = {gdn + "A_log", {"BF16", "F16", "F32"}, {layout.gdnValueHeads}};
     decay.bytes = uint64_t(layout.gdnValueHeads) * sizeof(float);
     append(result, std::move(decay));
     copy(result, gdn + "dt_bias", {layout.gdnValueHeads});
     copy(result, gdn + "norm.weight", {layout.gdnHeadDimension});
-    projection(result, {{gdn + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth);
+    projection(result, {{gdn + "out_proj", layout.hiddenSize}}, layout.hiddenSize, layout.attentionWidth, 4, 1,
+              bitsOf);
   }
   copy(result, prefix + "post_attention_layernorm.weight", {layout.hiddenSize});
   const std::string mlp = prefix + "mlp.";
@@ -114,7 +147,7 @@ Image layerImage(const Layout &layout, uint32_t layer) {
       const bool down = projectionName == "down_proj";
       const uint32_t n = down ? layout.hiddenSize : intermediate;
       const uint32_t k = down ? intermediate : layout.hiddenSize;
-      projection(result, {{name + projectionName, n}}, n, k, 4, experts);
+      projection(result, {{name + projectionName, n}}, n, k, 4, experts, bitsOf);
     }
   };
   if constexpr (Layout::ffnKind == QwenFfnKind::SparseMoe) {
@@ -131,10 +164,11 @@ Image layerImage(const Layout &layout, uint32_t layer) {
 }
 
 template<class Layout>
-Image headImage(const Layout &layout) {
+Image headImage(const Layout &layout, const BitsLookup &bitsOf) {
   Image result = image("head.bin", Layout::headMagic, layout.layers, 2);
   copy(result, "language_model.model.norm.weight", {layout.hiddenSize});
-  projection(result, {{"language_model.lm_head", layout.vocabularySize}}, layout.vocabularySize, layout.hiddenSize);
+  projection(result, {{"language_model.lm_head", layout.vocabularySize}}, layout.vocabularySize, layout.hiddenSize,
+            4, 1, bitsOf);
   return result;
 }
 
@@ -145,26 +179,34 @@ Image embeddingImage(const Layout &layout) {
   const std::string prefix = "language_model.model.embed_tokens";
   result.quantized.emplace_back(prefix, 4);
   copy(result, prefix + ".weight", {layout.vocabularySize, layout.hiddenSize / 8}, "U32");
-  copy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
-  copy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  halfCopy(result, prefix + ".scales", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
+  halfCopy(result, prefix + ".biases", {layout.vocabularySize, layout.hiddenSize / kQ4GroupElements});
   return result;
 }
 
-// Every image of a layout: the layers, the head, the embedding.
+// Every image of a layout: the layers, the head, the embedding. Without a
+// checkpoint (preparedBytes, memory sizing), every part plans at the
+// checkpoint-independent default bits; a real lookup only comes from an open
+// SafetensorsCheckpoint (AffineTargetLoader::Impl).
 template<class Layout>
-std::vector<Image> images(const Layout &layout) {
+std::vector<Image> images(const Layout &layout, const BitsLookup &bitsOf = defaultBits) {
   std::vector<Image> result;
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
-  result.push_back(headImage(layout));
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer, bitsOf));
+  result.push_back(headImage(layout, bitsOf));
   result.push_back(embeddingImage(layout));
   return result;
 }
 
 template<class Layout>
-uint64_t preparedBytes(const Layout &layout) {
+uint64_t preparedBytes(const Layout &layout, const BitsLookup &bitsOf = defaultBits) {
   uint64_t bytes = 0;
-  for (const Image &image : images(layout)) bytes += image.bytes;
+  for (const Image &image : images(layout, bitsOf)) bytes += image.bytes;
   return bytes;
+}
+
+// source's real per-tensor bits lookup, for the overloads that take one.
+BitsLookup checkpointBits(const SafetensorsCheckpoint &source) {
+  return [&source](std::string_view name) { return source.quantizationBits(name); };
 }
 
 } // namespace
@@ -182,7 +224,7 @@ struct AffineTargetLoader::Impl {
         files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
               [this] { source.checkUnchanged(); }) {
     validateConfiguration(source, layout);
-    images = model::images(layout);
+    images = model::images(layout, [this](std::string_view name) { return source.quantizationBits(name); });
     for (Image &image : images) {
       backend.checkOperation();
       affine::bind(image, source);
@@ -216,7 +258,21 @@ WeightFile AffineTargetLoader::embedding() { return impl_->open(impl_->images.si
 
 uint64_t preparedAffineBytes(const Qwen3_8Layout &layout) { return preparedBytes(layout); }
 uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout) { return preparedBytes(layout); }
-Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer) { return layerImage(layout, layer); }
-Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer) { return layerImage(layout, layer); }
+uint64_t preparedAffineBytes(const Qwen3_8Layout &layout, const SafetensorsCheckpoint &source) {
+  return preparedBytes(layout, checkpointBits(source));
+}
+uint64_t preparedAffineBytes(const Qwen3_6MoeLayout &layout, const SafetensorsCheckpoint &source) {
+  return preparedBytes(layout, checkpointBits(source));
+}
+Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer) { return layerImage(layout, layer, defaultBits); }
+Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer) {
+  return layerImage(layout, layer, defaultBits);
+}
+Image affineLayerImage(const Qwen3_8Layout &layout, uint32_t layer, const SafetensorsCheckpoint &source) {
+  return layerImage(layout, layer, checkpointBits(source));
+}
+Image affineLayerImage(const Qwen3_6MoeLayout &layout, uint32_t layer, const SafetensorsCheckpoint &source) {
+  return layerImage(layout, layer, checkpointBits(source));
+}
 
 } // namespace splash::model

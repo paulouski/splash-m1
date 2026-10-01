@@ -351,6 +351,21 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
                          breakdown.maximumKvPages);
   clampedKvPages -= clampedKvPages % breakdown.kvSparseMappingBatchPages;
+  if (!device.supportsPlacementSparse && model.requestedContextTokens) {
+    // Non-sparse backing is committed in full at load, not grown on demand:
+    // shrink the pool to what --max-context plus speculative scratch needs,
+    // rounded up to whole sparse-mapping batches, so the remainder of the
+    // dynamic budget stays free for prefix-cache state snapshots instead of
+    // being consumed by KV pages the configured context will never use.
+    const uint64_t requestedTokens = uint64_t{model.requestedContextTokens} +
+                                     model::ExecutionLimits::speculativeScratchTokens;
+    uint64_t requestedPages =
+        (requestedTokens + breakdown.kvPageTokens - 1) / breakdown.kvPageTokens;
+    requestedPages += breakdown.kvSparseMappingBatchPages - 1;
+    requestedPages -= requestedPages % breakdown.kvSparseMappingBatchPages;
+    requestedPages = std::max<uint64_t>(requestedPages, breakdown.kvExtentPages);
+    clampedKvPages = std::min(clampedKvPages, requestedPages);
+  }
   breakdown.kvVirtualPages = static_cast<uint32_t>(clampedKvPages);
 
   if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvVirtualPages,

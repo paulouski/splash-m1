@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +13,16 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def macos_major(macos_min):
+    match = re.fullmatch(
+        r"(?P<major>0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*))?",
+        macos_min,
+    )
+    if not match or int(match.group("major")) < 15:
+        raise ValueError("minimum macOS must be 15.0 or newer, such as 15.0")
+    return int(match.group("major"))
 
 
 def brew(*args, capture=False, **kwargs):
@@ -40,25 +51,33 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("build", "check"))
     parser.add_argument("--version", required=True)
+    parser.add_argument("--macos-min", default="15.0")
     parser.add_argument("--dist", type=Path, default=ROOT / "dist")
     args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.version):
+        parser.error("invalid release version")
+    try:
+        platform_major = macos_major(args.macos_min)
+    except ValueError as error:
+        parser.error(str(error))
     dist = args.dist.resolve()
-    formula_file = dist / "splash.rb"
+    formula_file = dist / "splash-m1.rb"
     if not formula_file.is_file():
         parser.error(f"missing {formula_file}; run make package first")
     cellar = Path(brew("--cellar", capture=True).strip())
     prefix = Path(brew("--prefix", capture=True).strip())
-    if (cellar / "splash").exists() or os.path.lexists(prefix / "bin/splash"):
+    if (cellar / "splash-m1").exists() or os.path.lexists(prefix / "bin/splash-m1"):
         parser.error(
             "Splash is already installed; use a release machine without an existing installation"
         )
 
     tap = f"splash-check/package-{uuid.uuid4().hex[:8]}"
-    name = f"{tap}/splash"
+    name = f"{tap}/splash-m1"
     brew("tap-new", "--no-git", tap)
     try:
         tap_formula = (
-            Path(brew("--repository", tap, capture=True).strip()) / "Formula/splash.rb"
+            Path(brew("--repository", tap, capture=True).strip())
+            / "Formula/splash-m1.rb"
         )
         shutil.copyfile(formula_file, tap_formula)
         info = json.loads(brew("info", "--json=v2", name, capture=True))["formulae"][0]
@@ -66,7 +85,9 @@ def main(argv=None):
             parser.error("formula version does not match --version")
 
         if args.action == "build":
-            archive = dist / f"splash-{args.version}-arm64-macos26.tar.gz"
+            archive = (
+                dist / f"splash-m1-{args.version}-arm64-macos{platform_major}.tar.gz"
+            )
             seed_cache(name, archive, "--build-from-source")
             brew("install", "--build-bottle", name)
             brew("test", name)
@@ -122,7 +143,7 @@ def main(argv=None):
             # brew test sets up a developer build environment. Validate the
             # user's entry point directly so this check needs no toolchain.
             help_text = subprocess.check_output(
-                [prefix / "bin/splash", "--help"], text=True
+                [prefix / "bin/splash-m1", "--help"], text=True
             )
             if "serve" not in help_text:
                 raise RuntimeError("installed launcher did not list serve")
@@ -132,7 +153,7 @@ def main(argv=None):
     finally:
         # The preflight above ensures these can only be our installation.
         try:
-            if (cellar / "splash").exists():
+            if (cellar / "splash-m1").exists():
                 brew("uninstall", "--formula", name)
         finally:
             brew("untap", tap)

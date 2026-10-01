@@ -1011,7 +1011,31 @@ def finish_reason(result, tool_calls):
     return result.reason
 
 
-def completion_response(model, job, result, message, tool_calls):
+def logprobs_content(tokenizer, job):
+    """OpenAI choices[].logprobs for a job, plus token ids (token_id)."""
+
+    def piece(token_id, logprob):
+        return {
+            "token": tokenizer.decode([token_id], skip_special_tokens=False),
+            "token_id": token_id,
+            "logprob": logprob,
+        }
+
+    return {
+        "content": [
+            {
+                **piece(token_id, logprob),
+                "top_logprobs": [
+                    piece(top_id, top_logprob)
+                    for top_id, top_logprob in zip(top_ids, top_logprobs)
+                ],
+            }
+            for token_id, logprob, top_ids, top_logprobs in job.logprob_entries
+        ]
+    }
+
+
+def completion_response(model, job, result, message, tool_calls, logprobs=None):
     return {
         "id": f"chatcmpl-{job.public_id}",
         "object": "chat.completion",
@@ -1021,6 +1045,7 @@ def completion_response(model, job, result, message, tool_calls):
             {
                 "index": 0,
                 "message": message,
+                "logprobs": logprobs,
                 "finish_reason": finish_reason(result, tool_calls),
             }
         ],
@@ -1039,6 +1064,7 @@ def stream_chunk(
     usage=None,
     metrics=None,
     timings=None,
+    logprobs=None,
 ):
     chunk = {
         "id": f"chatcmpl-{request_id}",
@@ -1047,6 +1073,8 @@ def stream_chunk(
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+    if logprobs is not None:
+        chunk["choices"][0]["logprobs"] = logprobs
     if usage is not None:
         chunk["choices"] = []
         chunk["usage"] = usage

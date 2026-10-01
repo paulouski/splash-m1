@@ -2,11 +2,18 @@
 
 #include "metal/abi/PagedAttention.h"
 #include "metal/kernels/common/q8_paging.h"
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
+// MetalPerformancePrimitives is empty below Metal 4.0 (macOS 15 build,
+// Makefile MACOS15=1); only splash_paged_attention_tile below needs it, and
+// that function is itself guarded the same way.
+#if __METAL_VERSION__ >= 400
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 
 using namespace metal;
+#if __METAL_VERSION__ >= 400
 using namespace mpp::tensor_ops;
+#endif
 
 // Paged attention over INT8 or BF16 KV. INT8 has one fp32 scale per
 // (token, KV head); BF16 reads the stored values directly. The preceding
@@ -182,6 +189,11 @@ inline void splash_attention_page_softmax(
 // KV-head-major [kv head][row][query head in group][dimension], so the tile's
 // fused rows form one contiguous M x D tensor. Three barriers per page order
 // the score store, the softmax and the probability reads of PV.
+// This function uses mpp::tensor_ops directly and is only ever selected
+// via AttentionTile::Mpp; guarded so the macOS 15 build (Makefile
+// MACOS15=1, Apple7/8-only metallib at -std=metal3.2) can still compile
+// callers of the other helpers in this header without it.
+#if __METAL_VERSION__ >= 400
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
           bool ScaleInSoftmax, typename CacheElement>
 inline void splash_paged_attention_tile(
@@ -308,6 +320,7 @@ inline void splash_paged_attention_tile(
     statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
   }
 }
+#endif  // __METAL_VERSION__ >= 400
 
 // Partials are [slot][fused row][dimension]; statistics are
 // [slot][fused row]{max, sum}. The callers lay slots out as

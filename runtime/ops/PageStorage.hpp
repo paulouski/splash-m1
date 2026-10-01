@@ -72,6 +72,13 @@ private:
   std::vector<Extent> extents_;
   uint64_t residentBackingBytes_ = 0;
   uint32_t residentPages_ = 0;
+  // False on macOS < 26.4 or unsupported GPU families, where MTLDevice
+  // placement-sparse buffers are unavailable (DeviceCapabilities
+  // .supportsPlacementSparse, read at construction). Every layer buffer is
+  // then an ordinary MTLBuffer sized to the full pool and admitted once at
+  // construction; every extent stays permanently resident and never
+  // releases its physical backing.
+  bool sparse_ = true;
 };
 
 } // namespace splash::kv

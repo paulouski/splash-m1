@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/Logprobs.hpp"
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
 
@@ -52,6 +53,8 @@ struct ModelRequest final {
   // generated, and the raw final-position logits at these ids are returned in
   // ModelStepResult::scoreLogits. maxNewTokens must be zero.
   std::span<const uint32_t> scoreTokens{};
+  // 0 disables logprobs; otherwise top_logprobs + 1.
+  uint32_t logprobs = 0;
 };
 
 struct ImageSpan final {
@@ -219,6 +222,9 @@ struct ModelStepResult final {
   // publishes cache state or emits output, and the rest of the batch stands.
   // Broken invariants and GPU faults stay exceptions and remain engine-fatal.
   std::string failure{};
+  // Target-distribution logprobs, one per outputTokens entry, only for
+  // requests that asked for them.
+  std::vector<ops::TokenLogprobs> outputLogprobs{};
 
   bool operator==(const ModelStepResult &) const = default;
 };
@@ -417,6 +423,13 @@ struct ModelTelemetry final {
   double lastDecodeWallSeconds = 0.0;
   double totalPrefillWallSeconds = 0.0;
   double totalDecodeWallSeconds = 0.0;
+  // Adaptive AR<->speculative decode policy (engine/DecodePolicy.hpp), only
+  // ever nonzero when SPLASH_DECODE_LADDER is enabled.
+  uint64_t decodeLadderSpeculativeCycles = 0;
+  uint64_t decodeLadderArCycles = 0;
+  uint64_t decodeLadderSwitchesToAr = 0;
+  uint64_t decodeLadderSwitchesToSpeculative = 0;
+  uint64_t decodeLadderProbes = 0;
 };
 
 // Observable outcome used to check repeated runs of the same configuration.

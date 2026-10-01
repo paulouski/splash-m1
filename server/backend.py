@@ -109,6 +109,8 @@ class Job:
     image_spans: tuple = ()
     image_pixels: bytes = b""
     image_owner: object | None = None
+    # Called with (prompt ids, generated ids) after a natural stop.
+    remember_tokens: object | None = None
     public_id: str = ""
     created_at: int = field(default_factory=lambda: int(time.time()))
     response_store: bool = False
@@ -120,6 +122,10 @@ class Job:
     return_progress: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
+    # 0 disables logprobs; otherwise top_logprobs + 1. Filled per token as
+    # (token id, logprob, top ids, top logprobs) from the target logits.
+    logprobs: int = 0
+    logprob_entries: list = field(default_factory=list)
     # Endpoint-specific metadata carried to the response builder.
     meta: dict | None = None
     latency: RequestLatency | None = None
@@ -258,8 +264,11 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger=None):
+    def __init__(self, runtime, tokenizer, request_logger=None, idle_unload=0.0):
         self.runtime = runtime
+        self.idle_unload = idle_unload
+        self._idle_wake = threading.Event()
+        self.last_activity = time.monotonic()
         self.tokenizer = tokenizer
         self.request_logger = request_logger
         self.active = {}
@@ -280,6 +289,11 @@ class NativeBackend:
             daemon=True,
         )
         self.finalizer.start()
+        threading.Thread(
+            target=self._idle_unload_loop,
+            name="splash-idle-unload",
+            daemon=True,
+        ).start()
         runtime.on_engine_failure = self._engine_failed
 
     def _engine_unavailable(self, event, error):
@@ -296,10 +310,44 @@ class NativeBackend:
         # would otherwise reload only after the next request was refused.
         self._ensure_background_status_refresh()
 
+    def _idle_unload_loop(self):
+        while True:
+            with self.lock:
+                if self.closing:
+                    return
+                if not self.runtime.ready:
+                    self.last_activity = time.monotonic()
+                idle_unload = self.idle_unload
+                wait = self.last_activity + idle_unload - time.monotonic()
+                if idle_unload > 0 and not self.active and wait <= 0:
+                    # Runtime re-checks pending under its admission lock.
+                    if self.runtime.unload_if_idle():
+                        print_status("Engine unloaded · idle")
+                    wait = idle_unload
+            # A changed timeout or close() wakes the loop early.
+            self._idle_wake.wait(min(max(wait, 0.1), 5.0) if idle_unload > 0 else 5.0)
+            self._idle_wake.clear()
+
+    def set_idle_unload(self, seconds):
+        """Seconds of idleness before the engine unloads; 0 never unloads."""
+        self.idle_unload = float(seconds)
+        self._idle_wake.set()
+
+    def idle_unload_remaining(self):
+        """Seconds until the idle unload, or None when none is pending."""
+        with self.lock:
+            if self.idle_unload <= 0 or self.active or self.closing:
+                return None
+            if not self.runtime.ready:
+                return None
+            return max(0.0, self.last_activity + self.idle_unload - time.monotonic())
+
     def can_submit(self):
         with self.lock:
             if self.closing:
                 return False
+        if self.runtime.unloaded:
+            return True
         if not self.runtime.ready:
             self._ensure_background_status_refresh()
             return False
@@ -338,7 +386,7 @@ class NativeBackend:
 
     def _background_status_refresh(self):
         try:
-            if not self.runtime.ready:
+            if not self.runtime.ready and not self.runtime.unloaded:
                 try:
                     self.runtime.wait_ready()
                 except Exception as error:
@@ -406,16 +454,20 @@ class NativeBackend:
                 # A stale snapshot is useful telemetry but never evidence that
                 # the service is currently ready.
                 snapshot["ready"] = False
-            if not self.runtime.ready or isinstance(error, TimeoutError):
+            if not self.runtime.unloaded and (
+                not self.runtime.ready or isinstance(error, TimeoutError)
+            ):
                 self._ensure_background_status_refresh()
         else:
             self._cache_status(snapshot)
         with self.lock:
             transport_ready = not self.closing and self.runtime.ready
+            unloaded = not self.closing and self.runtime.unloaded
             engine_error = self.engine_error
         snapshot["transport"] = {
             "ready": transport_ready,
-            "recovering": not self.closing and not transport_ready,
+            "unloaded": unloaded,
+            "recovering": not self.closing and not transport_ready and not unloaded,
             "pending": self.runtime.pending_count,
             "pending_limit": self.runtime.pending_limit,
             "restarts": self.runtime.restart_count,
@@ -501,6 +553,7 @@ class NativeBackend:
             image_owner=job.image_owner,
             return_progress=job.return_progress,
             score_tokens=job.score_tokens,
+            logprobs=job.logprobs,
         )
 
     def submit(self, job):
@@ -562,6 +615,7 @@ class NativeBackend:
                 )
                 return True
             self.active[job.request_id] = state
+            self.last_activity = time.monotonic()
         try:
             recovery_attempt = 0
             while True:
@@ -614,6 +668,7 @@ class NativeBackend:
             return True
 
     def _detach_locked(self, state):
+        self.last_activity = time.monotonic()
         state.detach()
         if self.active.get(state.job.request_id) is state:
             del self.active[state.job.request_id]
@@ -648,6 +703,13 @@ class NativeBackend:
                     job.latency.tokens()
                 if event.sequence_offset == 0:
                     state.first_token_batch_tokens = len(event.tokens)
+                if job.logprobs:
+                    if len(event.logprobs) != len(event.tokens):
+                        raise RuntimeError("engine returned no logprobs")
+                    job.logprob_entries.extend(
+                        (token, *entry)
+                        for token, entry in zip(event.tokens, event.logprobs)
+                    )
                 if job.constraint is not None:
                     job.constraint.consume(event.tokens)
                 state.streamer.put_tokens(event.tokens)
@@ -715,6 +777,12 @@ class NativeBackend:
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
             )
+            if (
+                result.reason == "stop"
+                and stop_sequence is None
+                and job.remember_tokens
+            ):
+                job.remember_tokens(job.prompt_tokens, state.streamer.token_ids)
             if job.latency is not None:
                 latency = metrics_dict(result)["request_latency"]
                 queued = latency.get("queue_to_start_ms")
@@ -810,6 +878,7 @@ class NativeBackend:
             if self.closing:
                 return
             self.closing = True
+            self._idle_wake.set()
             calls = []
             for state in self.active.values():
                 state.shutdown_requested = True

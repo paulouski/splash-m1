@@ -9,9 +9,22 @@ namespace splash {
 // Device features and memory limits used by runtime planning.
 struct DeviceCapabilities {
     std::string deviceName = "unknown";
+#if defined(SPLASH_MACOS15_BUILD)
+    // The macOS-15 build target (Makefile MACOS15=1, Apple7/8-only metallib):
+    // placement-sparse buffers stay unqueryable below macOS 26.4, so this
+    // floor only guarantees the register-kernel Metal surface, not sparse KV.
+    static constexpr uint32_t kMinimumMacosMajor = 15;
+    static constexpr uint32_t kMinimumMacosMinor = 0;
+    // The memory-plan worker reads this to decide whether a dense (non-sparse)
+    // KV fallback is required instead of failing validationError(); it is not
+    // the runtime probe (supportsPlacementSparse remains the live query).
+    static constexpr bool kRequiresPlacementSparse = false;
+#else
     // Placement-sparse support is queryable from macOS 26.4.
     static constexpr uint32_t kMinimumMacosMajor = 26;
     static constexpr uint32_t kMinimumMacosMinor = 4;
+    static constexpr bool kRequiresPlacementSparse = true;
+#endif
     uint32_t macosMajor = 0;
     uint32_t macosMinor = 0;
     uint32_t macosPatch = 0;

@@ -6,10 +6,11 @@ import copy
 import json
 import re
 from dataclasses import dataclass, field
-from functools import cached_property
+from functools import cached_property, lru_cache
 from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
+from llguidance import LLMatcher
 from referencing import Registry
 
 if __package__:
@@ -190,6 +191,24 @@ STRING_SCHEMA_POST_VALIDATION_KEYWORDS = {
 GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
 MAX_GRAMMAR_BOUND = 64
 
+# The whitespace a model chooses between the tokens of constrained output, in
+# JSON and around tool calls, is bounded. Whitespace inside strings is content
+# and remains unbounded.
+MAX_WHITESPACE = 64
+WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
+WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
+
+# Pattern checks compile a grammar, and clients reuse their schemas across
+# turns, so keep the result for a bounded number of patterns.
+PATTERN_CHECK_CACHE_SIZE = 1024
+
+
+@lru_cache(maxsize=PATTERN_CHECK_CACHE_SIZE)
+def _grammar_takes_pattern(pattern):
+    """Whether llguidance can compile a JSON Schema ``pattern``."""
+    string = json.dumps({"type": "string", "pattern": pattern})
+    return not LLMatcher.validate_grammar(f"%llguidance {{}}\nstart: %json {string}\n")
+
 
 def _grammar_compatible_schema(schema):
     """Guide generation with supported constraints; validate the original."""
@@ -197,7 +216,9 @@ def _grammar_compatible_schema(schema):
     for node in _schemas(output):
         if isinstance(node, dict):
             node.pop("propertyNames", None)
-            node.pop("pattern", None)
+            pattern = node.pop("pattern", None)
+            if isinstance(pattern, str) and _grammar_takes_pattern(pattern):
+                node["pattern"] = pattern
     # A local reference can point anywhere in the document, so any object may
     # be compiled as a schema.
     for node in json_objects(output):
@@ -205,8 +226,14 @@ def _grammar_compatible_schema(schema):
             bound = node.get(key)
             if isinstance(bound, (int, float)) and bound > MAX_GRAMMAR_BOUND:
                 del node[key]
+    if output is True:
+        # Any value, with the whitespace between its tokens bounded.
+        output = {}
     if isinstance(output, dict):
-        output["x-guidance"] = {"lenient": True}
+        output["x-guidance"] = {
+            "lenient": True,
+            "whitespace_pattern": WHITESPACE,
+        }
     return output
 
 
@@ -665,7 +692,7 @@ def json_grammar(schema, thinking):
     if thinking:
         grammar.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
         grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
-    grammar.append("WS: /[ \\n\\r\\t]*/")
+    grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
 
 
@@ -776,13 +803,14 @@ def tool_grammar(policy, thinking, response_schema=None):
         # An older declared dialect leaves newer keywords unchecked, so framing
         # can meet any JSON value where it reads part of a schema.
         raise APIError(400, "unsupported tool parameter schema") from error
+    separator = "WS" if policy.required or response_schema is not None else "TEXT"
     side_grammars = []
     tag_rules = []
     for index, (name, grammar) in enumerate(zip(policy.argument_schemas, arguments)):
         grammar_name = f"arguments_{index}"
         side_grammars.append({"name": grammar_name, "lark_grammar": grammar})
         tag_rules.append(
-            f"tool_{index}: {'WS' if response_schema is not None else 'TEXT'} {TOOL_CALL_OPEN} "
+            f"tool_{index}: {separator} {TOOL_CALL_OPEN} "
             f"{json.dumps(FUNCTION_OPEN + name + '>' + chr(10))} "
             f"@{grammar_name} {json.dumps(FUNCTION_CLOSE.removesuffix(TOOL_CALL_CLOSE))} "
             f"{TOOL_CALL_CLOSE}"
@@ -790,33 +818,31 @@ def tool_grammar(policy, thinking, response_schema=None):
     tool_choice = (
         "(" + " | ".join(f"tool_{index}" for index in range(len(tag_rules))) + ")"
     )
+    calls = tool_choice + ("+" if policy.parallel else "") + " WS"
     thinking_prefix = "think " if thinking else ""
     if not tag_rules:
         # tool_choice "none": neither the text nor a JSON answer starts a call.
         body = "tail" if response_schema is None else "answer"
         start = f"start: {thinking_prefix}{body}"
     elif response_schema is not None:
-        calls = tool_choice + ("+" if policy.parallel else "") + " WS"
         body = calls if policy.required else f"({calls} | answer)"
         start = f"start: {thinking_prefix}{body}"
     elif policy.required:
-        body = tool_choice + ("+" if policy.parallel else "")
-        start = f"start: {thinking_prefix}{body}"
+        start = f"start: {thinking_prefix}{calls}"
     else:
         body = tool_choice + ("*" if policy.parallel else "?")
         start = f"start: {thinking_prefix}{body} tail"
     main = ["%llguidance {}", start]
     if response_schema is not None:
-        main.extend(
-            [
-                "answer: WS %json "
-                + json.dumps(
-                    _grammar_compatible_schema(response_schema), separators=(",", ":")
-                )
-                + " WS",
-                r"WS: /[ \n\r\t]*/",
-            ]
+        main.append(
+            "answer: WS %json "
+            + json.dumps(
+                _grammar_compatible_schema(response_schema), separators=(",", ":")
+            )
+            + " WS"
         )
+    if separator == "WS":
+        main.append(WHITESPACE_RULE)
     if thinking:
         main.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
     main.extend(

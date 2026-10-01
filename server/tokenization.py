@@ -80,8 +80,6 @@ class PromptTokenizer:
         if not self.enabled or boundary < 0:
             return self._encode(text)
         boundary += len(self.MARKER)
-        if boundary < self.MIN_PREFIX_CHARS:
-            return self._encode(text)
         prefix = text[:boundary]
         with self.lock:
             key = max(
@@ -101,25 +99,39 @@ class PromptTokenizer:
             # case this literal occurrence is not a tokenizer boundary.
             if not tokens or tokens[-1] != self.marker_id:
                 return self._encode(text)
-            packed = array("I", tokens).tobytes()
-            size = sys.getsizeof(prefix) + sys.getsizeof(packed)
-            if size <= self.budget_bytes:
-                with self.lock:
-                    # An extension replaces its earlier prefix; unrelated
-                    # concurrent conversations retain their own LRU entries.
-                    for old in {key, prefix}:
-                        previous = self.entries.pop(old, None)
-                        if previous is not None:
-                            self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
-                    self.entries[prefix] = packed
-                    self.bytes += size
-                    while (
-                        self.bytes > self.budget_bytes
-                        or len(self.entries) > self.capacity
-                    ):
-                        old, previous = self.entries.popitem(last=False)
-                        self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
+            if boundary >= self.MIN_PREFIX_CHARS:
+                self._store(prefix, tokens, key)
         return tokens + self._encode(text[boundary:])
+
+    def _store(self, prefix, tokens, replaces=""):
+        packed = array("I", tokens).tobytes()
+        size = sys.getsizeof(prefix) + sys.getsizeof(packed)
+        if size > self.budget_bytes:
+            return
+        with self.lock:
+            # An extension replaces its earlier prefix; unrelated
+            # concurrent conversations retain their own LRU entries.
+            for old in {replaces, prefix}:
+                previous = self.entries.pop(old, None)
+                if previous is not None:
+                    self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
+            self.entries[prefix] = packed
+            self.bytes += size
+            while self.bytes > self.budget_bytes or len(self.entries) > self.capacity:
+                old, previous = self.entries.popitem(last=False)
+                self.bytes -= sys.getsizeof(old) + sys.getsizeof(previous)
+
+    def remember(self, prompt_ids, generated_ids):
+        """Keep the engine's exact ids for a finished reply so a re-rendered
+        history reuses them instead of the canonical re-tokenization."""
+        if not self.enabled or not generated_ids or generated_ids[-1] != self.marker_id:
+            return
+        ids = [*prompt_ids, *generated_ids]
+        text = self.tokenizer.decode(
+            ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
+        )
+        if text.endswith(self.MARKER):
+            self._store(text, ids)
 
     def stats(self):
         with self.lock:

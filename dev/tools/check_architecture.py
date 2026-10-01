@@ -130,6 +130,13 @@ def check() -> list[str]:
     )
     concrete_model_symbols = re.compile(r"\bmodel::(?:Qwen\w*|DFlash\w*|Runtime)\b")
     client_names = re.compile(r"\b(?:Claude Code|OpenCode|Codex|Hermes)\b", re.I)
+    # Existing fork integration edges: startup resolves separate target/draft
+    # ModelPaths, and Runtime owns the CPU-only adaptive decode policy. Keep
+    # these exceptions specific to their current callers, not entire layers.
+    fork_includes = {
+        ("runtime/main.mm", "model/ModelFactory.hpp"),
+        ("runtime/model/Runtime.mm", "engine/DecodePolicy.hpp"),
+    }
 
     for path in production_sources():
         name = relative(path)
@@ -146,7 +153,10 @@ def check() -> list[str]:
                     )
         if name.startswith("runtime/model/"):
             for include in includes:
-                if include.startswith(forbidden_model_dependencies):
+                if (
+                    include.startswith(forbidden_model_dependencies)
+                    and (name, include) not in fork_includes
+                ):
                     errors.append(f"{name}: model depends on engine layer {include}")
             if re.search(r"\b(?:graph|commandGraph)\.add\s*\(", text):
                 errors.append(f"{name}: model dispatches a Metal pipeline directly")
@@ -168,7 +178,10 @@ def check() -> list[str]:
                     )
         if name == "runtime/main.mm":
             for include in includes:
-                if include in concrete_model_headers:
+                if (
+                    include in concrete_model_headers
+                    and (name, include) not in fork_includes
+                ):
                     errors.append(
                         f"{name}: startup depends on concrete model {include}"
                     )

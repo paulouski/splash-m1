@@ -74,8 +74,8 @@ inline void expert(device const bfloat *grouped_input,
 
   // Fragment i: gate/up pairs fragments i and i + 2 on one column.
   device const uchar *laneWeights[FN];
-  device const bfloat *laneScales[FN];
-  device const bfloat *laneBiases[FN];
+  device const half *laneScales[FN];
+  device const half *laneBiases[FN];
 #pragma unroll
   for (uint i = 0; i < FN; ++i) {
     const bool up = gateUp && i >= FN / 2;

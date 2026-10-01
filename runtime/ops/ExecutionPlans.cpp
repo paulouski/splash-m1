@@ -128,8 +128,14 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t historyTokens) const {
   validateHistory(historyTokens, rows);
   const PrefillAttentionPolicy workload{attentionShape(queryHeads, layout), rows};
+  PrefillAttentionConfig fallback{};
+  if (appleGpuFamily_ == 7 && attentionTile_ == AttentionTile::Register &&
+      layout.format == kv::Format::Int8 && queryHeads == 24 &&
+      layout.kvHeads == 4 && layout.headDimension == 256 &&
+      rows >= 16 && rows <= 128 && historyTokens >= 4096)
+    fallback.splitMultiplier = PrefillSplitMultiplier::Two;
   PrefillAttentionConfig config =
-      chosenConfiguration(choices_.prefillAttention, workload, PrefillAttentionConfig{});
+      chosenConfiguration(choices_.prefillAttention, workload, fallback);
   config.tile = attentionTile_;
   return PagedAttention::prefillPlan(rows, queryHeads, layout, historyTokens, config);
 }
@@ -150,7 +156,8 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
       shape, lanes,
       chosenConfiguration(choices_.draftAttention,
                        DraftAttentionWorkload{shape, lanes},
-                       DraftAttentionConfiguration{}));
+                       DraftAttentionConfiguration{}),
+      appleGpuFamily_ < 9);
 }
 
 // The device's fields of a MoE plan: the router threshold, the 8-row tile

@@ -61,8 +61,9 @@ void requireContextInputs(const metal::MetalBuffer &contextQkv,
                           const metal::MetalBuffer &keyNorm,
                           const metal::MetalBuffer &ropeCos,
                           const metal::MetalBuffer &ropeSin, uint64_t rows,
-                          DraftAttentionShape shape) {
-  requireBuffer(contextQkv, rows * shape.qkvSize * 2);
+                          DraftAttentionShape shape, bool kvOnly = false) {
+  const uint32_t contextWidth = kvOnly ? shape.contextSize() : shape.qkvSize;
+  requireBuffer(contextQkv, rows * contextWidth * 2);
   requireBuffer(keyNorm, uint64_t{shape.headDimension} * 2);
   const uint64_t ropeBytes = rows * shape.headDimension / 2 * 4;
   requireBuffer(ropeCos, ropeBytes);
@@ -103,13 +104,14 @@ DraftAttention::candidates(DraftAttentionShape shape) {
 
 DraftAttentionPlan
 DraftAttention::plan(DraftAttentionShape shape, uint32_t lanes,
-                     DraftAttentionConfiguration configuration) {
+                     DraftAttentionConfiguration configuration,
+                     bool registerTile) {
   requireLanes(lanes);
   const auto configurations = candidates(shape);
   if (std::find(configurations.begin(), configurations.end(), configuration) ==
       configurations.end())
     throw std::invalid_argument("unsupported draft attention configuration");
-  return {shape, lanes, configuration};
+  return {shape, lanes, configuration, registerTile};
 }
 
 void DraftAttention::captureTargetHidden(
@@ -225,8 +227,15 @@ void DraftAttention::addDecode(
                      buffers.persistentValues);
   bindings.push_back(buffers.queryKeys);
   bindings.push_back(buffers.queryValues);
-  graph.add("draft_attention_bf16_split", std::move(bindings), params,
-            {shape.kvHeads, lanes, kSplits});
+  // Apple7/8 (no MetalPerformancePrimitives, macOS 15 build) dispatch the
+  // register-matrix split kernel (draft_sgf.metal) at 128 threads (four
+  // simdgroups, one per query head) instead of the MPP one's 256.
+  if (plan.registerTile())
+    graph.add("draft_attention_bf16_split_sgf", std::move(bindings), params,
+              {shape.kvHeads, lanes, kSplits}, {128, 1, 1});
+  else
+    graph.add("draft_attention_bf16_split", std::move(bindings), params,
+              {shape.kvHeads, lanes, kSplits});
   graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
             {shape.kvHeads, lanes, 1});
 }
@@ -252,15 +261,17 @@ void DraftAttention::addContextPrefill(
     metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
     metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
     metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-    uint32_t startPosition, DraftAttentionShape shape) {
+    uint32_t startPosition, DraftAttentionShape shape, bool kvOnly) {
   static_cast<void>(kernelShape(shape));
   if (!tokens || cacheStride != kWindow)
     throw std::invalid_argument("invalid draft context prefill geometry");
-  requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin, tokens, shape);
+  requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin, tokens, shape,
+                       kvOnly);
   requireBuffer(keys, ringBytes(shape));
   requireBuffer(values, ringBytes(shape));
   const DraftContextParams params{tokens, cacheStride, startPosition};
-  graph.add("prefill_draft_context_kv",
+  graph.add(kvOnly ? "prefill_draft_context_kv_only"
+                   : "prefill_draft_context_kv",
             {std::move(contextQkv), std::move(keyNorm), std::move(ropeCos),
              std::move(ropeSin), std::move(keys), std::move(values)},
             params, {uint64_t{tokens} * shape.kvHeads, 1, 1});
@@ -274,7 +285,7 @@ void DraftAttention::addContextCommit(
     std::span<const metal::MetalBuffer> persistentValues,
     metal::MetalBuffer retainedCounts,
     std::span<const uint32_t> startPositions, uint32_t cacheStride,
-    DraftAttentionShape shape, uint32_t lanes) {
+    DraftAttentionShape shape, uint32_t lanes, bool kvOnly) {
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
   if (startPositions.size() != kMaximumLanes || cacheStride != kWindow ||
@@ -283,7 +294,8 @@ void DraftAttention::addContextCommit(
     throw std::invalid_argument("invalid draft context commit geometry");
   // Each lane commits up to its eight verify rows.
   requireContextInputs(contextQkv, keyNorm, ropeCos, ropeSin,
-                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
+                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape,
+                       kvOnly);
   requireBuffer(retainedCounts, uint64_t{lanes} * sizeof(uint32_t));
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBuffer(persistentKeys[lane], ringBytes(shape));
@@ -298,7 +310,9 @@ void DraftAttention::addContextCommit(
   bindings.reserve(2 * kMaximumLanes + 5);
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
-  graph.add("draft_context_kv_commit", std::move(bindings), params,
+  graph.add(kvOnly ? "draft_context_kv_commit_only"
+                   : "draft_context_kv_commit",
+            std::move(bindings), params,
             {uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS * shape.kvHeads, 1,
              1});
 }

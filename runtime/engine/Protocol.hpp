@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/Logprobs.hpp"
 #include "ops/Vision.hpp"
 
 #include <array>
@@ -190,6 +191,8 @@ struct RequestFrame {
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
   std::vector<uint32_t> scoreTokens{};
+  // 0 disables logprobs; otherwise top_logprobs + 1 (top_logprobs <= 20).
+  uint8_t logprobs = 0;
 
   bool operator==(const RequestFrame &) const = default;
 };
@@ -266,6 +269,9 @@ struct TokensEvent {
   uint64_t requestId = 0;
   uint32_t sequenceOffset = 0;
   std::vector<uint32_t> tokens;
+  // Empty, or one entry per token, each with the same top-k width. Encoded
+  // after the token words; the C++ side does not decode it.
+  std::vector<ops::TokenLogprobs> logprobs{};
 
   bool operator==(const TokensEvent &) const = default;
 };

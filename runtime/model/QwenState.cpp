@@ -1,6 +1,7 @@
 #include "model/QwenState.hpp"
 
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <algorithm>
 #include <new>
 #include <stdexcept>
@@ -25,8 +26,24 @@ void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
   if (destination.sizeBytes() != source.sizeBytes()) {
     throw std::logic_error(std::string(name) + " shape mismatch");
   }
-  std::memcpy(writableContents(destination, name),
-              writableContents(source, name), destination.sizeBytes());
+  // One thread copies at about a quarter of the memory bandwidth; chunks also
+  // spread the page faults of a fresh destination.
+  struct Copy {
+    std::byte *to;
+    const std::byte *from;
+    uint64_t bytes;
+  } copy{static_cast<std::byte *>(writableContents(destination, name)),
+         static_cast<const std::byte *>(writableContents(source, name)),
+         destination.sizeBytes()};
+  static constexpr uint64_t chunk = 2u << 20;
+  dispatch_apply_f((copy.bytes + chunk - 1) / chunk,
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), &copy,
+                   [](void *context, size_t index) {
+                     const auto &c = *static_cast<const Copy *>(context);
+                     const uint64_t begin = index * chunk;
+                     std::memcpy(c.to + begin, c.from + begin,
+                                 std::min(chunk, c.bytes - begin));
+                   });
 }
 
 void clear(const MetalBuffer &buffer, const char *name) {

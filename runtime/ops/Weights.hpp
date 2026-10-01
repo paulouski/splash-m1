@@ -4,6 +4,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -23,6 +24,8 @@ struct ProjectionShape final {
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
+  // Affine projections only: 4 or 5 (Projection::bits).
+  uint32_t bits = 4;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -47,6 +50,32 @@ struct AffineWeights final {
   metal::MetalBuffer weights;
   metal::MetalBuffer scales;
   metal::MetalBuffer biases;
+  // Q5's fifth bit, one per weight (Q5Pack.hpp): empty for a Q4 projection.
+  metal::MetalBuffer hi{};
+  // The 256-row storage tiles [hiTileBegin, hiTileEnd) that hold nonzero hi
+  // bits (a Q4 part promoted into Q5 storage has none): the kernels skip the
+  // hi plane elsewhere. The default covers every tile.
+  uint32_t hiTileBegin = 0;
+  uint32_t hiTileEnd = UINT32_MAX;
+
+  // Sets the range from the hi plane (tile-major, inputSize * 32 bytes per tile).
+  void scanHiTiles(uint32_t outputSize, uint32_t inputSize) {
+    const auto *bytes = static_cast<const uint8_t *>(hi.contents());
+    if (!bytes) return;
+    const uint64_t stride = uint64_t{inputSize} * 32;
+    hiTileBegin = hiTileEnd = 0;
+    for (uint32_t t = 0; t < outputSize / 256; ++t) {
+      bool any = false;
+      for (uint64_t i = 0; i < stride && !any; i += 8) {
+        uint64_t word;
+        std::memcpy(&word, bytes + t * stride + i, 8);
+        any = word != 0;
+      }
+      if (!any) continue;
+      if (hiTileEnd == 0) hiTileBegin = t;
+      hiTileEnd = t + 1;
+    }
+  }
 };
 
 // A Q8 affine projection, quantized per 64 inputs in StorageN=256 order: the
@@ -154,7 +183,7 @@ public:
   }
 
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    return {outputSize, inputSize, layout(), static_cast<bool>(rotation)};
+    return {outputSize, inputSize, layout(), static_cast<bool>(rotation), bits};
   }
 
   uint32_t outputSize = 0;
@@ -162,6 +191,8 @@ public:
   // fp32 only for plain decode plans (Linear::plan), which keep the tile of
   // the bf16 plan.
   FloatOutput destination = FloatOutput::BFloat16;
+  // Affine projections only: 4 (AffineWeights::hi unused) or 5.
+  uint32_t bits = 4;
   // Block projections only.
   InputRotation rotation;
 };

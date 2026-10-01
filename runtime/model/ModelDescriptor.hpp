@@ -55,4 +55,14 @@ struct ModelDescriptor final {
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
 
+// A local target and draft directory, read directly with no shared root and
+// no model.json/manifest.json: the target's own config.json (its text_config
+// unwrapped, same as SafetensorsCheckpoint.mm) and the draft's own
+// config.json name the model; target_format is inferred from the target
+// directory's own files (a GGUF file, else safetensors shards). Always
+// language-only: this path serves no vision tower.
+[[nodiscard]] ModelDescriptor
+inspectLocalModel(const std::filesystem::path &targetDirectory,
+                  const std::filesystem::path &draftDirectory);
+
 } // namespace splash::model

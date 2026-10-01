@@ -1,36 +1,50 @@
 #include "metal/abi/KernelABI.h"
 
 // Sorted top-K lists: descending value, ascending token id on ties.
+inline bool top_beats(float value, uint token, float other, uint other_token) {
+  return value > other || (value == other && token < other_token);
+}
+
+// Register-resident sorted insert for an entry the caller has already checked
+// against the last slot; the unrolled shift keeps every index static.
 template <uint K>
-inline void top_insert(thread float *values, thread uint *ids, float value,
-                       uint token) {
-  if (!(value > values[K - 1] ||
-        (value == values[K - 1] && token < ids[K - 1])))
-    return;
-  uint slot = K - 1;
-  while (slot > 0 && (value > values[slot - 1] ||
-                      (value == values[slot - 1] && token < ids[slot - 1]))) {
-    values[slot] = values[slot - 1];
-    ids[slot] = ids[slot - 1];
-    --slot;
+inline void top_insert(thread float (&values)[K], thread uint (&ids)[K],
+                       float value, uint token) {
+#pragma clang loop unroll(full)
+  for (uint slot = K - 1; slot > 0; --slot) {
+    bool here = top_beats(value, token, values[slot], ids[slot]);
+    bool above = top_beats(value, token, values[slot - 1], ids[slot - 1]);
+    values[slot] = here ? (above ? values[slot - 1] : value) : values[slot];
+    ids[slot] = here ? (above ? ids[slot - 1] : token) : ids[slot];
   }
-  values[slot] = value;
-  ids[slot] = token;
+  bool top = top_beats(value, token, values[0], ids[0]);
+  values[0] = top ? value : values[0];
+  ids[0] = top ? token : ids[0];
+}
+
+// Pops the head of a register-resident sorted list of Count entries.
+template <uint Count>
+inline void top_pop(thread float (&values)[Count], thread uint (&ids)[Count]) {
+#pragma clang loop unroll(full)
+  for (uint slot = 0; slot + 1 < Count; ++slot) {
+    values[slot] = values[slot + 1];
+    ids[slot] = ids[slot + 1];
+  }
+  values[Count - 1] = -INFINITY;
+  ids[Count - 1] = 0xffffffffu;
 }
 
 // Each simdgroup drains its sorted top-K lists into threadgroup memory;
-// thread 0 merges the eight lists into the shard's partial.
+// simdgroup 0 merges the eight lists into the shard's partial.
 template <uint K>
 __attribute__((always_inline)) inline void top_shard_store(
     thread float (&local_values)[K], thread uint (&local_ids)[K],
     threadgroup float *group_values, threadgroup uint *group_ids,
     device uint *partial_ids, device float *partial_values,
-    uint group, uint thread_index, uint lane,
-    uint simd_group) {
-  uint cursor = 0;
+    uint group, uint lane, uint simd_group) {
   for (uint rank = 0; rank < K; ++rank) {
-    float value = cursor < K ? local_values[cursor] : -INFINITY;
-    uint token = cursor < K ? local_ids[cursor] : 0xffffffffu;
+    float value = local_values[0];
+    uint token = local_ids[0];
     float simd_best = simd_max(value);
     uint simd_id = simd_min(value == simd_best ? token : 0xffffffffu);
     uint winner =
@@ -40,23 +54,27 @@ __attribute__((always_inline)) inline void top_shard_store(
       group_ids[simd_group * K + rank] = simd_id;
     }
     if (lane == winner)
-      ++cursor;
+      top_pop<K>(local_values, local_ids);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  if (thread_index == 0) {
-    float final_values[K];
-    uint final_ids[K];
-    for (uint i = 0; i < K; ++i) {
-      final_values[i] = -INFINITY;
-      final_ids[i] = 0xffffffffu;
-    }
-    for (uint item = 0; item < 8 * K; ++item)
-      top_insert<K>(final_values, final_ids, group_values[item],
-                    group_ids[item]);
+  // Simdgroup 0 merges the eight sorted lists by rank, one list head per lane.
+  if (simd_group == 0) {
+    uint list_cursor = 0;
     for (uint rank = 0; rank < K; ++rank) {
-      partial_ids[group * K + rank] = final_ids[rank];
-      partial_values[group * K + rank] = final_values[rank];
+      const bool live = lane < 8 && list_cursor < K;
+      float value = live ? group_values[lane * K + list_cursor] : -INFINITY;
+      uint token = live ? group_ids[lane * K + list_cursor] : 0xffffffffu;
+      float best = simd_max(value);
+      uint best_id = simd_min(value == best ? token : 0xffffffffu);
+      uint winner =
+          simd_min(value == best && token == best_id ? lane : 0xffffffffu);
+      if (lane == 0) {
+        partial_ids[group * K + rank] = best_id;
+        partial_values[group * K + rank] = best;
+      }
+      if (lane == winner)
+        ++list_cursor;
     }
   }
 }
@@ -77,17 +95,47 @@ __attribute__((always_inline)) inline void target_top_shard(
     values[i] = -INFINITY;
     ids[i] = 0xffffffffu;
   }
+  // Unconstrained top-K: the K-th largest thread maximum is a lower bound on
+  // the shard's K-th largest, so only tokens at or above it can be in the
+  // shard's top-K and the sorted insert runs for those few. The (value desc,
+  // id asc) order is total, so the partial is unchanged. group_values doubles
+  // as the maxima scratch and group_ids as the per-simdgroup bounds.
+  float bound = -INFINITY;
+  if (K > 1 && !constrained) {
+    float best = -INFINITY;
+    for (uint token = (group % Shards) * 256 + thread_index; token < vocabulary;
+         token += Shards * 256) {
+      const float value = source[token];
+      best = value > best ? value : best;
+    }
+    group_values[thread_index] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint above = 0;
+    for (uint other = 0; other < 256; ++other)
+      above += group_values[other] > best ? 1u : 0u;
+    const float candidate = simd_min(above < K ? best : INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0)
+      group_ids[simd_group] = as_type<uint>(candidate);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bound = INFINITY;
+    for (uint g = 0; g < 8; ++g)
+      bound = min(bound, as_type<float>(group_ids[g]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
   for (uint token = (group % Shards) * 256 + thread_index; token < vocabulary;
        token += Shards * 256) {
     if (constrained &&
         (token_mask[mask_origin + token / 32] & (1u << (token % 32))) == 0)
       continue;
-    top_insert<K>(values, ids, source[token], token);
+    const float value = source[token];
+    if (value >= bound && top_beats(value, token, values[K - 1], ids[K - 1]))
+      top_insert(values, ids, value, token);
   }
   top_shard_store<K>(values, ids, group_values, group_ids,
                      partial_ids + ulong(group) * 32,
                      partial_values + ulong(group) * 32,
-                     0, thread_index, lane, simd_group);
+                     0, lane, simd_group);
 }
 
 // Merges the Shards partials of one row into its sorted top-K.
@@ -100,43 +148,71 @@ __attribute__((always_inline)) inline void top_partials_reduce(
     ids[i] = 0xffffffffu;
   }
   uint origin = row * Shards * K;
-  for (uint item = 0; item < Shards * K; ++item)
-    top_insert<K>(values, ids, partial_values[origin + item],
-                  partial_ids[origin + item]);
+  for (uint item = 0; item < Shards * K; ++item) {
+    const float value = partial_values[origin + item];
+    const uint token = partial_ids[origin + item];
+    if (top_beats(value, token, values[K - 1], ids[K - 1]))
+      top_insert(values, ids, value, token);
+  }
+}
+
+// The same merge on one simdgroup: lane s holds shard s's list head and each
+// rank takes the best head, as top_shard_store does for its simdgroups.
+template <uint K, uint Shards>
+__attribute__((always_inline)) inline void top_partials_reduce_simd(
+    device const uint *partial_ids, device const float *partial_values,
+    uint row, uint lane, threadgroup float *merged_values,
+    threadgroup uint *merged_ids) {
+  static_assert(Shards <= 32, "one list head per lane");
+  const uint origin = row * Shards * K;
+  uint cursor = 0;
+  for (uint rank = 0; rank < K; ++rank) {
+    const bool live = lane < Shards && cursor < K;
+    float value = live ? partial_values[origin + lane * K + cursor] : -INFINITY;
+    uint token = live ? partial_ids[origin + lane * K + cursor] : 0xffffffffu;
+    float best = simd_max(value);
+    uint best_id = simd_min(value == best ? token : 0xffffffffu);
+    uint winner =
+        simd_min(value == best && token == best_id ? lane : 0xffffffffu);
+    if (lane == 0) {
+      merged_values[rank] = best;
+      merged_ids[rank] = best_id;
+    }
+    if (lane == winner)
+      ++cursor;
+  }
+}
+
+// Top-k=1: the unit-probability winner of the shards' heads.
+__attribute__((always_inline)) inline void top32_probs_top1(
+    device const uint *partial_ids, device const float *partial_values,
+    device uint *top_ids, device float *top_probs, uint row) {
+  float best = -INFINITY;
+  uint token = 0xffffffffu;
+  for (uint shard = 0; shard < SPLASH_TARGET_SAMPLING_SHARDS; ++shard) {
+    ulong index = (ulong(row) * SPLASH_TARGET_SAMPLING_SHARDS + shard) * 32;
+    float value = partial_values[index];
+    uint id = partial_ids[index];
+    if (value > best || (value == best && id < token)) {
+      best = value;
+      token = id;
+    }
+  }
+  for (uint rank = 0; rank < 32; ++rank) {
+    top_ids[ulong(row) * 32 + rank] = rank == 0 ? token : 0xffffffffu;
+    top_probs[ulong(row) * 32 + rank] =
+        rank == 0 && token != 0xffffffffu ? 1.0f : 0.0f;
+  }
 }
 
 // One row's sparse target distribution: the merged top-32 is softmaxed at
 // temperature over its first top_k entries, truncated by top_p, renormalized
 // and written in ascending token-id order; slots past the valid count carry
-// ~0u. Top-k=1 stores only its unit-probability winner. The constant
-// references keep the divisions inside the loops.
-__attribute__((always_inline)) inline void top32_probs_row(
-    device const uint *partial_ids, device const float *partial_values,
+// ~0u. The constant references keep the divisions inside the loops.
+__attribute__((always_inline)) inline void top32_probs_finish(
+    thread const float (&values)[32], thread const uint (&ids)[32],
     device uint *top_ids, device float *top_probs, uint row,
     constant uint &top_k, constant float &temperature, constant float &top_p) {
-  if (top_k == 1) {
-    float best = -INFINITY;
-    uint token = 0xffffffffu;
-    for (uint shard = 0; shard < SPLASH_TARGET_SAMPLING_SHARDS; ++shard) {
-      ulong index = (ulong(row) * SPLASH_TARGET_SAMPLING_SHARDS + shard) * 32;
-      float value = partial_values[index];
-      uint id = partial_ids[index];
-      if (value > best || (value == best && id < token)) {
-        best = value;
-        token = id;
-      }
-    }
-    for (uint rank = 0; rank < 32; ++rank) {
-      top_ids[ulong(row) * 32 + rank] = rank == 0 ? token : 0xffffffffu;
-      top_probs[ulong(row) * 32 + rank] =
-          rank == 0 && token != 0xffffffffu ? 1.0f : 0.0f;
-    }
-    return;
-  }
-  float values[32];
-  uint ids[32];
-  top_partials_reduce<32, SPLASH_TARGET_SAMPLING_SHARDS>(partial_ids, partial_values, row, values, ids);
-
   uint valid_count = 0;
   while (valid_count < 32 && ids[valid_count] != 0xffffffffu)
     ++valid_count;
@@ -180,6 +256,20 @@ __attribute__((always_inline)) inline void top32_probs_row(
     top_ids[destination] = best_id;
     top_probs[destination] = probabilities[best] / kept_sum;
   }
+}
+
+__attribute__((always_inline)) inline void top32_probs_row(
+    device const uint *partial_ids, device const float *partial_values,
+    device uint *top_ids, device float *top_probs, uint row,
+    constant uint &top_k, constant float &temperature, constant float &top_p) {
+  if (top_k == 1) {
+    top32_probs_top1(partial_ids, partial_values, top_ids, top_probs, row);
+    return;
+  }
+  float values[32];
+  uint ids[32];
+  top_partials_reduce<32, SPLASH_TARGET_SAMPLING_SHARDS>(partial_ids, partial_values, row, values, ids);
+  top32_probs_finish(values, ids, top_ids, top_probs, row, top_k, temperature, top_p);
 }
 
 kernel void
@@ -285,46 +375,33 @@ kernel void decode_sample_top32_probs_batch(
     constant TargetSamplingBatchParams &params [[buffer(4)]],
     uint global_row [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
-  if (thread_index != 0)
-    return;
+  threadgroup float merged_values[32];
+  threadgroup uint merged_ids[32];
   uint batch = global_row / params.rows_per_lane;
   if (batch >= params.lanes)
     return;
-  top32_probs_row(partial_ids, partial_values, top_ids, top_probs, global_row,
-                  params.top_k[batch], params.temperature[batch],
-                  params.top_p[batch]);
-}
-
-inline bool top_beats(float value, uint token, float other, uint other_token) {
-  return value > other || (value == other && token < other_token);
-}
-
-// Register-resident sorted top-16 insert for an entry the caller has already
-// checked against the last slot; the unrolled shift keeps every index static.
-inline void top16_insert(thread float (&values)[16], thread uint (&ids)[16],
-                         float value, uint token) {
-#pragma clang loop unroll(full)
-  for (uint slot = 15; slot > 0; --slot) {
-    bool here = top_beats(value, token, values[slot], ids[slot]);
-    bool above = top_beats(value, token, values[slot - 1], ids[slot - 1]);
-    values[slot] = here ? (above ? values[slot - 1] : value) : values[slot];
-    ids[slot] = here ? (above ? ids[slot - 1] : token) : ids[slot];
+  if (params.top_k[batch] != 1) {
+    top_partials_reduce_simd<32, SPLASH_TARGET_SAMPLING_SHARDS>(
+        partial_ids, partial_values, global_row, thread_index, merged_values,
+        merged_ids);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  bool top = top_beats(value, token, values[0], ids[0]);
-  values[0] = top ? value : values[0];
-  ids[0] = top ? token : ids[0];
-}
-
-// Pops the head of a register-resident sorted list of Count entries.
-template <uint Count>
-inline void top_pop(thread float (&values)[Count], thread uint (&ids)[Count]) {
-#pragma clang loop unroll(full)
-  for (uint slot = 0; slot + 1 < Count; ++slot) {
-    values[slot] = values[slot + 1];
-    ids[slot] = ids[slot + 1];
+  if (thread_index != 0)
+    return;
+  if (params.top_k[batch] == 1) {
+    top32_probs_top1(partial_ids, partial_values, top_ids, top_probs,
+                     global_row);
+    return;
   }
-  values[Count - 1] = -INFINITY;
-  ids[Count - 1] = 0xffffffffu;
+  float values[32];
+  uint ids[32];
+  for (uint i = 0; i < 32; ++i) {
+    values[i] = merged_values[i];
+    ids[i] = merged_ids[i];
+  }
+  top32_probs_finish(values, ids, top_ids, top_probs, global_row,
+                     params.top_k[batch], params.temperature[batch],
+                     params.top_p[batch]);
 }
 
 // The simdgroup's best list head: (value desc, id asc), so ties and the
@@ -385,13 +462,13 @@ kernel void draft_select_top16_sharded(
     uint token = begin + thread_index;
     float value = row[token];
     if (top_beats(value, token, values[K - 1], ids[K - 1]))
-      top16_insert(values, ids, value, token);
+      top_insert(values, ids, value, token);
   }
   if (thread_index < end - tail_begin) {
     uint token = tail_begin + thread_index;
     float value = row[token];
     if (top_beats(value, token, values[K - 1], ids[K - 1]))
-      top16_insert(values, ids, value, token);
+      top_insert(values, ids, value, token);
   }
 
   threadgroup float maxima[256];
@@ -432,7 +509,7 @@ kernel void draft_select_top16_sharded(
         float value = loaded[i][j];
         if (value >= threshold &&
             top_beats(value, token + j, values[K - 1], ids[K - 1]))
-          top16_insert(values, ids, value, token + j);
+          top_insert(values, ids, value, token + j);
       }
     }
   }

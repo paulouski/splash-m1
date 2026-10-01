@@ -230,7 +230,13 @@ RuntimeResources::RuntimeResources(
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config) {
-  if (config.metallibPath.empty() || config.modelRoot.empty() ||
+  // modelPaths names the target/draft (and, when there is one, vision)
+  // directories directly; a legacy caller instead names one root and its
+  // target/draft/vision subdirectories.
+  const model::ModelPaths modelPaths = config.modelPaths.target.empty()
+      ? model::ModelPaths::ofRoot(config.modelRoot)
+      : config.modelPaths;
+  if (config.metallibPath.empty() || modelPaths.target.empty() ||
       !kv::validFormat(config.kvFormat) ||
       !config.model.valid() ||
       config.buildId.empty() || !config.maximumImagePatches ||
@@ -305,7 +311,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
     kvLayout.format = config.kvFormat;
     uint64_t requiredBytes = 0;
     for (const uint64_t bytes :
-         {model::preparedModelWeightBytes(config.modelRoot, config.model),
+         {model::preparedModelWeightBytes(modelPaths, config.model),
           model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
           config.model.stateLayout.activeCellBytes(),
           uint64_t{kvLayout.backingExtentPages()} *
@@ -341,7 +347,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
   model::ModelPackage package;
   try {
-    package = model::loadModelPackage(*backend, config.modelRoot, config.model,
+    package = model::loadModelPackage(*backend, modelPaths, config.model,
                                       admitWeightPreparation);
     requireLoadedModel(package);
   } catch (const metal::MetalAllocationError &error) {
@@ -390,6 +396,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
 
     ModelMemoryProfile modelProfile{
         package.name(), package.maximumContextTokens(),
+        config.requestedContextTokens,
         package.targetKvLayout(config.kvFormat), footprint};
     EngineMemoryPlanResult planResult =
         evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);

@@ -163,6 +163,48 @@ void baselinePlans() {
   }
 }
 
+void shortHistoryPrefillPolicy() {
+  const auto shape = attentionShapes[0];
+  const auto kvLayout = layout(shape);
+  const ExecutionPlans plans(device(7));
+  const auto workspace = plans.prefillAttentionWorkspace(2048, 24, kvLayout);
+  equalWorkspace(workspace, PagedAttention::prefillWorkspace(2048, 24, kvLayout),
+                 attentionFields);
+
+  for (const auto [rows, history] :
+       {std::pair{16U, 4096U}, std::pair{32U, 20000U}, std::pair{128U, 4096U}}) {
+    const auto selected = plans.prefillAttention(rows, 24, kvLayout, history);
+    require(selected.configuration.splitMultiplier == PrefillSplitMultiplier::Two &&
+                selected.configuration.tile == AttentionTile::Register,
+            "short long-history INT8 prefill did not select two register splits");
+    covers(workspace, selected.workspace, 1, attentionFields);
+  }
+
+  for (const auto [rows, history] :
+       {std::pair{15U, 4096U}, std::pair{129U, 4096U},
+        std::pair{32U, 4095U}, std::pair{32U, 0U}, std::pair{2048U, 20000U}})
+    require(plans.prefillAttention(rows, 24, kvLayout, history)
+                    .configuration.splitMultiplier == PrefillSplitMultiplier::One,
+            "short-history prefill policy changed outside its measured bounds");
+
+  require(plans.prefillAttention(32, 16, layout(attentionShapes[1]), 20000)
+                  .configuration.splitMultiplier == PrefillSplitMultiplier::One &&
+              plans.prefillAttention(32, 24,
+                  {1, 4, 256, kv::Format::BFloat16}, 20000)
+                  .configuration.splitMultiplier == PrefillSplitMultiplier::One &&
+              ExecutionPlans(device(8)).prefillAttention(32, 24, kvLayout, 20000)
+                  .configuration.splitMultiplier == PrefillSplitMultiplier::One,
+          "short-history policy leaked to another shape, format, or GPU family");
+
+  OperatorChoices choices;
+  choices.prefillAttention.push_back({{shape, 32}, {PrefillSplitMultiplier::One}});
+  ExecutionPlans overridden(device(7));
+  overridden.install(choices);
+  require(overridden.prefillAttention(32, 24, kvLayout, 20000)
+                  .configuration.splitMultiplier == PrefillSplitMultiplier::One,
+          "history fallback overrode an exact installed prefill choice");
+}
+
 // Apple9 decode plans run the four-simdgroup 8-row expert tiles; every other
 // family, and prefill on every family, keeps the shipped N128 x 8 tile. The
 // choice is the device's: candidates carry it and installed tables cannot
@@ -656,6 +698,7 @@ void invalidLookupsAndContextEdges() {
 int main() {
   try {
     baselinePlans();
+    shortHistoryPrefillPolicy();
     moeDeviceTiles();
     attentionDeviceTiles();
     ggufMoePlans();

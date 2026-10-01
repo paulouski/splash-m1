@@ -1,4 +1,5 @@
 #include "model/Runtime.hpp"
+#include "engine/DecodePolicy.hpp"
 #include "model/KvPageTier.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -7,6 +8,7 @@
 #include "metal/CommandGraph.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/Linear.hpp"
+#include "ops/Logprobs.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/RoPE.hpp"
@@ -210,6 +212,10 @@ struct Runtime::Impl {
     // Nonempty selects score-only mode: the final prefill chunk computes raw
     // logits at these token ids instead of selecting an anchor.
     std::vector<uint32_t> scoreTokens;
+    // 0 disables logprobs; otherwise top_logprobs + 1. anchorLogprobs belongs
+    // to pendingToken and is emitted with it.
+    uint32_t logprobs = 0;
+    std::optional<ops::TokenLogprobs> anchorLogprobs;
     std::vector<uint32_t> maskWords;
     // Set only while the current scheduler-owned ticket overlaps grammar-mask
     // computation with target verification. This is model runtime state, not a
@@ -221,6 +227,12 @@ struct Runtime::Impl {
     uint64_t draftContextThrough = 0;
     std::optional<DraftContextPlan> draftContextPlan;
     std::vector<ImageState> images;
+    // Adaptive AR<->speculative decode policy; only meaningful for width-1,
+    // unconstrained decode batches (see decodeAsync/finalizeDecode). Default
+    // constructed (disabled) unless beginAt() applies the runtime's config.
+    engine::DecodePolicy decodePolicy;
+    // Prompt plus committed output; the prompt-lookup drafter's search space.
+    std::vector<uint32_t> history;
   };
 
   struct DecodeLaneResult final {
@@ -233,6 +245,7 @@ struct Runtime::Impl {
     bool verify = false;
     bool draftForMask = false;
     bool draftComputed = false;
+    bool lookup = false;
   };
 
   struct PageTableBinding final {
@@ -276,6 +289,11 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
+  // Read once at startup (SPLASH_DECODE_LADDER and friends); --decode-ladder
+  // sets the same environment variable before the runtime is constructed
+  // (runtime/main.mm).
+  const engine::DecodePolicyConfig decodeLadderConfig =
+      engine::decodePolicyConfigFromEnvironment();
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         admitAllocation(std::move(value.admitAllocation)),
@@ -317,6 +335,41 @@ struct Runtime::Impl {
 
   static bool samplingEnabled(const Request &entry) noexcept {
     return entry.sampling.temperature > 0.0F;
+  }
+
+  // Prompt-lookup drafting (SPLASH_LOOKUP_MIN=L, default 16; 0 = off): the
+  // longest earlier occurrence of the history+anchor suffix, if it is at least
+  // L tokens long and followed by a full proposal, supplies the draft. The
+  // target still verifies every token, so a wrong guess costs only the cycle.
+  static bool promptLookup(Request &entry, uint32_t anchor, uint32_t *proposed) {
+    static const uint32_t minLen =
+        std::getenv("SPLASH_LOOKUP_MIN")
+            ? static_cast<uint32_t>(std::atoi(std::getenv("SPLASH_LOOKUP_MIN")))
+            : 16;
+    constexpr size_t kMaxLen = 64;
+    if (minLen == 0 || entry.history.size() <= kDraftProposalTokens)
+      return false;
+    std::vector<uint32_t> &h = entry.history;
+    h.push_back(anchor);
+    const size_t length = h.size();
+    size_t bestLen = 0, bestNext = 0;
+    // end = index of the last token of a candidate match; needs a full proposal after it.
+    for (size_t end = length - kDraftProposalTokens; end-- > 0;) {
+      if (h[end] != anchor)
+        continue;
+      size_t n = 1;
+      while (n < kMaxLen && n <= end && h[end - n] == h[length - 1 - n])
+        ++n;
+      if (n > bestLen) {
+        bestLen = n;
+        bestNext = end + 1;
+      }
+    }
+    const bool found = bestLen >= minLen;
+    if (found)
+      std::copy_n(h.begin() + bestNext, kDraftProposalTokens, proposed);
+    h.pop_back();
+    return found;
   }
 
   // Qwen3.5 M-RoPE: text rows advance one counter shared by all three axes;
@@ -587,6 +640,21 @@ struct Runtime::Impl {
     entry.cycleUniforms.fill(0.0F);
     for (uint32_t index = 1; index < entry.cycleUniforms.size(); ++index) {
       entry.cycleUniforms[index] = nextUniform(entry);
+    }
+  }
+
+  void stageLookupSamplingProposal(uint32_t lane,
+                                   const uint32_t *lookupTokens) {
+    // Deterministic proposal: q = 1 on the proposed token, 0 elsewhere.
+    auto *ids = contents<uint32_t>(
+        decodeArena->get(lane, DecodeTensor::Candidates), "lookup q ids");
+    auto *probs = contents<float>(
+        decodeArena->get(lane, DecodeTensor::ProposalProbs), "lookup q probs");
+    for (uint32_t position = 0; position < kDraftProposalTokens; ++position) {
+      for (uint32_t i = 0; i < 16; ++i) {
+        ids[position * 16 + i] = lookupTokens[position];
+        probs[position * 16 + i] = i == 0 ? 1.0F : 0.0F;
+      }
     }
   }
 
@@ -1459,6 +1527,26 @@ struct Runtime::Impl {
         width);
   }
 
+  void dumpLogits(uint32_t lane, uint32_t firstRow, uint32_t rows) const {
+    if (!gLogitsDump)
+      return;
+    const float *logits = contents<float>(
+        decodeArena->get(lane, DecodeTensor::Logits), "dump logits");
+    const uint64_t vocabulary = geometry.target.vocabularySize;
+    std::fwrite(logits + firstRow * vocabulary, sizeof(float) * vocabulary,
+                rows, gLogitsDump);
+  }
+
+  ops::TokenLogprobs rowLogprobs(const Request &entry, uint32_t lane,
+                                 uint32_t row, uint32_t chosen) const {
+    const float *logits =
+        contents<float>(decodeArena->get(lane, DecodeTensor::Logits),
+                        "logprobs logits");
+    return ops::tokenLogprobs(
+        logits + uint64_t{row} * geometry.target.vocabularySize,
+        geometry.target.vocabularySize, chosen, entry.logprobs - 1);
+  }
+
   // A stop token or the last budgeted token needs no target work of its own:
   // the next cycle would only echo it as output. Emitting it as soon as it is
   // selected saves that cycle; the engine is told it has no KV row.
@@ -1467,6 +1555,8 @@ struct Runtime::Impl {
     if (!stop && entry.maxNewTokens - entry.generatedTokens != 1)
       return false;
     result.outputTokens.push_back(*entry.pendingToken);
+    if (entry.anchorLogprobs)
+      result.outputLogprobs.push_back(*entry.anchorLogprobs);
     result.outputTokensWithoutKv = 1;
     result.finished = stop;
     ++entry.generatedTokens;
@@ -1521,6 +1611,7 @@ struct Runtime::Impl {
       output.insert(output.end(), targetTokens,
                     targetTokens + (laneResult.retained - 1));
 
+      entry.history.insert(entry.history.end(), output.begin(), output.end());
       states.swapParity(entry.slot);
       const uint64_t nextLength =
           items[lane].logicalPosition + laneResult.retained;
@@ -1531,20 +1622,83 @@ struct Runtime::Impl {
                           {static_cast<uint32_t>(items[lane].logicalPosition),
                            static_cast<uint32_t>(nextLength), 0, false}));
       entry.generatedTokens += laneResult.retained;
+      // Row r of the verify logits is the target distribution of the token
+      // after position r: output[r + 1], or the next anchor for the last row.
+      std::vector<ops::TokenLogprobs> outputLogprobs;
+      if (entry.logprobs) {
+        outputLogprobs.push_back(entry.anchorLogprobs.value());
+        for (uint32_t row = 0; row + 1 < laneResult.retained; ++row) {
+          outputLogprobs.push_back(
+              rowLogprobs(entry, lane, row, targetTokens[row]));
+        }
+        entry.anchorLogprobs = rowLogprobs(
+            entry, lane, laneResult.retained - 1, laneResult.nextAnchor);
+      }
+      dumpLogits(lane, 0, laneResult.retained);
       entry.pendingToken = laneResult.nextAnchor;
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
       entry.decodeStage = DecodeStage::Regular;
+      // Width-1 guard: a wider batch's wall-clock cost is shared across
+      // lanes and is not a valid per-request cycle cost for the policy.
+      // Disabled/constrained requests carry a default-constructed (disabled)
+      // policy, so record() is a no-op for them.
+      if (items.size() == 1) {
+        const auto modeBefore = entry.decodePolicy.mode();
+        const uint64_t probesBefore = entry.decodePolicy.metrics().probesRun;
+        entry.decodePolicy.record(laneResult.retained, timing.wallSeconds * 1000.0);
+        const auto modeAfter = entry.decodePolicy.mode();
+        if (modeBefore == engine::DecodeMode::Speculative)
+          ++counters.decodeLadderSpeculativeCycles;
+        else
+          ++counters.decodeLadderArCycles;
+        if (modeAfter != modeBefore) {
+          if (modeAfter == engine::DecodeMode::Ar)
+            ++counters.decodeLadderSwitchesToAr;
+          else
+            ++counters.decodeLadderSwitchesToSpeculative;
+        }
+        counters.decodeLadderProbes +=
+            entry.decodePolicy.metrics().probesRun - probesBefore;
+      }
       ModelStepResult &result = results[lane];
       result = {entry.id,
                 0,
                 std::move(output),
                 false,
                 DecodeStage::Regular,
-                kDraftProposalTokens,
+                laneResult.draftComputed || laneResult.lookup ? kDraftProposalTokens : 0,
                 std::min(laneResult.accepted, laneResult.retained - 1)};
+      result.outputLogprobs = std::move(outputLogprobs);
       if (entry.generatedTokens < entry.maxNewTokens)
         emitTerminalAnchor(entry, result);
+      if (gAcceptLog) {
+        // lookup+sampling: target p(x_i) for positions up to the first rejection
+        std::string lookupP;
+        if (laneResult.lookup && samplingEnabled(entry)) {
+          const auto *prop = contents<uint32_t>(
+              decodeArena->get(lane, DecodeTensor::ProposedTokens), "log proposals");
+          const auto *ids = contents<uint32_t>(
+              decodeArena->get(lane, DecodeTensor::TargetTopIds), "log target ids");
+          const auto *pr = contents<float>(
+              decodeArena->get(lane, DecodeTensor::TargetTopProbs), "log target probs");
+          for (uint32_t i = 0; i <= std::min(laneResult.accepted, kDraftProposalTokens - 1); ++i) {
+            float px = 0.0F;
+            for (uint32_t j = 0; j < 32; ++j)
+              if (ids[i * 32 + j] == prop[i]) px = pr[i * 32 + j];
+            lookupP += (i ? "," : "") + std::to_string(px);
+          }
+        }
+        // id lane width generated_total proposed accepted retained emitted temperature lookup lookupP
+        std::fprintf(gAcceptLog, "%llu\t%u\t%zu\t%u\t%u\t%u\t%u\t%zu\t%.3f\t%d\t%s\n",
+                     static_cast<unsigned long long>(entry.id), lane,
+                     items.size(), entry.generatedTokens,
+                     result.draftedTokens, result.acceptedDraftTokens,
+                     laneResult.retained, result.outputTokens.size(),
+                     static_cast<double>(entry.sampling.temperature),
+                     laneResult.lookup ? 1 : 0, lookupP.c_str());
+        std::fflush(gAcceptLog);
+      }
     }
 
     counters.lastDecodeWidth = planWidth;
@@ -1564,7 +1718,8 @@ struct Runtime::Impl {
   // only when no batch runs, so a command without them would leave a restore
   // or demotion waiting for as long as the model stays busy.
   CommandTicket submitWithCopies(CommandGraph &graph,
-                                 std::function<void()> completion) {
+                                 std::function<void()> completion,
+                                 size_t maxDispatchesPerCommandBuffer = 0) {
     // The copies are reported before the engine wakes, so the tick the wake
     // starts can retire their batch in poll().
     std::function<void()> report = kvTier ? kvTier->encode(graph) : nullptr;
@@ -1576,7 +1731,8 @@ struct Runtime::Impl {
             report();
           if (completion)
             completion();
-        });
+        },
+        maxDispatchesPerCommandBuffer);
   }
   [[nodiscard]] bool copiesQueued() const noexcept {
     return kvTier && kvTier->copiesQueued();
@@ -1858,6 +2014,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.slot = *admission.cell;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+    entry.history.assign(request.prompt.begin(), request.prompt.end());
     impl_->takeStagedImages(entry);
   }
   images.committed = admission.granted();
@@ -1874,6 +2031,7 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
   Impl::Request entry;
   entry.id = request.id;
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+  entry.history.assign(request.prompt.begin(), request.prompt.end());
   entry.maxNewTokens = request.maxNewTokens;
   entry.cohort = request.cohort;
   entry.sampling = request.sampling;
@@ -1913,9 +2071,22 @@ metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t s
     entry.scoreTokens.assign(request.scoreTokens.begin(),
                              request.scoreTokens.end());
   }
+  if (request.logprobs) {
+    if (request.logprobs > ops::kMaximumTopLogprobs + 1 ||
+        entry.constraint != ConstraintMode::None ||
+        !request.scoreTokens.empty()) {
+      throw std::invalid_argument("invalid logprobs request");
+    }
+    entry.logprobs = request.logprobs;
+  }
   entry.decodeStage = entry.cohort == BatchCohort::Constrained
                           ? DecodeStage::RequestInitialMask
                           : DecodeStage::Regular;
+  // The ladder never applies to constrained (grammar-mask) decoding: that
+  // path always drafts to build the mask (see ConstrainedDecodeTicket) and
+  // is out of scope for this policy.
+  if (entry.constraint == ConstraintMode::None)
+    entry.decodePolicy = engine::DecodePolicy(impl_->decodeLadderConfig);
   if (auto admission = impl_->states.tryActivateSlot(stateSlot, request.id);
       !admission)
     return admission;
@@ -2045,7 +2216,16 @@ Runtime::prefillAsync(const BatchPlan &plan,
                            });
       });
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
-  CommandTicket command = impl_->submitWithCopies(graph, std::move(completion));
+  uint64_t prefillRows = 0;
+  for (const ModelBatchItem &item : items) prefillRows += item.tokenCount;
+  // The measured grouped case used 2048 rows. Keep the initial eligibility
+  // floor provisional and restrict it to Apple7 packed prefill submissions.
+  const size_t maxDispatchesPerCommandBuffer =
+      impl_->backend.capabilities().appleGpuFamily == 7 && prefillRows >= 256
+          ? 64
+          : 0;
+  CommandTicket command = impl_->submitWithCopies(
+      graph, std::move(completion), maxDispatchesPerCommandBuffer);
   Impl *impl = impl_.get();
   auto finish = [impl, entries,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
@@ -2135,6 +2315,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
                   impl->geometry.target.vocabularySize) {
             throw std::runtime_error(
                 "prefill policy selected an invalid token");
+          }
+          impl->dumpLogits(lane, 0, std::min(item.tokenCount, kDecodeRows));
+          if (entry.logprobs) {
+            entry.anchorLogprobs = impl->rowLogprobs(
+                entry, lane, std::min(item.tokenCount, kDecodeRows) - 1,
+                *entry.pendingToken);
           }
           impl->emitTerminalAnchor(entry, result);
         } else {
@@ -2235,7 +2421,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
       if (Impl::samplingEnabled(entry))
         Impl::stageSamplingCycle(entry);
       impl_->loadPolicyBuffers(entry, lane, {});
-      laneResult.draftComputed = true;
+      if (items.size() == 1) {
+        uint32_t *lookupTokens = contents<uint32_t>(
+            impl_->decodeArena->get(lane, DecodeTensor::ProposedTokens),
+            "lookup proposals");
+        laneResult.lookup = Impl::promptLookup(
+            entry, *entry.pendingToken, lookupTokens);
+        if (laneResult.lookup && Impl::samplingEnabled(entry))
+          impl_->stageLookupSamplingProposal(lane, lookupTokens);
+      }
+      laneResult.draftComputed = !laneResult.lookup;
       continue;
     }
 
@@ -2245,12 +2440,38 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // DFlash has one physical graph: anchor + seven proposal rows. A shorter
     // output budget only lowers the token-exact commit count; it never
     // changes the Metal graph shape.
+    //
+    // The AR ladder mode reuses the same graph: the draft is skipped
+    // (draftComputed=false) and maximumRetained is forced to 1, so only row 0
+    // of the 8-row verify batch (the causally-isolated anchor continuation)
+    // is ever committed -- bit-identical to a real single-token target step.
+    // Rows 1..7 embed whatever proposedTokens buffer is stale from a prior
+    // cycle; they cannot affect row 0 and are rejected by the acceptance cap
+    // exactly like a low-acceptance speculative cycle. The draft's context
+    // ring still receives this cycle's committed hidden state unconditionally
+    // via encodeDraftStateCommitBatch below (gated on `verified`, not
+    // `draftComputed`), so switching back to speculative needs no catch-up.
+    //
+    // Only ever engaged for width-1, unconstrained batches: draftComputed
+    // must be uniform across the whole dispatched batch (see the
+    // "mixed draft execution phases" check below).
+    const bool arLane = items.size() == 1 &&
+                        entry.decodePolicy.mode() == engine::DecodeMode::Ar;
     laneResult.currentAnchor = *entry.pendingToken;
-    laneResult.maximumRetained = std::min(remaining, kDecodeRows);
+    laneResult.maximumRetained =
+        arLane ? 1u : std::min(remaining, kDecodeRows);
 
     impl_->prepareDecodeLane(entry, item, lane);
     impl_->loadPolicyBuffers(entry, lane, {});
-    laneResult.draftComputed = true;
+    uint32_t *lookupTokens = contents<uint32_t>(
+        impl_->decodeArena->get(lane, DecodeTensor::ProposedTokens),
+        "lookup proposals");
+    laneResult.lookup = !arLane && items.size() == 1 &&
+                        Impl::promptLookup(entry, *entry.pendingToken, lookupTokens);
+    if (laneResult.lookup && Impl::samplingEnabled(entry)) {
+      impl_->stageLookupSamplingProposal(lane, lookupTokens);
+    }
+    laneResult.draftComputed = !arLane && !laneResult.lookup;
     laneResult.verify = true;
   }
 
@@ -2268,7 +2489,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
   if (draftComputed && draftComputed != lanes.size()) {
     throw std::logic_error("decode batch mixed draft execution phases");
   }
-  if (draftComputed || verified) {
+  const bool lookupUsed = std::any_of(
+      lanes.begin(), lanes.end(),
+      [](const Impl::DecodeLaneResult &lane) { return lane.lookup; });
+  if (draftComputed || verified || lookupUsed) {
     const uint32_t ropeRows = width * kDecodeRows;
     impl_->addRopeTables(
         commandGraph,

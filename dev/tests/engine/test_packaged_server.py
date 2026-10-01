@@ -25,6 +25,7 @@ class PackagedServerTests(unittest.TestCase):
                 (root / folder).mkdir(parents=True)
                 for name in names:
                     shutil.copy2(package.ROOT / folder / name, root / folder / name)
+            shutil.copytree(package.ROOT / "server/static", root / "server/static")
             (root / "build").mkdir()
             for name in ("splash", "splash.metallib"):
                 (root / "build" / name).write_bytes(b"unused CPU test fixture")
@@ -32,6 +33,13 @@ class PackagedServerTests(unittest.TestCase):
                 shutil.copy2(package.ROOT / name, root / name)
             with mock.patch.object(package, "ROOT", root):
                 package.stage_runtime(stage, "test")
+            for asset in (
+                "server/static/katex/katex.min.js",
+                "server/static/katex/katex.min.css",
+                "server/static/katex/fonts/KaTeX_Main-Regular.woff2",
+                "server/static/katex/LICENSE",
+            ):
+                self.assertTrue((stage / asset).is_file(), asset)
             result = subprocess.run(
                 [
                     sys.executable,

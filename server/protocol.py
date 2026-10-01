@@ -23,13 +23,14 @@ MAX_TOP_K = 32
 # final-position logit per requested token, in request order.
 MIN_SCORE_TOKENS = 2
 MAX_SCORE_TOKENS = 255
+MAX_TOP_LOGPROBS = 20
 ABSOLUTE_MAX_FRAME_PAYLOAD_BYTES = 256 * 1024 * 1024
 
 _MAGIC = b"SPLH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBI")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIffIQBIB")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
@@ -50,7 +51,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 64
+assert _REQUEST.size == 65
 assert _IMAGE_SPAN.size == 32
 assert _START.size == 21
 assert _DONE.size == 41
@@ -221,6 +222,8 @@ class RequestFrame:
     # Option token ids for score-only requests; empty means ordinary
     # generation. Score tokens serialize after the image pixel bytes.
     score_tokens: tuple[int, ...] = ()
+    # 0 disables logprobs; otherwise top_logprobs + 1.
+    logprobs: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -287,6 +290,8 @@ class TokensEvent:
     request_id: int
     sequence_offset: int
     tokens: tuple[int, ...]
+    # Per token (logprob, top ids, top logprobs); empty when not requested.
+    logprobs: tuple[tuple[float, tuple[int, ...], tuple[float, ...]], ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -532,7 +537,13 @@ def _payload_bounds(frame_type: FrameType, limits: ProtocolLimits) -> tuple[int,
         case FrameType.START:
             bounds = (_START.size, _START.size)
         case FrameType.TOKENS:
-            bounds = (_TOKENS.size, _TOKENS.size + limits.max_token_batch * 4)
+            bounds = (
+                _TOKENS.size,
+                _TOKENS.size
+                + limits.max_token_batch * 4
+                + 4
+                + limits.max_token_batch * (4 + 8 * MAX_TOP_LOGPROBS),
+            )
         case FrameType.MASK_REQUEST:
             bounds = (
                 _MASK_REQUEST.size,
@@ -772,6 +783,15 @@ def _request_issue(
             FailureClass.REQUEST_ERROR,
             IssueCode.INVALID_SAMPLING,
             str(error),
+            request_id,
+        )
+    if not 0 <= request.logprobs <= MAX_TOP_LOGPROBS + 1 or (
+        request.logprobs and (scores or constraint is not ConstraintMode.NONE)
+    ):
+        return _issue(
+            FailureClass.REQUEST_ERROR,
+            IssueCode.INVALID_COUNT,
+            "logprobs need top_logprobs <= 20 and an unconstrained generation",
             request_id,
         )
     if scores and constraint is not ConstraintMode.NONE:
@@ -1143,6 +1163,7 @@ def _encode_message(
                 message.seed,
                 message.return_progress,
                 len(scores),
+                message.logprobs,
             )
             + _pack_words(prompt)
             + b"".join(
@@ -1216,6 +1237,12 @@ def _encode_message(
         payload = _TOKENS.pack(
             message.request_id, message.sequence_offset, len(tokens)
         ) + _pack_words(tokens)
+        if message.logprobs:
+            width = len(message.logprobs[0][1])
+            payload += struct.pack("<I", width) + b"".join(
+                struct.pack(f"<f{width}I{width}f", logprob, *ids, *values)
+                for logprob, ids, values in message.logprobs
+            )
         frame_type = FrameType.TOKENS
     elif isinstance(message, MaskRequestEvent):
         _raise_issue(
@@ -1425,6 +1452,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         seed,
         return_progress,
         score_count,
+        logprobs,
     ) = _REQUEST.unpack_from(payload)
     if return_progress > 1:
         _fail(
@@ -1509,6 +1537,7 @@ def _decode_request(payload: bytes, limits: ProtocolLimits) -> RequestFrame:
         bytes(image_pixels),
         bool(return_progress),
         score_tokens,
+        logprobs,
     )
     _raise_issue(_request_issue(request, limits))
     return request
@@ -1579,16 +1608,30 @@ def _decode_frame(frame: Frame, limits: ProtocolLimits = ProtocolLimits()) -> Me
                 "tokens event batch size exceeds its limit",
                 request_id,
             )
+        logprobs = ()
         try:
-            tokens = _unpack_words(payload, _TOKENS.size, count)
-        except ValueError:
+            tokens = _unpack_prefix_words(payload, _TOKENS.size, count)
+            rest = _TOKENS.size + 4 * count
+            if len(payload) > rest:
+                (width,) = struct.unpack_from("<I", payload, rest)
+                row = struct.Struct(f"<f{width}I{width}f")
+                if (
+                    width > MAX_TOP_LOGPROBS
+                    or len(payload) != rest + 4 + count * row.size
+                ):
+                    raise ValueError("logprobs")
+                logprobs = tuple(
+                    (values[0], values[1 : 1 + width], values[1 + width :])
+                    for values in row.iter_unpack(payload[rest + 4 :])
+                )
+        except (ValueError, struct.error):
             _fail(
                 FailureClass.PROTOCOL_FATAL,
                 IssueCode.INVALID_PAYLOAD_LENGTH,
                 "token count does not match the binary event payload",
                 request_id,
             )
-        message = TokensEvent(request_id, offset, tokens)
+        message = TokensEvent(request_id, offset, tokens, logprobs)
         _raise_issue(_tokens_issue(message, limits, FailureClass.PROTOCOL_FATAL))
         return message
     if frame_type is FrameType.MASK_REQUEST:

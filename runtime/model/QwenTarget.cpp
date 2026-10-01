@@ -282,11 +282,16 @@ void QwenTarget::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, 
 metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
                                                const ops::NormWeights &norm, metal::MetalBuffer input) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
+  const ops::GdnShape gdnShape = geometry_.gdnShape();
+  const bool useBf16GdnScan =
+      backend_.capabilities().appleGpuFamily == 7 &&
+      gdnShape == ops::GdnShape{16, 48, 128, 10240, 16640};
   const uint32_t layer = step.gdnLayer++;
   addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, b.projectionSums,
                                  step.rows, b.linearScratch);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
+    const bool bf16GdnScan = useBf16GdnScan && sequence.rows >= 256;
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin, sequence.rows, width);
     };
@@ -301,7 +306,7 @@ metal::MetalBuffer QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnW
          mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
          sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
          mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
-        geometry_.gdnShape(), sequence.rows, mixer.outputHeadOrder);
+        gdnShape, sequence.rows, mixer.outputHeadOrder, bf16GdnScan);
   }
   addPrefillOutput(step, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput);
   return b.gdnOutput;
@@ -439,7 +444,8 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
       {geometry_.stateLayout.convolutionLayerBytes(), geometry_.stateLayout.recurrentLayerBytes(),
        geometry_.stateLayout.convolutionBytes()},
       mixer.outputHeadOrder,
-      linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual).input());
+      linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual).input(),
+      backend_.capabilities().appleGpuFamily == 7);
   linear.addResidualBatch(step.graph, b.gdnHidden, mixer.outputProjection, input, b.gdnOutput, step.lanes,
                           step.stats, b.linearScratch, hidden);
   return b.gdnOutput;

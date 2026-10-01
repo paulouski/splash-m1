@@ -400,10 +400,13 @@ int main(int argc,char **argv) {
         fusedAttentionGate(backend, 24, 4, lanes, layout);
         fusedAttentionGate(backend, 16, 2, lanes, layout);
       }
+    // The bf16 Simdgroup tile needs Apple family 9.
+    std::vector<LinearTile> tiles{LinearTile::SimdgroupF32};
+    if (backend.capabilities().appleGpuFamily >= 9) tiles.insert(tiles.begin(), LinearTile::Simdgroup);
     uint32_t cases=0;
     // Simdgroup (bf16 operands) and SimdgroupF32 (Apple7/8: exact half weights,
     // fp32 activations, every lane in one threadgroup) share bounds and layout.
-    for (auto tile : {LinearTile::Simdgroup, LinearTile::SimdgroupF32})
+    for (auto tile : tiles)
       for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
         for (uint32_t splits : {1U,2U,4U,8U}) {
           if ((k/64)%splits) continue;
@@ -420,7 +423,7 @@ int main(int argc,char **argv) {
     for (uint32_t width : {64U, 2048U, 5120U, 17408U})
       for (uint32_t rows : {1U,37U,64U,65U}) prefillNorm(backend, width, rows);
     // 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
-    for (auto tile : {LinearTile::Simdgroup, LinearTile::SimdgroupF32})
+    for (auto tile : tiles)
       for (uint32_t lanes : {1U, 4U}) {
         splitVisibility(backend, tile, {{{{5120, 6144}, LinearEpilogue::Residual}, {{5120, 17408}, LinearEpilogue::Residual}}}, lanes);
         splitVisibility(backend, tile, {{{{16640, 5120}, LinearEpilogue::None}, {{17408, 5120}, LinearEpilogue::GateUp}}}, lanes);

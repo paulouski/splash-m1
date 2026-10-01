@@ -710,6 +710,24 @@ class Frontend:
         if not self.accepts_model(body.get("model", self.model)):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
+        preserve_thinking = body.get("preserve_thinking")
+        # Qwen-style clients (e.g. Pi) send these nested instead of top-level.
+        template_kwargs = body.get("chat_template_kwargs")
+        if template_kwargs is not None:
+            if not isinstance(template_kwargs, dict):
+                raise APIError(400, "chat_template_kwargs must be an object")
+            if reasoning_effort is None and "enable_thinking" in template_kwargs:
+                enable_thinking = template_kwargs["enable_thinking"]
+                if not isinstance(enable_thinking, bool):
+                    raise APIError(
+                        400, "chat_template_kwargs.enable_thinking must be a boolean"
+                    )
+                # False pins the template's thinking mode off; true defers to
+                # whatever reasoning_effort/default this request would otherwise use.
+                if not enable_thinking:
+                    reasoning_effort = "none"
+            if preserve_thinking is None and "preserve_thinking" in template_kwargs:
+                preserve_thinking = template_kwargs["preserve_thinking"]
         if reasoning_effort is None:
             reasoning_effort = self.default_reasoning_effort
         if reasoning_effort is not None and (
@@ -717,7 +735,6 @@ class Frontend:
             or reasoning_effort not in REASONING_EFFORTS
         ):
             raise APIError(400, "invalid reasoning_effort")
-        preserve_thinking = body.get("preserve_thinking")
         if preserve_thinking is not None and not isinstance(preserve_thinking, bool):
             raise APIError(400, "preserve_thinking must be a boolean")
         messages = template_messages(
@@ -864,13 +881,24 @@ class Frontend:
             raise APIError(400, "stop must be a string or up to four strings")
         n = body.get("n", 1)
         logprobs = body.get("logprobs")
+        top_logprobs = body.get("top_logprobs")
+        if not isinstance(n, int) or isinstance(n, bool) or n != 1:
+            raise APIError(400, "n is not currently supported")
         if (
-            not isinstance(n, int)
-            or isinstance(n, bool)
-            or n != 1
-            or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
+            (logprobs is not None and not isinstance(logprobs, bool))
+            or (top_logprobs is not None and not logprobs)
+            or (
+                top_logprobs is not None
+                and (
+                    not isinstance(top_logprobs, int)
+                    or isinstance(top_logprobs, bool)
+                    or not 0 <= top_logprobs <= wire.MAX_TOP_LOGPROBS
+                )
+            )
         ):
-            raise APIError(400, "n and logprobs are not currently supported")
+            raise APIError(400, "logprobs must be a boolean; top_logprobs is 0..20")
+        # Engine encoding: 0 disabled, else top_logprobs + 1.
+        logprobs_wire = (top_logprobs or 0) + 1 if logprobs else 0
         penalties = (
             body.get("presence_penalty", 0),
             body.get("frequency_penalty", 0),
@@ -975,9 +1003,15 @@ class Frontend:
             image_spans=image_spans,
             image_pixels=image_pixels,
             image_owner=prepared_images if prepared_images else None,
+            remember_tokens=None if prepared_images else self.prompt_tokenizer.remember,
             public_id=secrets.token_hex(16),
             tools_signature=tools_signature,
+            logprobs=logprobs_wire,
         )
+        if logprobs_wire and constraint is not None:
+            raise APIError(
+                400, "logprobs cannot be combined with tools or structured output"
+            )
         return job, thinking, bool(tools)
 
     def prepare_responses(self, body, *, deadline=None, reserve_input=None):

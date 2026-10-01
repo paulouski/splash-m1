@@ -170,6 +170,74 @@ class StructuredToolGrammarTest(unittest.TestCase):
             tool_schema._tool_arguments_grammar(array),
         )
 
+    def test_whitespace_between_tokens_is_bounded(self):
+        # A model preferring whitespace to every token the grammar allows next
+        # must write one of them within 64 characters; strings keep theirs.
+        bound = tool_schema.MAX_WHITESPACE
+        for spaces, complete in ((bound, True), (bound + 1, False)):
+            with self.subTest(spaces=spaces):
+                pad = " " * spaces
+                for text in (
+                    "{" + pad + '"answer":42}',
+                    pad + ANSWER,
+                    CALL + "\n" * spaces + OTHER_CALL,
+                ):
+                    if complete:
+                        self.assert_complete(text)
+                    else:
+                        self.assert_not_complete(text)
+                grammar = tool_schema.json_grammar(SCHEMA, False)
+                matcher = LLMatcher(self.guidance, grammar)
+                tokens = self.tokenizer.encode("{" + pad + '"answer":42}').ids
+                self.assertEqual(
+                    matcher.validate_tokens(tokens) == len(tokens)
+                    and matcher.consume_tokens(tokens)
+                    and matcher.is_accepting(),
+                    complete,
+                )
+        required_grammar = tool_schema.tool_grammar(policy("required"), False)
+        self.assertFalse(LLMatcher.validate_grammar(required_grammar, self.guidance))
+        for spaces, complete in ((bound, True), (bound + 1, False)):
+            pad = " " * spaces
+            for text in (
+                pad + CALL + OTHER_CALL,
+                CALL + pad + OTHER_CALL,
+                CALL + OTHER_CALL + pad,
+            ):
+                with self.subTest(required_spaces=spaces, text=text[:24]):
+                    matcher = LLMatcher(self.guidance, required_grammar)
+                    tokens = self.tokenizer.encode(text).ids
+                    accepted = (
+                        matcher.validate_tokens(tokens) == len(tokens)
+                        and matcher.consume_tokens(tokens)
+                        and matcher.is_accepting()
+                    )
+                    self.assertEqual(accepted, complete)
+        self.assert_complete('{"answer":42,"marker":"' + " " * 200 + '"}')
+        # Any value, as an open parameter takes, is bounded alike.
+        tool = {"name": "note", "parameters": {"type": "object"}}
+        grammar = tool_schema.tool_grammar(
+            tool_schema.normalize_tools(
+                [{"type": "function", "function": tool}], "auto", True
+            )[1],
+            False,
+        )
+        for spaces, complete in ((bound, True), (bound + 1, False)):
+            text = (
+                "<tool_call>\n<function=note>\n<parameter=body>\n{"
+                + " " * spaces
+                + '"a":1}\n</parameter>\n</function>\n</tool_call>'
+            )
+            with self.subTest(open_parameter=spaces):
+                matcher = LLMatcher(self.guidance, grammar)
+                tokens = self.tokenizer.encode(text).ids
+                self.assertEqual(
+                    matcher.validate_tokens(tokens) == len(tokens)
+                    and matcher.consume_tokens(tokens)
+                    and matcher.is_accepting(),
+                    complete,
+                )
+
     def test_json_strings_can_contain_tool_delimiter_bytes(self):
         text = json.dumps({"answer": 42, "marker": CALL})
         self.assert_complete(text, byte_tokens=True)

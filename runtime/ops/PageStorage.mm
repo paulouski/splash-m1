@@ -1,6 +1,7 @@
 #include "ops/PageStorage.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -27,7 +28,8 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     metal::AllocationAdmission admitAllocation, Layout layout,
     uint32_t pageCount)
     : backend_(backend), admitAllocation_(std::move(admitAllocation)),
-      layout_(layout), pageCount_(pageCount), layers_(layout.attentionLayers) {
+      layout_(layout), pageCount_(pageCount), layers_(layout.attentionLayers),
+      sparse_(backend.capabilities().supportsPlacementSparse) {
     if (!admitAllocation_) {
         throw std::invalid_argument(
             "KV page storage requires physical allocation admission");
@@ -40,28 +42,58 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
             "KV page pool is not sparse-mapping aligned");
     }
     const StorageByteCounts bytes = layout_.storageByteCounts(pageCount);
-    for (uint32_t layerIndex = 0; layerIndex < layers_.size();
-         ++layerIndex) {
-        std::string prefix = "kv-layer-" +
-                             std::to_string(layerIndex) + "-";
-        LayerStorage &storage = layers_[layerIndex];
-        storage.format = layout_.format;
-        storage.keyData = backend_.allocatePlacementSparseBuffer(
-            checkedMultiply(pageCount, layout_.dataBytesPerLayerPage()),
-            kSparseMappingAlignmentBytes, prefix + "keys");
-        if (layout_.scaleBytesPerLayerPage()) {
-            storage.keyScales = backend_.allocatePlacementSparseBuffer(
-                checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
-                kSparseMappingAlignmentBytes, prefix + "key-scales");
+    // Sparse mode maps virtual placement-sparse buffers; the fallback
+    // allocates the same total bytes as ordinary private buffers, all
+    // physically committed up front. Either way this closure fills layers_.
+    using Allocate = std::function<metal::MetalBuffer(uint64_t, std::string_view)>;
+    auto allocateLayers = [&](const Allocate &allocate) {
+        for (uint32_t layerIndex = 0; layerIndex < layers_.size();
+             ++layerIndex) {
+            std::string prefix = "kv-layer-" +
+                                 std::to_string(layerIndex) + "-";
+            LayerStorage &storage = layers_[layerIndex];
+            storage.format = layout_.format;
+            storage.keyData = allocate(
+                checkedMultiply(pageCount, layout_.dataBytesPerLayerPage()),
+                prefix + "keys");
+            if (layout_.scaleBytesPerLayerPage()) {
+                storage.keyScales = allocate(
+                    checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
+                    prefix + "key-scales");
+            }
+            storage.valueData = allocate(
+                checkedMultiply(pageCount, layout_.dataBytesPerLayerPage()),
+                prefix + "values");
+            if (layout_.scaleBytesPerLayerPage()) {
+                storage.valueScales = allocate(
+                    checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
+                    prefix + "value-scales");
+            }
         }
-        storage.valueData = backend_.allocatePlacementSparseBuffer(
-            checkedMultiply(pageCount, layout_.dataBytesPerLayerPage()),
-            kSparseMappingAlignmentBytes, prefix + "values");
-        if (layout_.scaleBytesPerLayerPage()) {
-            storage.valueScales = backend_.allocatePlacementSparseBuffer(
-                checkedMultiply(pageCount, layout_.scaleBytesPerLayerPage()),
-                kSparseMappingAlignmentBytes, prefix + "value-scales");
+    };
+    if (sparse_) {
+        allocateLayers([&](uint64_t size, std::string_view label) {
+            return backend_.allocatePlacementSparseBuffer(
+                size, kSparseMappingAlignmentBytes, label);
+        });
+    } else {
+        // No placement sparse (macOS < 26.4 or unsupported GPU family): the
+        // whole pool is ordinary, private Metal buffers, admitted once as a
+        // single physical commitment instead of growing extent by extent.
+        auto admitted = admitAllocation_(bytes.total, [&] {
+            allocateLayers([&](uint64_t size, std::string_view label) {
+                return backend_.allocateBuffer(size, metal::BufferStorage::Private,
+                                               label);
+            });
+        });
+        if (!admitted) {
+            throw metal::MetalAllocationError(
+                std::string("unable to allocate non-sparse KV pool: ") +
+                    metal::allocationFailureName(admitted.failure),
+                admitted.failure);
         }
+        residentBackingBytes_ = bytes.total;
+        residentPages_ = pageCount_;
     }
     if (declaredBytes() != bytes.total) {
         throw std::logic_error("KV storage accounting mismatch");
@@ -99,7 +131,7 @@ PageStorage::~PageStorage() {
         }
         extent.heap.reset();
     }
-    if (!backend_.healthy()) return;
+    if (!sparse_ || !backend_.healthy()) return;
     try {
         backend_.drainSparseUnmaps();
     } catch (...) {
@@ -132,7 +164,8 @@ uint32_t PageStorage::extentPageCount(uint32_t page) const {
 }
 
 bool PageStorage::isResident(uint32_t page) const {
-    return extents_.at(extentIndex(page)).heap.has_value();
+    const size_t extent = extentIndex(page);
+    return sparse_ ? extents_.at(extent).heap.has_value() : true;
 }
 
 std::vector<metal::SparseMapping> PageStorage::mappingsFor(
@@ -164,6 +197,10 @@ std::vector<metal::SparseMapping> PageStorage::mappingsFor(
 }
 
 metal::AllocationResult PageStorage::ensureResident(uint32_t page) {
+    if (!sparse_) {
+        static_cast<void>(extentIndex(page)); // validates page range; already resident
+        return true;
+    }
     Extent &extent = extents_.at(extentIndex(page));
     if (extent.heap) return true;
     uint64_t bytes = checkedMultiply(extent.pageCount,
@@ -207,11 +244,11 @@ bool PageStorage::releaseBackingForPage(uint32_t page) {
 }
 
 bool PageStorage::releaseReady() const noexcept {
-    return !backend_.sparseUnmapPending();
+    return !sparse_ || !backend_.sparseUnmapPending();
 }
 
 void PageStorage::awaitRelease() {
-    backend_.drainSparseUnmaps();
+    if (sparse_) backend_.drainSparseUnmaps();
 }
 
 const LayerStorage &PageStorage::layer(uint32_t index) const {

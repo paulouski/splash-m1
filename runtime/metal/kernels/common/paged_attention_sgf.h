@@ -72,7 +72,7 @@ __attribute__((always_inline)) inline void tile(
     device const float *value_scales, device const uint *page_table,
     uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    uint sg, uint lane) {
+    uint sg, uint lane, threadgroup uint *query_words) {
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
@@ -97,8 +97,10 @@ __attribute__((always_inline)) inline void tile(
       min(visible, committed_tokens + min(row / G, active_rows - 1) + 1),
       min(visible, committed_tokens + min((row + 1) / G, active_rows - 1) + 1));
 
-  // Q^T fragments for all 32 QK steps, bfloat pairs (row, row + 1).
-  uint queries[4][8];
+  // Q^T fragments for all 32 QK steps, bfloat pairs (row, row + 1). Each lane
+  // reads back only its own words, so they live in threadgroup memory (word i
+  // of lane l at i * 32 + l, conflict-free) with no barrier, not in registers.
+  threadgroup uint *queries = query_words + sg * 1024 + lane;
   {
     device const ushort *q0 =
         reinterpret_cast<device const ushort *>(tile_queries) + row * D;
@@ -108,7 +110,7 @@ __attribute__((always_inline)) inline void tile(
 #pragma unroll
       for (uint t = 0; t < 8; ++t) {
         const uint d = 64 * b + block_dimension(fm, t);
-        queries[b][t] = uint(q0[d]) | (uint(q1[d]) << 16);
+        queries[(b * 8 + t) * 32] = uint(q0[d]) | (uint(q1[d]) << 16);
       }
   }
   // O^T tiles: dimension 8 d + fm of rows (row, row + 1).
@@ -149,7 +151,7 @@ __attribute__((always_inline)) inline void tile(
 #pragma unroll
         for (uint t = 0; t < 8; ++t)
           mma(scores[s], int8_pair(words[t >> 1] >> (8 * (t & 1))),
-              bfloat_pair(queries[b][t]));
+              bfloat_pair(queries[(b * 8 + t) * 32]));
       }
 
     // Online softmax, as splash_attention_page_softmax: key scale, then

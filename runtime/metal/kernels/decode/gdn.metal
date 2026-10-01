@@ -45,12 +45,87 @@ template <uint HeadDim> struct GdnDecodeShared {
   bfloat beta[SPLASH_TARGET_VERIFY_ROWS];
 };
 
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim>
+inline void gdn_decode_prepare_qk_once(
+    device const bfloat *packed, device const bfloat *conv_weights,
+    device const bfloat *conv_state_in, device bfloat *conv_state_out,
+    device bfloat *mixed_qkv, uint packed_width, uint key_head, uint token,
+    uint lane) {
+  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint KeyWidth = KeyHeads * HeadDim;
+  constexpr uint Groups = HeadDim / 32;
+  static_assert(Tokens == 8 && KeyHeads == 16 && ValueHeads == 48 &&
+                    HeadDim == 128 && ConvDim == 10240,
+                "Q/K-once preparation is specialized for the 8 x 16 x 48 layout");
+
+  const uint q_channel = key_head * HeadDim + lane;
+  const uint k_channel = KeyWidth + q_channel;
+  float q[Groups], k[Groups];
+  for (uint g = 0; g < Groups; ++g) {
+    q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+                               packed_width, ConvDim, token,
+                               q_channel + 32 * g));
+    k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+                               packed_width, ConvDim, token,
+                               k_channel + 32 * g));
+  }
+
+  float q_sum = 0.0f, k_sum = 0.0f;
+  for (uint g = 0; g < Groups; ++g) {
+    q_sum += simd_sum(q[g] * q[g]);
+    k_sum += simd_sum(k[g] * k[g]);
+  }
+  const float q_scale = rsqrt(q_sum / HeadDim + 1e-6f);
+  const float k_scale = rsqrt(k_sum / HeadDim + 1e-6f);
+  for (uint g = 0; g < Groups; ++g) {
+    const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
+    const bfloat key = bfloat(float(bfloat(k[g] * k_scale)) * 0.08838834765f);
+    mixed_qkv[token * ConvDim + q_channel + 32 * g] = query;
+    mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
+  }
+
+  if (token < 3) {
+    for (uint g = 0; g < Groups; ++g) {
+      conv_state_out[token * ConvDim + q_channel + 32 * g] =
+          gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim, Tokens,
+                         token, q_channel + 32 * g);
+      conv_state_out[token * ConvDim + k_channel + 32 * g] =
+          gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim, Tokens,
+                         token, k_channel + 32 * g);
+    }
+  }
+}
+
+kernel void verify_gdn_qk_prepare_once(
+    device const bfloat *packed [[buffer(0)]],
+    device const bfloat *conv_weights [[buffer(1)]],
+    device const uchar *current [[buffer(2)]],
+    device uchar *next [[buffer(3)]], device bfloat *mixed [[buffer(4)]],
+    constant GDNDecodeBatchParams &params [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint KeyHeads = 16, ValueHeads = 48, HeadDim = 128,
+                 ConvDim = 10240;
+  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+  if (group.x >= KeyHeads || group.y >= Tokens)
+    return;
+
+  device const bfloat *conv_state_in = reinterpret_cast<device const bfloat *>(
+      current + ulong(params.layer) * params.conv_layer_bytes);
+  device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(
+      next + ulong(params.layer) * params.conv_layer_bytes);
+  gdn_decode_prepare_qk_once<KeyHeads, ValueHeads, HeadDim, ConvDim>(
+      packed, conv_weights, conv_state_in, conv_state_out, mixed,
+      params.packed_width, group.x, group.y, lane);
+}
+
 // Eight verify rows' conv+SiLU, q/k RMS norms and gates for one value head.
 // One simdgroup per row holds channels 32g + lane (g = 0..3). RMS reduction
 // sums each 32-channel group, then adds the four partials in channel order.
 // q/k/v and the gates go to threadgroup memory for the scan, and to device
 // memory for the commit.
-template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim>
+template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
+          bool QkPrepared = false>
 inline void gdn_decode_prologue(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const bfloat *conv_state_in, device bfloat *conv_state_out,
@@ -80,48 +155,63 @@ inline void gdn_decode_prologue(
   float q[Groups], k[Groups];
   bfloat v[Groups], carry_v[Groups], carry_q[Groups], carry_k[Groups];
   for (uint g = 0; g < Groups; ++g) {
-    q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                               packed_width, ConvDim, token,
-                               q_channel + 32 * g));
-    k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
-                               packed_width, ConvDim, token,
-                               k_channel + 32 * g));
+    if constexpr (!QkPrepared) {
+      q[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+                                 packed_width, ConvDim, token,
+                                 q_channel + 32 * g));
+      k[g] = float(gdn_conv_silu(packed, conv_state_in, conv_weights,
+                                 packed_width, ConvDim, token,
+                                 k_channel + 32 * g));
+    }
     v[g] = gdn_conv_silu(packed, conv_state_in, conv_weights, packed_width,
                          ConvDim, token, v_channel + 32 * g);
     if (carrier) {
       carry_v[g] = gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim,
                                   Tokens, simd_group, v_channel + 32 * g);
-      carry_q[g] = shared_writer
-          ? gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim, Tokens,
-                           simd_group, q_channel + 32 * g)
-          : bfloat(0.0f);
-      carry_k[g] = shared_writer
-          ? gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim, Tokens,
-                           simd_group, k_channel + 32 * g)
-          : bfloat(0.0f);
+      if constexpr (!QkPrepared) {
+        carry_q[g] = shared_writer
+            ? gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim,
+                             Tokens, simd_group, q_channel + 32 * g)
+            : bfloat(0.0f);
+        carry_k[g] = shared_writer
+            ? gdn_conv_carry(packed, conv_state_in, packed_width, ConvDim,
+                             Tokens, simd_group, k_channel + 32 * g)
+            : bfloat(0.0f);
+      }
     }
   }
   GdnGates gates{};
   if (lane == 0)
     gates = gdn_gates(packed + token * packed_width, dt_bias, a_scale, BOffset,
                       AOffset, value_head);
-  float q_sum = 0.0f, k_sum = 0.0f;
-  for (uint g = 0; g < Groups; ++g) {
-    q_sum += simd_sum(q[g] * q[g]);
-    k_sum += simd_sum(k[g] * k[g]);
+  float q_scale = 0.0f, k_scale = 0.0f;
+  if constexpr (!QkPrepared) {
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint g = 0; g < Groups; ++g) {
+      q_sum += simd_sum(q[g] * q[g]);
+      k_sum += simd_sum(k[g] * k[g]);
+    }
+    q_scale = rsqrt(q_sum / HeadDim + 1e-6f);
+    k_scale = rsqrt(k_sum / HeadDim + 1e-6f);
   }
-  const float q_scale = rsqrt(q_sum / HeadDim + 1e-6f);
-  const float k_scale = rsqrt(k_sum / HeadDim + 1e-6f);
   for (uint g = 0; g < Groups; ++g) {
     const uint dim = 32 * g + lane;
-    const bfloat query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
-    const bfloat key = bfloat(float(bfloat(k[g] * k_scale)) * 0.08838834765f);
+    bfloat query, key;
+    if constexpr (QkPrepared) {
+      query = mixed_qkv[token * ConvDim + q_channel + 32 * g];
+      key = mixed_qkv[token * ConvDim + k_channel + 32 * g];
+    } else {
+      query = bfloat(float(bfloat(q[g] * q_scale)) * 0.0078125f);
+      key = bfloat(float(bfloat(k[g] * k_scale)) * 0.08838834765f);
+    }
     shared.queries[token * HeadDim + dim] = query;
     shared.keys[token * HeadDim + dim] = key;
     shared.values[token * HeadDim + dim] = v[g];
-    if (shared_writer) {
-      mixed_qkv[token * ConvDim + q_channel + 32 * g] = query;
-      mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
+    if constexpr (!QkPrepared) {
+      if (shared_writer) {
+        mixed_qkv[token * ConvDim + q_channel + 32 * g] = query;
+        mixed_qkv[token * ConvDim + k_channel + 32 * g] = key;
+      }
     }
     mixed_qkv[token * ConvDim + v_channel + 32 * g] = v[g];
   }
@@ -136,9 +226,11 @@ inline void gdn_decode_prologue(
     const uint row = simd_group;
     for (uint g = 0; g < Groups; ++g) {
       conv_state_out[row * ConvDim + v_channel + 32 * g] = carry_v[g];
-      if (shared_writer) {
-        conv_state_out[row * ConvDim + q_channel + 32 * g] = carry_q[g];
-        conv_state_out[row * ConvDim + k_channel + 32 * g] = carry_k[g];
+      if constexpr (!QkPrepared) {
+        if (shared_writer) {
+          conv_state_out[row * ConvDim + q_channel + 32 * g] = carry_q[g];
+          conv_state_out[row * ConvDim + k_channel + 32 * g] = carry_k[g];
+        }
       }
     }
   }
@@ -397,7 +489,7 @@ GDN_COMMIT_ENTRY(verify_gdn_commit_vh32, 16, 32, 128, 8192)
 #undef GDN_COMMIT_ENTRY
 
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint RowsInFlight, class Table, class W>
+          uint RowsInFlight, class Table, class W, bool QkPrepared = false>
 inline void gdn_decode_batch_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const uchar *current0, device const uchar *current1,
@@ -441,7 +533,7 @@ inline void gdn_decode_batch_phase(
   device bfloat *lane_recurrent =
       recurrent + ulong(batch) * Rows * ValueWidth;
   device bfloat *lane_hidden = gdn_hidden + ulong(batch) * Rows * ValueWidth;
-  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim>(
+  gdn_decode_prologue<KeyHeads, ValueHeads, HeadDim, ConvDim, QkPrepared>(
       packed, conv_weights, conv_state_in, conv_state_out, mixed, a_scale,
       dt_bias, decay, beta, params.packed_width, shared, group.x, lane,
       simd_group);
@@ -494,6 +586,13 @@ inline void gdn_decode_batch_phase(
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
         gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
         thread_index, lane, simd_group, shared, table, sums);
+#define GDN_DECODE_QK_ONCE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
+    threadgroup GdnDecodeShared<HeadDim> shared; \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, 2, Layout, bfloat, true>( \
+        packed, conv_weights, current0, current1, current2, current3, next0, \
+        next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, recurrent, \
+        gdn_norm_weight, gdn_hidden, arrived, generation, params, group, \
+        thread_index, lane, simd_group, shared, table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
 #define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, W) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
@@ -507,19 +606,28 @@ inline void gdn_decode_batch_phase(
       constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
     GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
   }
+#define GDN_DECODE_QK_ONCE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, Layout, W) \
+  kernel void Name(GDN_DECODE_BUFFERS(W), \
+      device bfloat *table [[buffer(20)]], device float *sums [[buffer(21)]], \
+      constant GDNDecodeBatchParams &params [[buffer(22)]], GDN_DECODE_THREADS) { \
+    GDN_DECODE_QK_ONCE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, table, sums, Layout) \
+  }
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
 GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192, bfloat)
 // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64, 16, 48, 128, 10240, q4sg::Table64, bfloat)
+GDN_DECODE_QK_ONCE_TABLE_ENTRY(verify_gdn_fused_table64_qk_once, 16, 48, 128, 10240, q4sg::Table64, bfloat)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64_vh32, 16, 32, 128, 8192, q4sg::Table64, bfloat)
 GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, float)
 GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, gguf_sg::Table16, float)
 GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, gguf_sg::Table16, float)
 #undef GDN_DECODE_ENTRY
+#undef GDN_DECODE_QK_ONCE_TABLE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY
+#undef GDN_DECODE_QK_ONCE_BODY
 #undef GDN_DECODE_BODY
 #undef GDN_DECODE_THREADS
 #undef GDN_DECODE_BUFFERS

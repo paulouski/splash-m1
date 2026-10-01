@@ -5,7 +5,7 @@ set -eu
 completion_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)
 root=$(CDPATH= cd -P "$completion_dir/../.." && pwd -P)
 if [ -f "$root/release.json" ]; then
-    data_dir="$HOME/Library/Application Support/Splash"
+    data_dir="$HOME/Library/Application Support/Splash M1"
     models_dir="$data_dir/models"
 else
     data_dir="$root/build/runtime"

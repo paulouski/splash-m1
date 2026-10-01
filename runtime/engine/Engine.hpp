@@ -148,6 +148,7 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    uint32_t lastDecodeStatePublished = 0;
     // The scheduler owns the terminal phase; this flag records that the
     // corresponding event was emitted and model/resource ownership ended.
     bool finalized = false;
@@ -203,6 +204,7 @@ private:
   void armNextStateBoundary(Request &request);
   void discardPendingStateBoundaries(Request &request) noexcept;
   [[nodiscard]] bool retireCheckpoint(Request &request);
+  void publishDecodeCheckpoint(Request &request, uint32_t tokens);
   void publishReachedStateBoundaries(Request &request,
                                      uint32_t promptProcessed);
   [[nodiscard]] Prepared prepare(BatchPlan &plan,

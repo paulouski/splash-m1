@@ -23,7 +23,7 @@ from transformers import AutoTokenizer
 
 if __package__:
     from . import images as image_input
-    from . import json_codec, judgments
+    from . import json_codec, judgments, web_tools
     from . import runtime as engine_runtime
     from .api_shapes import (
         anthropic_response,
@@ -33,6 +33,7 @@ if __package__:
         anthropic_usage,
         completion_response,
         finish_reason,
+        logprobs_content,
         responses_item,
         responses_output,
         responses_response,
@@ -62,10 +63,19 @@ if __package__:
         validate_tool_calls,
     )
     from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
+    from .user_settings import (
+        DEFAULT_PATH as DEFAULT_SETTINGS_PATH,
+    )
+    from .user_settings import (
+        load_idle_unload,
+        save_idle_unload,
+        validate_idle_unload,
+    )
 else:
     import images as image_input
     import json_codec
     import judgments
+    import web_tools
     from api_shapes import (
         anthropic_response,
         anthropic_stop,
@@ -74,6 +84,7 @@ else:
         anthropic_usage,
         completion_response,
         finish_reason,
+        logprobs_content,
         responses_item,
         responses_output,
         responses_response,
@@ -103,6 +114,14 @@ else:
         validate_tool_calls,
     )
     from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
+    from user_settings import (
+        DEFAULT_PATH as DEFAULT_SETTINGS_PATH,
+    )
+    from user_settings import (
+        load_idle_unload,
+        save_idle_unload,
+        validate_idle_unload,
+    )
 
     import runtime as engine_runtime
 
@@ -122,7 +141,15 @@ CLIENT_DISCONNECT_POLL = 0.1
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
-CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+CHAT_HTML_PATH = Path(__file__).with_name("chat.html")
+STATIC_DIR = Path(__file__).with_name("static").resolve()
+STATIC_TYPES = {
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+}
 
 
 def _normalize_path(raw_path):
@@ -219,7 +246,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and path in ("/", "/index.html", "/health", "/ready")
+                and (
+                    path in ("/", "/index.html", "/health", "/ready")
+                    or path.startswith("/static/")
+                )
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -380,13 +410,41 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def version_string(self):
         return "Splash"
 
+    def _send_static(self, name):
+        try:
+            target = (STATIC_DIR / unquote(name)).resolve()
+        except ValueError:
+            target = STATIC_DIR
+        content_type = STATIC_TYPES.get(target.suffix)
+        if (
+            not self.server.webui
+            or content_type is None
+            or not target.is_relative_to(STATIC_DIR)
+            or not target.is_file()
+        ):
+            self._safe_error(APIError(404, "not found", "not_found"))
+            return
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.send_header("Connection", "close")
+        self._response_started = True
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     def do_GET(self):
         path = self.path.partition("?")[0]
         if path in ("/", "/index.html"):
             if self.server.webui:
-                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
+                self._send(200, CHAT_HTML_PATH.read_bytes(), "text/html; charset=utf-8")
             else:
                 self._safe_error(APIError(404, "not found", "not_found"))
+            return
+        if path.startswith("/static/"):
+            self._send_static(path[len("/static/") :])
             return
         if path == "/health":
             self._json(200, {"status": "ok"})
@@ -400,6 +458,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         if path == "/status":
             self._json(200, self.server.status())
+            return
+        if path == "/splash/settings":
+            self._json(200, self.server.settings())
             return
         if path == "/metrics":
             self._send(
@@ -470,6 +531,72 @@ class FrontendHandler(BaseHTTPRequestHandler):
             {"id": response_id, "object": "response", "deleted": True},
         )
 
+    def _post_settings(self, started_at):
+        # Small control body: one ingress slot, no engine involvement.
+        if not self.server.token_counts.acquire():
+            self._safe_error(
+                APIError(
+                    503, "frontend request capacity is exhausted", "frontend_overloaded"
+                )
+            )
+            return
+        try:
+            body = self._read_json_body(started_at + self.app.request_timeout)
+            if not isinstance(body, dict) or "idle_unload_seconds" not in body:
+                raise APIError(400, "expected an object with idle_unload_seconds")
+            self.server.set_idle_unload(body["idle_unload_seconds"])
+            self._json(200, self.server.settings())
+        except APIError as error:
+            self._safe_error(error)
+        except TimeoutError:
+            self._safe_error(APIError(408, "HTTP I/O timed out", "request_timeout"))
+        except (ValueError, RecursionError):
+            self._safe_error(APIError(400, "invalid JSON request body"))
+        except OSError as error:
+            log_unexpected(error)
+            self._safe_error(
+                APIError(500, "could not save settings", "internal_server_error"),
+                log=False,
+            )
+        finally:
+            if self._body_reservation is not None:
+                self._body_reservation.release()
+                self._body_reservation = None
+            self.server.token_counts.release()
+
+    def _post_web_tool(self, path, started_at):
+        # Blocking network call for the chat UI's tools; one ingress slot, no engine.
+        if not self.server.token_counts.acquire():
+            self._safe_error(
+                APIError(
+                    503, "frontend request capacity is exhausted", "frontend_overloaded"
+                )
+            )
+            return
+        try:
+            body = self._read_json_body(started_at + self.app.request_timeout)
+            if not isinstance(body, dict):
+                raise APIError(400, "expected a JSON object")
+            if path == "/splash/tools/search":
+                result = web_tools.search(body.get("query"))
+            else:
+                query = body.get("query")
+                if query is not None and not isinstance(query, str):
+                    raise APIError(400, "query must be a string")
+                result = web_tools.fetch(body.get("url"), query)
+            self._json(200, result)
+        except APIError as error:
+            self._safe_error(error, log=False)
+        except TimeoutError:
+            self._safe_error(APIError(408, "HTTP I/O timed out", "request_timeout"))
+        except (ValueError, RecursionError):
+            self._safe_error(APIError(400, "invalid JSON request body"))
+        finally:
+            if self._body_reservation is not None:
+                self._body_reservation.release()
+                self._body_reservation = None
+            self.server.token_counts.release()
+
     def do_POST(self):
         started_at = time.monotonic()
         job = None
@@ -479,6 +606,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # Route on the URL path so standard protocol query parameters do not
         # turn a supported endpoint into an unknown one.
         path = self.path.partition("?")[0]
+        if path == "/splash/settings":
+            self._post_settings(started_at)
+            return
+        if path in ("/splash/tools/search", "/splash/tools/fetch"):
+            self._post_web_tool(path, started_at)
+            return
         count_tokens = path == "/v1/messages/count_tokens"
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
@@ -904,7 +1037,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
             message["tool_calls"] = tool_calls
         self._json(
             200,
-            completion_response(self.app.model, job, result, message, bool(tool_calls)),
+            completion_response(
+                self.app.model,
+                job,
+                result,
+                message,
+                bool(tool_calls),
+                logprobs_content(self.app.tokenizer, job) if job.logprobs else None,
+            ),
         )
 
     def _anthropic_complete(self, job, thinking, has_tools):
@@ -1567,6 +1707,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._sse_keepalive,
                 put_progress,
             )
+            if job.logprobs:
+                # ponytail: token logprobs are not aligned with text deltas, so
+                # they arrive in one chunk before the finish chunk.
+                self._sse(
+                    stream_chunk(
+                        self.app.model,
+                        public_id,
+                        created,
+                        {},
+                        logprobs=logprobs_content(self.app.tokenizer, job),
+                    )
+                )
             self._sse(
                 stream_chunk(
                     self.app.model,
@@ -1706,6 +1858,7 @@ class FrontendServer(ThreadingHTTPServer):
         api_key=None,
         webui=True,
         max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        settings_path=None,
     ):
         if not is_finite_number(io_timeout) or io_timeout <= 0:
             raise ValueError("io_timeout must be positive and finite")
@@ -1722,6 +1875,7 @@ class FrontendServer(ThreadingHTTPServer):
         self.io_timeout = io_timeout
         self.api_key = validate_api_key(api_key) if api_key is not None else None
         self.webui = webui
+        self.settings_path = settings_path
         self.allowed_hosts = {
             host.lower().rstrip(".")
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
@@ -1736,6 +1890,20 @@ class FrontendServer(ThreadingHTTPServer):
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
+
+    def settings(self):
+        backend = self.app.backend
+        return {
+            "idle_unload_seconds": backend.idle_unload,
+            "unload_in_seconds": backend.idle_unload_remaining(),
+        }
+
+    def set_idle_unload(self, value):
+        seconds = validate_idle_unload(value)
+        # Persist first: a failed save leaves the running value unchanged.
+        if self.settings_path is not None:
+            save_idle_unload(self.settings_path, seconds)
+        self.app.backend.set_idle_unload(seconds)
 
     def status(self):
         status = self.app.status()
@@ -1937,6 +2105,7 @@ def parse_args(argv=None):
         type=_parse_max_cache_disk,
         default=0,
     )
+    parser.add_argument("--idle-unload", type=float, default=0, metavar="SECONDS")
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
     parser.add_argument("--max-new-tokens", type=int, default=65536)
     parser.add_argument("--request-timeout", type=float, default=10000)
@@ -2021,6 +2190,7 @@ def main():
             api_key=args.api_key,
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
+            settings_path=DEFAULT_SETTINGS_PATH,
         )
         server.server_bind()
         thinking_codec = ThinkingCodec(load_thinking_key())
@@ -2037,10 +2207,17 @@ def main():
             pending_limit=args.queue_size,
             eager_start=False,
         )
+        saved_idle = load_idle_unload(DEFAULT_SETTINGS_PATH)
+        idle_unload = args.idle_unload if saved_idle is None else saved_idle
+        print_status(
+            f"Idle unload · {idle_unload:g} s · "
+            + ("saved setting" if saved_idle is not None else "--idle-unload")
+        )
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
+            idle_unload=idle_unload,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")

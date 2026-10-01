@@ -133,11 +133,38 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
 
 uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                             const ops::ExecutionPlans &operators) {
-  uint64_t bytes = 0;
-  for (uint64_t value : prefillTensorBytes(geometry, operators)) {
-    bytes = checkedAdd(bytes, alignArena(value), "prefill arena");
+  return prefillArenaLayout(prefillTensorBytes(geometry, operators)).bytes;
+}
+
+PrefillArenaLayout prefillArenaLayout(
+    const std::array<uint64_t, prefillTensorCount> &sizes) {
+  PrefillArenaLayout result;
+  uint64_t cursor = 0;
+  for (uint32_t index = 0; index < sizes.size(); ++index) {
+    const PrefillTensor tensor = static_cast<PrefillTensor>(index);
+    if (tensor == PrefillTensor::GdnPacked ||
+        tensor == PrefillTensor::GdnOutput) {
+      const PrefillTensor other = tensor == PrefillTensor::GdnPacked
+                                      ? PrefillTensor::FullPacked
+                                      : PrefillTensor::AttentionOutput;
+      const uint32_t first = static_cast<uint32_t>(tensor);
+      const uint32_t second = static_cast<uint32_t>(other);
+      result.offsets[first] = cursor;
+      result.offsets[second] = cursor;
+      cursor = checkedAdd(cursor,
+                          alignArena(std::max(sizes[first], sizes[second])),
+                          "prefill arena");
+      continue;
+    }
+    if (tensor == PrefillTensor::FullPacked ||
+        tensor == PrefillTensor::AttentionOutput) {
+      continue;
+    }
+    result.offsets[index] = cursor;
+    cursor = checkedAdd(cursor, alignArena(sizes[index]), "prefill arena");
   }
-  return bytes;
+  result.bytes = cursor;
+  return result;
 }
 
 static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {

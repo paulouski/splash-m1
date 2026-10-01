@@ -18,6 +18,7 @@ REVIEWED = {
     "runtime/model/GgufFile.hpp": "keys record each tensor's bytes and type",
     "runtime/model/GgufImage.hpp": "the GGUF plan, which keys record whole",
     "runtime/model/AffinePreparation.hpp": "the affine plan, which keys record whole",
+    "runtime/model/SafetensorsCheckpoint.hpp": "the parser; preparation binds and identifies its tensors",
     "runtime/model/GgufPreparation.hpp": "the executor's declarations",
     "runtime/model/VisionPreparation.hpp": "the vision plan, which keys record whole",
     "runtime/model/WeightStore.hpp": "the reader; preparation uses its error type",

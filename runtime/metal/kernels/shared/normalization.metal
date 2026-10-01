@@ -21,22 +21,26 @@ constant constexpr uint kNormChunk = kNormThreads * kNormColumns;
 // 35B's MoE-input norms ~25% slower on a 40-core M3 Max. Both paths give the
 // same bits.
 constant constexpr uint kNormStreamingWidth = kNormThreads * 8;
+// The hidden size whose decode norm has its own exact-width chunk path.
+constant constexpr uint kNormWidth5120 = 5120;
 
 // Columns begin + tid + 256 i of a row, zero past its end.
-template <class T>
+template <class T, uint C>
 inline void load_norm_chunk(device const T *row, uint width, uint begin,
-                            uint tid, thread T (&x)[kNormColumns]) {
-  for (uint i = 0; i < kNormColumns; ++i) {
+                            uint tid, thread T (&x)[C]) {
+  for (uint i = 0; i < C; ++i) {
     const uint column = begin + tid + kNormThreads * i;
-    x[i] = column < width ? row[column] : T(0.0f);
+    const T v = row[min(column, width - 1)];
+    x[i] = column < width ? v : T(0.0f);
   }
 }
 
 // The thread's squares in column order, as rms_inverse adds them (zeros past
 // the row's end add nothing).
-inline float add_squares(thread const bfloat (&x)[kNormColumns], float sum) {
+template <uint C>
+inline float add_squares(thread const bfloat (&x)[C], float sum) {
 #pragma clang fp reassociate(off)
-  for (uint i = 0; i < kNormColumns; ++i) {
+  for (uint i = 0; i < C; ++i) {
     const float value = float(x[i]);
     sum += value * value;
   }
@@ -44,14 +48,15 @@ inline float add_squares(thread const bfloat (&x)[kNormColumns], float sum) {
 }
 
 // The row's inverse RMS from its first chunk (in registers) and the rest.
-inline float rms_inverse_of(thread const bfloat (&first)[kNormColumns],
+template <uint C>
+inline float rms_inverse_of(thread const bfloat (&first)[C],
                             device const bfloat *row, uint width,
                             threadgroup float *reductions, uint tid, uint lane,
                             uint sg) {
 #pragma clang fp reassociate(off)
   float sum = add_squares(first, 0.0f);
-  for (uint begin = kNormChunk; begin < width; begin += kNormChunk) {
-    bfloat x[kNormColumns];
+  for (uint begin = C * kNormThreads; begin < width; begin += C * kNormThreads) {
+    bfloat x[C];
     load_norm_chunk(row, width, begin, tid, x);
     sum = add_squares(x, sum);
   }
@@ -164,14 +169,59 @@ NORM_RMS_STAGED(norm_rms_staged, bfloat4)
 NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)
 #undef NORM_RMS_STAGED
 
+// The register-chunk path, C columns per thread: kNormColumns, or the exact
+// width / 256 for a row of one chunk that fills its 256 threads (5120: 20 columns
+// and 10 spans instead of 32 and 16, without the clamped loads for the rest).
+template <class Table, class W, class TableValue, uint C>
+inline void norm_rms_table_chunks(device const bfloat *input, device const W *weight,
+                                  device bfloat *output, device TableValue *table, device float *sums,
+                                  uint width, uint row, uint tid, uint lane, uint sg,
+                                  threadgroup float *reductions) {
+#pragma clang fp reassociate(off)
+  constexpr uint Spans = C * kNormThreads / 64 / 8;  // per simdgroup and chunk
+  device const bfloat *row_input = input + row * width;
+  bfloat x[C];
+  load_norm_chunk(row_input, width, 0, tid, x);
+  bfloat2 in[Spans];
+  vec<W, 2> w[Spans];
+  const auto load_spans = [&](uint begin) {
+    for (uint j = 0; j < Spans; ++j) {
+      const uint k = begin + (sg + 8 * j) * 64 + lane * 2;
+      const uint kc = min(k, width - 2);
+      const bfloat2 iv = bfloat2(row_input[kc], row_input[kc + 1]);
+      const vec<W, 2> wv = vec<W, 2>(weight[kc], weight[kc + 1]);
+      in[j] = k < width ? iv : bfloat2(bfloat(0.0f));
+      w[j] = k < width ? wv : vec<W, 2>(W(0.0f));
+    }
+  };
+  load_spans(0);
+  const float inverse = rms_inverse_of(x, row_input, width, reductions, tid, lane, sg);
+  for (uint begin = 0; begin < width; begin += C * kNormThreads) {
+    if (begin)
+      load_spans(begin);
+    for (uint j = 0; j < Spans; ++j) {
+      const uint k = begin + (sg + 8 * j) * 64 + lane * 2;
+      if (k >= width)
+        break;
+      const bfloat a = bfloat((float(in[j].x) * inverse) * float(w[j].x));
+      const bfloat b = bfloat((float(in[j].y) * inverse) * float(w[j].y));
+      output[row * width + k] = a;
+      output[row * width + k + 1] = b;
+      Table::write(table + ulong(row / 8) * width * 8,
+                   sums + ulong(row / 8) * Table::sums_per_tile(width), width, k / 64, row % 8, lane,
+                   a, b);
+    }
+  }
+}
+
 // Keep the ordinary output for non-matrix consumers, and emit the consumer's
 // matrix operand table (Table: q4sg::Table64 affine, gguf_sg::Table16 GGUF) from
 // the same rounded bfloat values. No additional dispatch is needed. The table
 // takes a simdgroup per 64-column span, so the first chunk's span pairs are
 // loaded (L2-hot input, weights) alongside the reduction's columns.
-template <class Table, class W>
+template <class Table, class W, class TableValue>
 inline void norm_rms_table(device const bfloat *input, device const W *weight,
-                           device bfloat *output, device bfloat *table, device float *sums,
+                           device bfloat *output, device TableValue *table, device float *sums,
                            uint width, uint row, uint tid, uint lane, uint sg,
                            threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
@@ -190,52 +240,31 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     }
     return;
   }
-  constexpr uint Spans = kNormChunk / 64 / 8;  // per simdgroup and chunk
-  device const bfloat *row_input = input + row * width;
-  bfloat x[kNormColumns];
-  load_norm_chunk(row_input, width, 0, tid, x);
-  bfloat2 in[Spans];
-  vec<W, 2> w[Spans];
-  const auto load_spans = [&](uint begin) {
-    for (uint j = 0; j < Spans; ++j) {
-      const uint k = begin + (sg + 8 * j) * 64 + lane * 2;
-      in[j] = k < width ? bfloat2(row_input[k], row_input[k + 1]) : bfloat2(bfloat(0.0f));
-      w[j] = k < width ? vec<W, 2>(weight[k], weight[k + 1]) : vec<W, 2>(W(0.0f));
-    }
-  };
-  load_spans(0);
-  const float inverse = rms_inverse_of(x, row_input, width, reductions, tid, lane, sg);
-  for (uint begin = 0; begin < width; begin += kNormChunk) {
-    if (begin)
-      load_spans(begin);
-    for (uint j = 0; j < Spans; ++j) {
-      const uint k = begin + (sg + 8 * j) * 64 + lane * 2;
-      if (k >= width)
-        break;
-      const bfloat a = bfloat((float(in[j].x) * inverse) * float(w[j].x));
-      const bfloat b = bfloat((float(in[j].y) * inverse) * float(w[j].y));
-      output[row * width + k] = a;
-      output[row * width + k + 1] = b;
-      Table::write(table + ulong(row / 8) * width * 8,
-                   sums + ulong(row / 8) * Table::sums_per_tile(width), width, k / 64, row % 8, lane,
-                   a, b);
-    }
-  }
+  if (width == kNormWidth5120)
+    norm_rms_table_chunks<Table, W, TableValue, kNormWidth5120 / kNormThreads>(
+        input, weight, output, table, sums, kNormWidth5120, row, tid, lane, sg, reductions);
+  else
+    norm_rms_table_chunks<Table, W, TableValue, kNormColumns>(
+        input, weight, output, table, sums, width, row, tid, lane, sg, reductions);
 }
-#define NORM_RMS_TABLE(Name, Table, W) \
+#define NORM_RMS_TABLE(Name, Table, W, TableValue) \
   kernel void Name(device const bfloat *input [[buffer(0)]], \
       device const W *weight [[buffer(1)]], device bfloat *output [[buffer(2)]], \
-      device bfloat *table [[buffer(3)]], device float *sums [[buffer(4)]], \
+      device TableValue *table [[buffer(3)]], device float *sums [[buffer(4)]], \
       constant uint &width [[buffer(5)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup float reductions[8]; \
-    norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
+    norm_rms_table<Table, W, TableValue>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
   }
-// The reachable pairs: Table64 feeds affine projections, from the affine targets' and the draft's bf16 norms.
-// Table16 feeds a GGUF target's register-tile projections, from its F32 norms, and also the target's vocabulary
-// head from the draft's bf16 final norm (DFlashDraft::addDecode). No F32 norm feeds an affine projection.
-NORM_RMS_TABLE(norm_rms_table64_decode, q4sg::Table64, bfloat)
-NORM_RMS_TABLE(norm_rms_table16_decode, gguf_sg::Table16, bfloat)
-NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float)
+// Table64 feeds affine projections from bf16 norms. Table64Half is limited to
+// selected Q4 GDN and dense gate/up decode shapes; its fp16 staging can
+// further round, overflow, or underflow BF16 values. Table16 feeds GGUF register-
+// tile projections from F32 norms and the target vocabulary head from the
+// draft's bf16 final norm (DFlashDraft::addDecode).
+NORM_RMS_TABLE(norm_rms_table64_decode, q4sg::Table64, bfloat, bfloat)
+NORM_RMS_TABLE(norm_rms_table16_decode, gguf_sg::Table16, bfloat, bfloat)
+NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float, bfloat)
+NORM_RMS_TABLE(norm_rms_table64_halftable_decode, q4sg::Table64Half, bfloat, half)
+NORM_RMS_TABLE(norm_rms_table64_halftable_decode_f32, q4sg::Table64Half, float, half)
 #undef NORM_RMS_TABLE

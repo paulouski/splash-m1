@@ -24,7 +24,9 @@ DOMAIN = b"splash-weight-preparation-identity-v1\0"
 INPUTS = {
     "AFFINE": (
         "runtime/model/AffinePreparation.cpp",
+        "runtime/model/AffinePlan.hpp",
         "runtime/model/WeightLayout.hpp",
+        "runtime/model/Q5Pack.hpp",
     ),
     "GGUF": (
         "runtime/model/GgufPreparation.cpp",

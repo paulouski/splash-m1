@@ -834,7 +834,7 @@ int main(int argc, char **argv) {
         executorPlan.pipelineReserveBytes,
         executorPlan.runtimeOverheadReserveBytes};
     ModelMemoryProfile profile{
-        model.name(), model.maximumContextTokens(),
+        model.name(), model.maximumContextTokens(), 0,
         model.targetKvLayout(format), footprint};
     EngineMemoryPlan memoryPlan =
         requireEngineMemoryPlan(backend.capabilities(), profile);

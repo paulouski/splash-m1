@@ -38,8 +38,8 @@ inline float moe_route_group_term(float dot, float scale, float sum,
 kernel void moe_route_scores_q8_m8(
     device bfloat *input [[buffer(0)]],
     device uint8_t *router_weights [[buffer(1)]],
-    device bfloat *router_scales [[buffer(2)]],
-    device bfloat *router_biases [[buffer(3)]],
+    device half *router_scales [[buffer(2)]],
+    device half *router_biases [[buffer(3)]],
     device float *scores [[buffer(4)]],
     constant MoeRouteParams &params [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -154,8 +154,8 @@ kernel void moe_route_scores_q8_m8(
 kernel void moe_route_scores_q8_m32(
     device bfloat *input [[buffer(0)]],
     device uint8_t *router_weights [[buffer(1)]],
-    device bfloat *router_scales [[buffer(2)]],
-    device bfloat *router_biases [[buffer(3)]],
+    device half *router_scales [[buffer(2)]],
+    device half *router_biases [[buffer(3)]],
     device float *scores [[buffer(4)]],
     constant MoeRouteParams &params [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]],
@@ -268,8 +268,8 @@ kernel void moe_route_scores_q8_m32(
 // which runs unrounded.
 struct MoeSharedGateQ8 {
   device uint8_t *weights;
-  device bfloat *scales;
-  device bfloat *biases;
+  device half *scales;
+  device half *biases;
 };
 struct MoeSharedGateF32 {
   device const float *weights;
@@ -380,8 +380,8 @@ kernel void moe_route_select_q8(
     device const float *scores [[buffer(0)]],
     device bfloat *input [[buffer(1)]],
     device uint8_t *shared_weights [[buffer(2)]],
-    device bfloat *shared_scales [[buffer(3)]],
-    device bfloat *shared_biases [[buffer(4)]],
+    device half *shared_scales [[buffer(3)]],
+    device half *shared_biases [[buffer(4)]],
     device uint *selected [[buffer(5)]],
     device float *routing_weights [[buffer(6)]],
     constant MoeRouteParams &params [[buffer(7)]],

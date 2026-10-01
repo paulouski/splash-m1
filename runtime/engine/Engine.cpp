@@ -892,6 +892,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
           if (!state)
             continue;
         }
+        // An end-of-prompt state only serves a resend; the rolling checkpoint
+        // is what an edited tail resumes from, so it becomes an ordinary state.
+        if (!checkpoint && active.latestCheckpoint)
+          static_cast<void>(cache_.reuseCompositeState(
+              active.latestCheckpoint.kvBlock, false));
         // Recycle the previous recovery point before allocating its replacement.
         // A restore lease can delay this optional publication. A checkpoint
         // only on disk frees no cache slot for an ordinary state, so it stays
@@ -947,6 +952,34 @@ void Engine::publishReachedStateBoundaries(Request &active,
     active.stateBoundaryCursor = 0;
   }
   armNextStateBoundary(active);
+}
+
+void Engine::publishDecodeCheckpoint(Request &active, uint32_t tokens) {
+  // Opportunistic rolling checkpoint so the next turn resumes near the reply end.
+  try {
+    const uint64_t block = cache_.blockAt(active.request.id, tokens);
+    if (cache_.reuseCompositeState(block, true)) {
+      ++counters_.deduplicatedStatePublications;
+    } else {
+      if (!retireCheckpoint(active)) {
+        ++counters_.checkpointPublicationFailures;
+        return;
+      }
+      auto state = model_.snapshot(active.request.id);
+      if (!state) {
+        ++counters_.checkpointPublicationFailures;
+        return;
+      }
+      cache_.publishCompositeState(block, std::move(state), true);
+      ++counters_.checkpointPublications;
+    }
+    if (active.latestCheckpoint.kvBlock != block)
+      static_cast<void>(retireCheckpoint(active));
+    active.latestCheckpoint = cache_.checkpointState(block);
+    active.lastDecodeStatePublished = tokens;
+  } catch (const std::exception &) {
+    ++counters_.checkpointPublicationFailures;
+  }
 }
 
 Engine::Prepared Engine::prepare(BatchPlan &plan,
@@ -1306,6 +1339,9 @@ void Engine::apply(const BatchPlan &plan,
                                 result.outputTokens.begin(),
                                 result.outputTokens.end());
       outputTokens += static_cast<uint32_t>(result.outputTokens.size());
+      if (!result.outputLogprobs.empty()) {
+        events_.tokenLogprobs(active.request.id, result.outputLogprobs);
+      }
       events_.tokens(active.request.id, result.outputTokens);
     }
     if (plan.kind == WorkKind::Decode) {
@@ -1319,6 +1355,10 @@ void Engine::apply(const BatchPlan &plan,
       static_cast<void>(cache_.publishCommittedBlocks(
           active.request.id, active.exactTokens, storedTokens,
           active.request.images));
+      if (!result.outputTokensWithoutKv && storedTokens % KvCache::pageTokens == 0 &&
+          storedTokens > active.promptTokens &&
+          storedTokens >= active.lastDecodeStatePublished + 32)
+        publishDecodeCheckpoint(active, storedTokens);
     }
     const uint64_t completionTokens =
         active.exactTokens.size() - active.promptTokens;

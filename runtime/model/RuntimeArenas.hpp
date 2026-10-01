@@ -159,6 +159,12 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators);
+struct PrefillArenaLayout final {
+  std::array<uint64_t, prefillTensorCount> offsets{};
+  uint64_t bytes = 0;
+};
+[[nodiscard]] PrefillArenaLayout prefillArenaLayout(
+    const std::array<uint64_t, prefillTensorCount> &sizes);
 [[nodiscard]] uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                                            const ops::ExecutionPlans &operators);
 
@@ -168,16 +174,16 @@ public:
                 const ops::ExecutionPlans &operators)
       : bytes_(plannedPrefillBytes(geometry, operators)) {
     const auto sizes = prefillTensorBytes(geometry, operators);
+    const PrefillArenaLayout layout = prefillArenaLayout(sizes);
+    if (layout.bytes != bytes_)
+      throw std::logic_error("prefill arena mismatch");
     base_ = backend.allocateBuffer(bytes_, metal::BufferStorage::Shared,
                                    "qwen-shared-prefill");
-    uint64_t cursor = 0;
     for (uint32_t index = 0; index < sizes.size(); ++index) {
       if (sizes[index])
-        tensors_[index] = backend.view(base_, cursor, sizes[index]);
-      cursor += alignArena(sizes[index]);
+        tensors_[index] =
+            backend.view(base_, layout.offsets[index], sizes[index]);
     }
-    if (cursor != bytes_)
-      throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
     auto *draft = static_cast<float *>(

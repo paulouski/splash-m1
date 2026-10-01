@@ -99,9 +99,9 @@ inline void q4_store_input_sums(device const bfloat *input, uint input_size,
 template <ushort TileN, bool GateUp, bool AddResidual,
           ushort StorageN = TileN, bool Pipelined = false, ushort Simdgroups = 8, class Out>
 inline void q4_mpp_tile(device bfloat *input, device uchar *weights_0,
-                        device bfloat *scales_0, device bfloat *biases_0,
+                        device half *scales_0, device half *biases_0,
                         device Out *output_0, device uchar *weights_1,
-                        device bfloat *scales_1, device bfloat *biases_1,
+                        device half *scales_1, device half *biases_1,
                         device bfloat *residual, uint output_size,
                         uint input_size, threadgroup float *input_sums,
                         uint output_origin, uint simd_lane, uint simd_group) {
@@ -246,9 +246,9 @@ template <ushort Rows, ushort TileN, bool GateUp, bool AddResidual,
           ushort StorageN = TileN, bool MultiplySiluGate = false,
           ushort Simdgroups = 8, class Out>
 inline void q4_mpp_tile_batched(
-    device bfloat *input, device uchar *weights_0, device bfloat *scales_0,
-    device bfloat *biases_0, device Out *output_0, device uchar *weights_1,
-    device bfloat *scales_1, device bfloat *biases_1, device bfloat *residual,
+    device bfloat *input, device uchar *weights_0, device half *scales_0,
+    device half *biases_0, device Out *output_0, device uchar *weights_1,
+    device half *scales_1, device half *biases_1, device bfloat *residual,
     uint output_size, uint input_size, threadgroup float *input_sums,
     uint output_origin, uint simd_lane, uint simd_group) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows},
@@ -381,10 +381,10 @@ inline void q4_mpp_tile_batched(
 template <ushort TileN, bool GateUp, ushort StorageN = TileN,
           bool Pipelined = true, ushort Simdgroups = 8, ushort SplitK = 4>
 inline void q4_mpp_tile_split(device bfloat *input, device uchar *weights_0,
-                              device bfloat *scales_0, device bfloat *biases_0,
+                              device half *scales_0, device half *biases_0,
                               threadgroup float *partials,
-                              device uchar *weights_1, device bfloat *scales_1,
-                              device bfloat *biases_1, uint input_size,
+                              device uchar *weights_1, device half *scales_1,
+                              device half *biases_1, uint input_size,
                               threadgroup float *input_sums,
                               uint output_origin, uint simd_lane,
                               uint simd_group, uint partition) {

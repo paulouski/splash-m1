@@ -43,6 +43,35 @@ PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
 	runtime/metal/kernels/shared/*.metal))
+# MACOS15=1 selects a macOS-15 (Apple7/8-only) build variant, compiled at
+# -std=metal3.2 into its own metallib: MetalPerformancePrimitives
+# (mpp::tensor_ops) is empty below Metal 4.0, so every kernel whose baseline
+# dispatch is MPP-only (never chosen for appleGpuFamily < 9 by
+# ExecutionPlans.cpp/Linear.cpp/PagedAttention.cpp) is dropped here rather
+# than guarded. Confirmed by compiling every kernel at metal3.2 (see build
+# report): GGUF (Block32 weight layout), vision and BF16-KV attention are
+# unreached by the affine Qwen3.8 text serve path on Apple7/8. decode/draft.metal
+# (DFlash speculative decoding, --draft-model) keeps its non-MPP kernels
+# unguarded and guards its MPP-only draft_attention_bf16_split behind
+# __METAL_VERSION__ >= 400; DraftAttention.cpp dispatches the register
+# alternative draft_attention_bf16_split_sgf (decode/draft_sgf.metal) on
+# Apple7/8 instead.
+MACOS15 ?= 1
+MACOS15_EXCLUDED_KERNELS := \
+	runtime/metal/kernels/prefill/attention_q8.metal \
+	runtime/metal/kernels/prefill/linear_q4.metal \
+	runtime/metal/kernels/prefill/moe.metal \
+	runtime/metal/kernels/decode/attention_q8.metal \
+	runtime/metal/kernels/decode/linear_q4.metal \
+	runtime/metal/kernels/decode/linear_q4_split.metal \
+	runtime/metal/kernels/shared/gguf_float.metal \
+	runtime/metal/kernels/shared/gguf_linear.metal \
+	runtime/metal/kernels/shared/moe.metal \
+	runtime/metal/kernels/shared/moe_gguf.metal \
+	runtime/metal/kernels/shared/vision.metal
+ifeq ($(MACOS15),1)
+PRODUCTION_KERNEL_SOURCES := $(filter-out $(MACOS15_EXCLUDED_KERNELS),$(PRODUCTION_KERNEL_SOURCES))
+endif
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
@@ -51,13 +80,22 @@ KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h))
 # Placement-sparse support became queryable in macOS 26.4
 # (MTLDevice.supportsPlacementSparse). The engine refuses older systems at
-# startup; every binary and metallib records the same floor.
+# startup; every binary and metallib records the same floor. MACOS15=1 lowers
+# both floors together (see DeviceCapabilities.hpp kRequiresPlacementSparse).
+ifeq ($(MACOS15),1)
+MACOS_MIN_VERSION := 15.0
+PROD_METALFLAGS := -std=metal3.2 -O3 -Wall -Wextra -Werror -Wno-c++17-extensions \
+	-Iruntime -mmacosx-version-min=$(MACOS_MIN_VERSION)
+else
 MACOS_MIN_VERSION := 26.4
-MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	-mmacosx-version-min=$(MACOS_MIN_VERSION)
+endif
+MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+# Read by DeviceCapabilities.hpp to lower its macOS/placement-sparse gate.
+MACOS15_DEFINE := $(if $(filter 1,$(MACOS15)),-DSPLASH_MACOS15_BUILD)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I$(BUILD)/engine \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(MACOS15_DEFINE)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
 .PHONY: all clean force-build-identity install _install \

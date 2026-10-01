@@ -339,7 +339,7 @@ class ClientTests(unittest.TestCase):
                                 "thinkingLevelMap": {"off": "none"},
                                 "input": ["text", "image"],
                                 "contextWindow": 102400,
-                                "maxTokens": 25600,
+                                "maxTokens": 32768,
                             }
                         ],
                     }
@@ -398,7 +398,7 @@ class ClientTests(unittest.TestCase):
         for name in ("settings.json", "auth.json"):
             (agent / name).write_text('{"keep": true}')
         self.command("pi")
-        self.command("pi", context=262144, model="incoai/Qwen3.8-27B-Splash")
+        self.command("pi", context=32768, model="incoai/Qwen3.8-27B-Splash")
         config = json.loads(self.pi_models.read_text())
         self.assertEqual(config["providers"]["other"], other)
         self.assertEqual(config["future"], {"keep": True})
@@ -406,7 +406,7 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(splash["baseUrl"], "http://127.0.0.1:8000/v1")
         self.assertEqual(
             [(m["id"], m["contextWindow"], m["maxTokens"]) for m in splash["models"]],
-            [("incoai/Qwen3.8-27B-Splash", 262144, 32768)],
+            [("incoai/Qwen3.8-27B-Splash", 32768, 32768)],
         )
         for name in ("settings.json", "auth.json"):
             self.assertEqual((agent / name).read_text(), '{"keep": true}')

@@ -12,7 +12,11 @@ std::string DeviceCapabilities::macosVersion() const {
 std::optional<std::string> DeviceCapabilities::validationError() const {
     // The operating system explains a missing placement-sparse query, so it
     // is reported ahead of every device feature.
+#if defined(SPLASH_MACOS15_BUILD)
+    if (!meetsMinimumMacos()) return "macos_15_required";
+#else
     if (!meetsMinimumMacos()) return "macos_26_4_required";
+#endif
     if (!physicalMemoryBytes) return "physical_memory_unavailable";
     if (!recommendedMaxWorkingSetBytes) {
         return "recommended_working_set_unavailable";
@@ -29,7 +33,13 @@ std::optional<std::string> DeviceCapabilities::validationError() const {
         return "threadgroup_width_below_256";
     }
     if (!hasUnifiedMemory) return "unified_memory_required";
-    if (!supportsPlacementSparse) return "placement_sparse_required";
+    // kRequiresPlacementSparse is false only on the macOS-15 build target,
+    // where supportsPlacementSparse is always false (unqueryable below macOS
+    // 26.4): the memory-plan worker must fall back to dense KV instead of
+    // relying on this validation to reject the device.
+    if (kRequiresPlacementSparse && !supportsPlacementSparse) {
+        return "placement_sparse_required";
+    }
     return std::nullopt;
 }
 
@@ -46,12 +56,17 @@ std::optional<std::string> DeviceCapabilities::validationMessage() const {
                          : supportsPlacementSparse
                              ? "with placement-sparse buffers"
                              : "without placement-sparse buffers";
+#if defined(SPLASH_MACOS15_BUILD)
+    const char *sparseRequirement = "";
+#else
+    const char *sparseRequirement = ", with placement-sparse buffers";
+#endif
     return "Splash needs Apple GPU family " +
            std::to_string(kMinimumAppleGpuFamily) +
            " or newer (M1 or later) on macOS " +
            std::to_string(kMinimumMacosMajor) + '.' +
            std::to_string(kMinimumMacosMinor) +
-           " or newer, with placement-sparse buffers; this Mac has " +
+           " or newer" + sparseRequirement + "; this Mac has " +
            deviceName + " (" + family + ") on macOS " + macosVersion() + ", " +
            sparse + " (" + *error + ')';
 }

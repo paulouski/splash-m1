@@ -127,30 +127,37 @@ kernel void draft_context_kv_commit(
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
-  constexpr uint KVHeads = 8;
-  constexpr uint PackedWidth = 6144;
-  constexpr uint RopeLaneStride = Rows * 64;
-  uint batch = group / (Rows * KVHeads);
-  uint task = group % (Rows * KVHeads);
-  if (batch >= params.lanes)
-    return;
-  device bfloat *keys =
-      batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
-  device bfloat *values = batch == 0
-                              ? values0
-                              : (batch == 1 ? values1
-                                            : (batch == 2 ? values2 : values3));
-  DraftContextParams lane_params{Rows, params.cache_stride,
-                                  params.start_position[batch]};
   threadgroup float reductions[8];
   threadgroup bfloat normalized[128];
-  draft_context_kv_phase(
-      context_qkv + ulong(batch) * Rows * PackedWidth, k_norm,
-      rope_cos + ulong(batch) * RopeLaneStride,
-      rope_sin + ulong(batch) * RopeLaneStride, keys, values, lane_params,
-      min(retained[batch], Rows), task, thread_index, lane, simd_group,
-      reductions, normalized);
+  draft_context_kv_commit_phase<6144, 4096>(
+      context_qkv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,
+      values0, values1, values2, values3, retained, params, group,
+      thread_index, lane, simd_group, reductions, normalized);
+}
+
+kernel void draft_context_kv_commit_only(
+    device const bfloat *context_qkv [[buffer(0)]],
+    device const bfloat *k_norm [[buffer(1)]],
+    device const float *rope_cos [[buffer(2)]],
+    device const float *rope_sin [[buffer(3)]],
+    device bfloat *keys0 [[buffer(4)]], device bfloat *keys1 [[buffer(5)]],
+    device bfloat *keys2 [[buffer(6)]], device bfloat *keys3 [[buffer(7)]],
+    device bfloat *values0 [[buffer(8)]],
+    device bfloat *values1 [[buffer(9)]],
+    device bfloat *values2 [[buffer(10)]],
+    device bfloat *values3 [[buffer(11)]],
+    device const uint *retained [[buffer(12)]],
+    constant DraftContextBatchParams &params [[buffer(13)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat normalized[128];
+  draft_context_kv_commit_phase<2048, 0>(
+      context_qkv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3,
+      values0, values1, values2, values3, retained, params, group,
+      thread_index, lane, simd_group, reductions, normalized);
 }
 
 // One split of the attention of one KV head over the 32 query rows of one
@@ -161,6 +168,12 @@ kernel void draft_context_kv_commit(
 // over its tiles, the last split adds the eight current rows, and the
 // unnormalized fp32 accumulator with its row maxima and sums lands in
 // `partial` for the fixed-order reduce.
+// This function uses mpp::tensor_ops directly and is only ever selected on
+// Apple9+ (DraftAttention.cpp); guarded so the macOS 15 build (Makefile
+// MACOS15=1, Apple7/8-only metallib at -std=metal3.2) can still compile the
+// rest of this file, including draft_attention_bf16_split_sgf's reduce
+// consumer draft_attention_reduce_phase, without it.
+#if __METAL_VERSION__ >= 400
 inline void draft_attention_split_phase(
     device bfloat *queries, device bfloat *keys, device bfloat *values,
     device bfloat *query_keys, device bfloat *query_values,
@@ -406,6 +419,7 @@ inline void draft_attention_split_phase(
     partial[M * D + M + thread_index] = row_sum[thread_index];
   }
 }
+#endif // __METAL_VERSION__ >= 400
 
 // Fixed-order combine of one (lane, head) pair's split partials into the
 // normalized bf16 rows, so the result does not depend on which split
@@ -537,7 +551,10 @@ kernel void draft_attention_qkv(
 // Grid {kv heads, lanes, splits}: every split streams its share of the live
 // ring tiles of its head and the last one adds the eight current rows.
 // Partials follow the grouped queries in the same allocation, one 32 x 130
-// fp32 block per (lane, head, split).
+// fp32 block per (lane, head, split). Apple9+ only (draft_attention_split_phase
+// is MPP); Apple7/8 dispatch draft_attention_bf16_split_sgf (draft_sgf.metal)
+// instead, selected by DraftAttention.cpp.
+#if __METAL_VERSION__ >= 400
 kernel void draft_attention_bf16_split(
     device bfloat *queries [[buffer(0)]],
     device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
@@ -585,6 +602,7 @@ kernel void draft_attention_bf16_split(
       workspace + AttentionM * AttentionN + 2 * AttentionM, thread_index,
       lane, simd_group);
 }
+#endif // __METAL_VERSION__ >= 400
 
 kernel void draft_attention_bf16_reduce(
     device bfloat *queries [[buffer(0)]],

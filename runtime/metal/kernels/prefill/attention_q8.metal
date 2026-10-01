@@ -38,35 +38,6 @@ inline void splash_prefill_attention_split_phase(
       previous_scale, rescale, thread_index);
 }
 
-template <uint KVHeads, uint QueryHeadsPerKVHead>
-inline void splash_q8_prefill_attention_reduce_phase(
-    device const float *partials, device const float *statistics,
-    device bfloat *output,
-    constant SplashQ8PrefillAttentionParams &params, uint3 group,
-    uint thread_index) {
-  constexpr ushort M = SPLASH_PREFILL_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead;
-  constexpr ushort D = SplashQ8HeadDimension;
-  uint kv_head = group.x;
-  uint fused_row = group.y;
-  uint tile = group.z;
-  uint tile_start = tile * SplashPrefillTileRows;
-  if (!splash_q8_prefill_attention_contract_valid(params) ||
-      kv_head >= KVHeads || fused_row >= M || thread_index >= D ||
-      tile_start >= params.rows)
-    return;
-  uint active_rows = min(SplashPrefillTileRows, params.rows - tile_start);
-  if (fused_row / QueryHeadsPerKVHead >= active_rows)
-    return;
-  ulong tile_offset = (ulong(kv_head) * params.chunk_stride + tile_start) *
-                      QueryHeadsPerKVHead * D;
-  splash_q8_attention_reduce_row<QueryHeadsPerKVHead,
-                                   SPLASH_PREFILL_ATTENTION_TILE_ROWS>(
-      partials, statistics, output + tile_offset,
-      params.committed_tokens + tile_start, active_rows, params.split_count,
-      (ulong(tile) * KVHeads + kv_head) * params.split_count, fused_row,
-      thread_index);
-}
-
 #define Q8_PREFILL_SPLIT(Name, Heads, Group, ScaleInSoftmax)                   \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
@@ -102,29 +73,11 @@ Q8_PREFILL_SPLIT(prefill_attention_q8_split_cooperative_scale_kv2_g8,
                 2, 8, false)
 #undef Q8_PREFILL_SPLIT
 
-kernel void prefill_attention_q8_reduce(
-    device const float *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant SplashQ8PrefillAttentionParams &params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  splash_q8_prefill_attention_reduce_phase<4, 6>(partials, statistics,
-                                                   output, params, group,
-                                                   thread_index);
-}
-
-kernel void prefill_attention_q8_reduce_kv2_g8(
-    device const float *partials [[buffer(0)]],
-    device const float *statistics [[buffer(1)]],
-    device bfloat *output [[buffer(2)]],
-    constant SplashQ8PrefillAttentionParams &params [[buffer(3)]],
-    uint3 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  splash_q8_prefill_attention_reduce_phase<2, 8>(partials, statistics,
-                                                   output, params, group,
-                                                   thread_index);
-}
+// prefill_attention_q8_reduce/_kv2_g8 moved to attention_q8_reduce.metal:
+// they call no MPP function (unlike the split kernels above), and
+// PagedAttention::prefillPlan binds the reduce pipeline unconditionally for
+// any Q8-format prefill, register tile included -- so it must survive the
+// MACOS15_EXCLUDED_KERNELS drop of this file.
 
 // BF16 shares the page loop and reduction, without quantization scales.
 #define BF16_PREFILL_SPLIT(Name, Heads, Group)                                 \

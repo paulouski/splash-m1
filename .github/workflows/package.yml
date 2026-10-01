@@ -1,0 +1,48 @@
+name: Build macOS 15 package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example, 0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build runtime package
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      MACOS15: "1"
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Validate release version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", os.environ["RELEASE_VERSION"]):
+              sys.exit("invalid release version")
+          PY
+      - name: Prepare Metal toolchain
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun metal --version
+      - name: Build package
+        run: make BUILD=build/release/native package -j4 PYTHON_CANDIDATES=python3
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: splash-macos15-${{ inputs.version }}
+          path: dist/*
+          if-no-files-found: error

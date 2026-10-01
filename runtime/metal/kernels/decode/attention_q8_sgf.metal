@@ -20,6 +20,7 @@
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint sg [[simdgroup_index_in_threadgroup]],                              \
       uint lane [[thread_index_in_simdgroup]]) {                               \
+    threadgroup uint query_words[Group * 1024];                                \
     const SplashQ8VerifyTile tile =                                            \
         splash_q8_verify_attention_tile_at<Heads, Group>(                      \
             queries, page_table0, page_table1, page_table2, page_table3,       \
@@ -30,7 +31,7 @@
         tile.queries, cache_keys, key_scales_buffer, cache_values,             \
         value_scales_buffer, tile.page_table, tile.kv_head,                    \
         tile.committed_tokens, tile.active_rows, tile.splits, tile.split,      \
-        partials, statistics, tile.slot, sg, lane);                            \
+        partials, statistics, tile.slot, sg, lane, query_words);             \
   }
 
 Q8_SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf, 4, 6)

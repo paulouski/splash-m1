@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <system_error>
 #include <tuple>
@@ -161,6 +162,9 @@ struct WeightFile::Impl {
     WeightFileRecord record;
     uint64_t offset = kHeaderBytes;
     bool finished = false;
+    // Lazily parsed from the header block; affine images only.
+    std::optional<std::vector<uint32_t>> affineBits;
+    size_t affineBitsCursor = 0;
 };
 
 namespace {
@@ -240,6 +244,17 @@ std::vector<metal::MetalBuffer> WeightFile::split(std::initializer_list<uint64_t
     return views;
 }
 
+uint32_t WeightFile::nextAffineProjectionBits() {
+    if (!impl_->affineBits) {
+        const auto *base = static_cast<const uint8_t *>(impl_->mapping->address());
+        const uint64_t headerBytes = std::min(impl_->bytes, kWeightFileAlignment);
+        impl_->affineBits = parseAffineBitsTable({base, static_cast<size_t>(headerBytes)});
+    }
+    if (impl_->affineBitsCursor >= impl_->affineBits->size())
+        throw WeightStoreError("affine bits table is exhausted: " + impl_->record.relativePath);
+    return (*impl_->affineBits)[impl_->affineBitsCursor++];
+}
+
 void WeightFile::finish() {
     if (impl_->finished) return;
     uint64_t consumed = alignPacked(impl_->offset);
@@ -258,10 +273,26 @@ const WeightFileRecord &WeightFile::record() const noexcept {
 ops::Projection readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                      std::string_view label) {
     validateQ4Layout(outputSize, inputSize);
+    const uint32_t bits = file.nextAffineProjectionBits();
     const uint64_t elements = q4Elements(outputSize, inputSize);
+    // Q5Pack.hpp's split planes, in AffinePreparation.cpp's writeQ5Projection
+    // field order: lo4 (Q4-tile-identical), scales, biases, hi.
+    if (bits == 5) {
+        const std::vector<metal::MetalBuffer> planes =
+            file.split({elements / 2, elements / 32, elements / 32, elements / 8}, label);
+        ops::AffineWeights weights{planes[0], planes[1], planes[2]};
+        weights.hi = planes[3];
+        weights.scanHiTiles(outputSize, inputSize);
+        ops::Projection result{outputSize, inputSize, std::move(weights)};
+        result.bits = bits;
+        return result;
+    }
+    if (bits != 4) throw WeightStoreError("unsupported affine projection bits: " + std::string(label));
     const std::vector<metal::MetalBuffer> planes =
         file.split({elements / 2, elements / 32, elements / 32}, label);
-    return {outputSize, inputSize, ops::AffineWeights{planes[0], planes[1], planes[2]}};
+    ops::Projection result{outputSize, inputSize, ops::AffineWeights{planes[0], planes[1], planes[2]}};
+    result.bits = bits;
+    return result;
 }
 
 ops::EmbeddingWeights readAffineEmbedding(WeightFile &file,

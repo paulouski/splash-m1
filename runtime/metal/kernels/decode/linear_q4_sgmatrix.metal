@@ -17,11 +17,11 @@ enum class Epilogue { Affine, Residual, GateUp };
 // logits (ops::Projection::destination), which keeps the sum unrounded.
 template <Epilogue E, class Out>
 __attribute__((always_inline)) inline void decode(device const bfloat *table, device const uchar *w0,
-                   device const bfloat *sc0, device const bfloat *bi0,
+                   device const half *sc0, device const half *bi0,
                    device Out *out, device const float *sums,
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
-                   device const bfloat *sc1, device const bfloat *bi1,
+                   device const half *sc1, device const half *bi1,
                    constant Q4Params &p, uint3 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
@@ -142,9 +142,22 @@ kernel void decode_linear_q4_prepare(
   q4sg::write_input(table, sums, group, row, lane, input[offset], input[offset + 1]);
 }
 
+kernel void decode_linear_q4_prepare_halftable(
+    device const bfloat *input [[buffer(0)]], device half *table [[buffer(1)]],
+    device float *sums [[buffer(2)]], constant uint &width [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  const uint group = (tg.x * 4 + sg) / 8, row = (tg.x * 4 + sg) % 8;
+  input += ulong(tg.y) * width * 8;
+  table += ulong(tg.y) * width * 8;
+  sums += ulong(tg.y) * width / 8;
+  const uint offset = row * width + group * 64 + 2 * lane;
+  q4sg::write_input(table, sums, group, row, lane, input[offset], input[offset + 1]);
+}
+
 #define Q4_SG_INPUTS(Out) \
     device const bfloat *table [[buffer(0)]], device const uchar *weights [[buffer(1)]], \
-    device const bfloat *scales [[buffer(2)]], device const bfloat *biases [[buffer(3)]], \
+    device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]], \
     device Out *output [[buffer(4)]], device const float *sums [[buffer(5)]], \
     device coherent(device) float *partials [[buffer(6)]], device atomic_uint *counters [[buffer(7)]]
 #define Q4_SG_THREADS \
@@ -170,7 +183,7 @@ kernel void decode_linear_q4_sg_residual(Q4_SG_INPUTS(bfloat),
       partials, counters, residual, weights, scales, biases, p, tg, tid, sg, lane, &arrival);
 }
 kernel void decode_linear_q4_sg_gate_up(Q4_SG_INPUTS(bfloat), device const uchar *up [[buffer(8)]],
-    device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]],
+    device const half *upScales [[buffer(9)]], device const half *upBiases [[buffer(10)]],
     constant Q4Params &p [[buffer(11)]], Q4_SG_THREADS) {
   threadgroup uint arrival;
   q4sg::decode<q4sg::Epilogue::GateUp>(table, weights, scales, biases, output, sums,

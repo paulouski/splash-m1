@@ -41,10 +41,12 @@ struct EngineRequest final {
   // generated, and the raw final-position logits at these ids are returned in
   // the completion callback. maxNewTokens must be zero.
   std::vector<uint32_t> scoreTokens{};
+  // 0 disables logprobs; otherwise top_logprobs + 1.
+  uint32_t logprobs = 0;
 
   [[nodiscard]] ModelRequest modelView() const noexcept {
     return {id,        cohort,   prompt,     images, imagePixels,
-            maxNewTokens, sampling, constraint, scoreTokens};
+            maxNewTokens, sampling, constraint, scoreTokens, logprobs};
   }
 };
 
@@ -56,6 +58,8 @@ public:
   virtual void started(uint64_t requestId, EngineCacheStatus cacheStatus,
                        uint32_t matchedTokens, uint32_t stateSlot) = 0;
   virtual void promptProgress(uint64_t, uint32_t) {}
+  // Precedes the tokens() call that emits the same tokens, one entry each.
+  virtual void tokenLogprobs(uint64_t, std::span<const ops::TokenLogprobs>) {}
   virtual void tokens(uint64_t requestId, std::span<const uint32_t> tokens) = 0;
   virtual void maskRequested(uint64_t requestId,
                              std::span<const uint32_t> simulationTokens) = 0;

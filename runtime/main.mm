@@ -1,9 +1,11 @@
 #include "engine/MemoryPlan.hpp"
+#include "engine/DecodePolicy.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/Status.hpp"
 #include "model/Model.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "model/ModelFactory.hpp"
 
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
@@ -16,6 +18,7 @@
 #include <csignal>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <limits.h>
@@ -46,7 +49,7 @@ public:
 };
 
 struct NativeArguments final {
-  std::filesystem::path modelRoot;
+  model::ModelPaths modelPaths;
   model::ModelDescriptor model;
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
@@ -123,7 +126,8 @@ void printUsage(std::string_view executable) {
   std::cerr << "usage: " << executable
             << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
                " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-               " [--kv-format int8|bf16] [--prefill-mode bounded|full]\n";
+               " [--kv-format int8|bf16] [--prefill-mode bounded|full]"
+               " [--decode-ladder on|off]\n";
 }
 
 template <typename T>
@@ -166,19 +170,41 @@ std::filesystem::path canonicalDirectory(std::string_view argument,
   return path;
 }
 
-std::filesystem::path requireModelRoot(std::string_view targetArgument,
-                                       std::string_view draftArgument) {
+// TARGET_DIRECTORY and DRAFT_DIRECTORY are read directly: any two
+// directories, with no shared parent required. An installed package's
+// TARGET_DIRECTORY and DRAFT_DIRECTORY happen to be one root's target/ and
+// draft/ subdirectories (install/launcher.py); when they are, and that root
+// carries the package's identity (model.json or manifest.json), that
+// identity is used unchanged so installed packages keep serving exactly as
+// before. Anything else -- a local MLX export and DFlash2 draft directory,
+// pointed at directly -- is inspected from its own files (inspectLocalModel).
+model::ModelPaths resolveModelPaths(std::string_view targetArgument,
+                                    std::string_view draftArgument) {
   std::filesystem::path target =
       canonicalDirectory(targetArgument, "TARGET_DIRECTORY");
   std::filesystem::path draft =
       canonicalDirectory(draftArgument, "DRAFT_DIRECTORY");
-  if (target.filename() != "target" || draft.filename() != "draft" ||
-      target.parent_path() != draft.parent_path()) {
-    throw UsageError(
-        "TARGET_DIRECTORY and DRAFT_DIRECTORY must be the target/ and "
-        "draft/ subdirectories of one model root");
+  if (target.filename() == "target" && draft.filename() == "draft" &&
+      target.parent_path() == draft.parent_path()) {
+    return model::ModelPaths::ofRoot(target.parent_path());
   }
-  return target.parent_path();
+  return {target, draft, {}};
+}
+
+bool isLegacyPackageRoot(const model::ModelPaths &paths, std::filesystem::path &root) {
+  if (paths.target.filename() != "target" || paths.draft.filename() != "draft" ||
+      paths.target.parent_path() != paths.draft.parent_path()) {
+    return false;
+  }
+  root = paths.target.parent_path();
+  return std::filesystem::exists(root / "model.json") ||
+        std::filesystem::exists(root / "manifest.json");
+}
+
+model::ModelDescriptor inspectModel(const model::ModelPaths &paths) {
+  std::filesystem::path root;
+  if (isLegacyPackageRoot(paths, root)) return model::inspectModelPackage(root);
+  return model::inspectLocalModel(paths.target, paths.draft);
 }
 
 NativeArguments parseArguments(int argc, char **argv) {
@@ -194,6 +220,7 @@ NativeArguments parseArguments(int argc, char **argv) {
   }
   bool kvFormatSeen = false;
   bool prefillModeSeen = false;
+  bool decodeLadderSeen = false;
   for (; next < argc; next += 2) {
     const std::string_view option(argv[next]);
     if (next + 1 == argc)
@@ -202,6 +229,11 @@ NativeArguments parseArguments(int argc, char **argv) {
     if (option == "--kv-format" && !kvFormatSeen) {
       if (value != "int8" && value != "bf16")
         throw UsageError("--kv-format requires int8 or bf16");
+#if defined(SPLASH_MACOS15_BUILD)
+      // bf16 split attention kernels live in attention_q8.metal, excluded on this build.
+      if (value != "int8")
+        throw UsageError("--kv-format bf16 is unsupported on the macOS-15 build; use int8");
+#endif
       result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
       kvFormatSeen = true;
     } else if (option == "--prefill-mode" && !prefillModeSeen) {
@@ -209,12 +241,23 @@ NativeArguments parseArguments(int argc, char **argv) {
         throw UsageError("--prefill-mode requires bounded or full");
       result.boundPrefillCommands = value == "bounded";
       prefillModeSeen = true;
+    } else if (option == "--decode-ladder" && !decodeLadderSeen) {
+      if (value != "on" && value != "off")
+        throw UsageError("--decode-ladder requires on or off");
+      // The model runtime (model/Runtime.mm) reads this once at construction
+      // via engine::decodePolicyConfigFromEnvironment(); setting it here
+      // keeps that single environment-backed config path (SPLASH_DECODE_
+      // LADDER and its SPLASH_DECODE_LADDER_* tuning overrides) as the one
+      // source of truth instead of threading a new field through
+      // RuntimeContext/ModelFactory.
+      setenv("SPLASH_DECODE_LADDER", value == "on" ? "1" : "0", 1);
+      decodeLadderSeen = true;
     } else {
       throw UsageError("unexpected option " + std::string(option));
     }
   }
-  result.modelRoot = requireModelRoot(argv[2], argv[3]);
-  result.model = model::inspectModelPackage(result.modelRoot);
+  result.modelPaths = resolveModelPaths(argv[2], argv[3]);
+  result.model = inspectModel(result.modelPaths);
   result.maxContext = parseMaxContext(argv[4], result.model.capabilities);
   result.maxMemoryBytes = parseMaxMemory(argv[5]);
   return result;
@@ -254,10 +297,11 @@ bootstrapConfig(const NativeArguments &arguments) {
   engine::RuntimeBootstrapConfig config;
   config.resources.metallibPath =
       executablePath().parent_path() / "splash.metallib";
-  config.resources.modelRoot = arguments.modelRoot;
+  config.resources.modelPaths = arguments.modelPaths;
   config.resources.model = arguments.model;
   config.resources.buildId = SPLASH_BUILD_ID;
   config.resources.maximumMemoryBytes = arguments.maxMemoryBytes;
+  config.resources.requestedContextTokens = arguments.maxContext;
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
   config.nativeLoop.engine.maxContext = arguments.maxContext;

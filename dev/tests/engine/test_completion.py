@@ -81,7 +81,7 @@ class CompletionTests(unittest.TestCase):
         (directory / "suggested-models.txt").write_text("\n".join(SUGGESTED) + "\n")
         if release:
             (root / "release.json").write_text("{}")
-            models = self.home / "Library/Application Support/Splash/models"
+            models = self.home / "Library/Application Support/Splash M1/models"
         else:
             models = root / "install/models"
         for model in (*OFFICIAL, LOCAL[0]):
@@ -139,7 +139,9 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         return result.stdout.splitlines()
 
-    def bash_complete(self, shell, script, words, *, upgrade=None, unbroken=""):
+    def bash_complete(
+        self, shell, script, words, *, command="splash", upgrade=None, unbroken=""
+    ):
         setup = ""
         if upgrade:
             link, new, old = upgrade
@@ -151,13 +153,15 @@ class CompletionTests(unittest.TestCase):
         if unbroken:
             setup += f"COMP_WORDBREAKS=${{COMP_WORDBREAKS//[{unbroken}]/}}\n"
         program = (
-            'source "$1"\nshift\n' + setup + "registration=$(complete -p splash)\n"
-            "function=${registration##* -F }\nfunction=${function%% *}\n"
-            'COMP_WORDS=("$@")\nCOMP_CWORD=$((${#COMP_WORDS[@]} - 1))\n'
-            'COMP_LINE="${COMP_WORDS[*]}"\nCOMP_POINT=${#COMP_LINE}\n'
-            '"$function" splash "${COMP_WORDS[COMP_CWORD]}" '
-            '"${COMP_WORDS[COMP_CWORD-1]}"\n'
-            'if ((${#COMPREPLY[@]})); then printf "%s\\0" "${COMPREPLY[@]}"; fi\n'
+            'source "$1"\nshift\n'
+            + setup
+            + f"registration=$(complete -p {shlex.quote(command)})\n"
+            + "function=${registration##* -F }\nfunction=${function%% *}\n"
+            + 'COMP_WORDS=("$@")\nCOMP_CWORD=$((${#COMP_WORDS[@]} - 1))\n'
+            + 'COMP_LINE="${COMP_WORDS[*]}"\nCOMP_POINT=${#COMP_LINE}\n'
+            + f'"$function" {shlex.quote(command)} "${{COMP_WORDS[COMP_CWORD]}}" '
+            + '"${COMP_WORDS[COMP_CWORD-1]}"\n'
+            + 'if ((${#COMPREPLY[@]})); then printf "%s\\0" "${COMPREPLY[@]}"; fi\n'
         )
         result = subprocess.run(
             [
@@ -191,12 +195,27 @@ class CompletionTests(unittest.TestCase):
                 self.assertEqual(self.run_helper(directory, "community/*"), [])
                 self.assertEqual(self.run_helper(directory, "["), [])
 
+    def test_bash_completion_is_registered_for_both_command_names(self):
+        _, directory = self.layout("release", release=True)
+        for shell in bash_paths():
+            for command in ("splash", "splash-m1"):
+                with self.subTest(shell=shell, command=command):
+                    self.assertEqual(
+                        self.bash_complete(
+                            shell,
+                            directory / "splash.bash",
+                            [command, "co"],
+                            command=command,
+                        ),
+                        ["codex"],
+                    )
+
     def test_cached_catalog_adds_valid_entries_in_source_and_release(self):
         for release in (False, True):
             with self.subTest(release=release):
                 root, directory = self.layout(str(release), release=release)
                 data = (
-                    self.home / "Library/Application Support/Splash"
+                    self.home / "Library/Application Support/Splash M1"
                     if release
                     else root / "build/runtime"
                 )
@@ -432,6 +451,7 @@ class CompletionTests(unittest.TestCase):
         _, directory = self.layout()
         for line, expected in (
             ("splash se", "splash serve "),
+            ("splash-m1 se", "splash-m1 serve "),
             ("splash p", "splash pi "),
             ("splash serve --model community/l", f"splash serve --model {LOCAL[1]} "),
             ("splash serve --model=community/l", f"splash serve --model={LOCAL[1]} "),
@@ -502,17 +522,17 @@ class CompletionTests(unittest.TestCase):
         opt = self.root / "opt/splash"
         opt.parent.mkdir()
         opt.symlink_to(old, target_is_directory=True)
-        entry = self.root / "share/zsh/site-functions/_splash"
+        entry = self.root / "share/zsh/site-functions/_splash-m1"
         entry.parent.mkdir(parents=True)
         entry.symlink_to(opt / "install/completions/_splash")
         self.assertEqual(
             self.shell_tab(
                 entry,
-                "splash serve --model=community/l",
+                "splash-m1 serve --model=community/l",
                 upgrade=(opt, new, old),
                 autoload=True,
             ),
-            f"splash serve --model={LOCAL[1]} ",
+            f"splash-m1 serve --model={LOCAL[1]} ",
         )
 
 
