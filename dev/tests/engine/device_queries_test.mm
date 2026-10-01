@@ -71,14 +71,23 @@ int main() {
         require(!queryPlacementSparseSupport((id<MTLDevice>)device),
                 "a false capability must report unsupported");
         device.supportsPlacementSparse = YES;
-        require(queryPlacementSparseSupport((id<MTLDevice>)device),
-                "a supported capability must remain supported");
-        requireQueryError([ForwardingDevice new],
-                          NSInvalidArgumentException.UTF8String,
-                          "unrecognized selector");
-        requireQueryError([FailingDevice new],
-                          NSInternalInconsistencyException.UTF8String,
-                          "driver query failed");
+        if (@available(macOS 26.4, *)) {
+            require(queryPlacementSparseSupport((id<MTLDevice>)device),
+                    "a supported capability must remain supported");
+            requireQueryError([ForwardingDevice new],
+                              NSInvalidArgumentException.UTF8String,
+                              "unrecognized selector");
+            requireQueryError([FailingDevice new],
+                              NSInternalInconsistencyException.UTF8String,
+                              "driver query failed");
+        } else {
+            require(!queryPlacementSparseSupport((id<MTLDevice>)device),
+                    "macOS before 26.4 must report placement sparse unsupported");
+            require(!queryPlacementSparseSupport((id<MTLDevice>)[ForwardingDevice new]),
+                    "unavailable queries must not call the forwarding selector");
+            require(!queryPlacementSparseSupport((id<MTLDevice>)[FailingDevice new]),
+                    "unavailable queries must not call the failing selector");
+        }
     }
     std::cout << "device queries: PASS\n";
 }

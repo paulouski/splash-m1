@@ -222,8 +222,11 @@ class PassthroughStreamer:
         self.tokenizer = tokenizer
         self.callback = callback
         self.stop_sequence = None
+        self.token_ids = []
 
     def put_tokens(self, token_ids):
+        token_ids = [int(token_id) for token_id in token_ids]
+        self.token_ids.extend(token_ids)
         text = self.tokenizer.decode(token_ids)
         if text:
             self.callback(text)
@@ -1063,7 +1066,7 @@ class ServerTest(unittest.TestCase):
             b"Chat still works if browser storage is full or disabled", payload
         )
         self.assertIn(b"function cleanMessage", payload)
-        self.assertIn(b"if (input.value === '') input.value = text", payload)
+        self.assertIn(b"if (input.value === '') input.value = draft.text", payload)
         self.assertIn(b'id="image-input"', payload)
         self.assertIn(b'accept="image/*"', payload)
         self.assertIn(b"reader.readAsDataURL(file)", payload)
@@ -3585,6 +3588,7 @@ class ServerTest(unittest.TestCase):
         with (
             mock.patch.object(api, "parse_args", return_value=args),
             mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(api, "load_idle_unload", return_value=None),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
@@ -3626,7 +3630,10 @@ class ServerTest(unittest.TestCase):
             eager_start=False,
         )
         backend_type.assert_called_once_with(
-            runtime, tokenizer, request_logger=diagnostics.print_request
+            runtime,
+            tokenizer,
+            request_logger=diagnostics.print_request,
+            idle_unload=args.idle_unload,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         self.assertEqual(app_type.call_args.args[6], 4)
@@ -5045,7 +5052,10 @@ class ServerTest(unittest.TestCase):
             "required": ["pattern", "propertyNames", "nested", "constant", "choice"],
         }
         projected = _grammar_compatible_schema(schema)
-        self.assertEqual(projected.pop("x-guidance"), {"lenient": True})
+        self.assertEqual(
+            projected.pop("x-guidance"),
+            {"lenient": True, "whitespace_pattern": tool_schema.WHITESPACE},
+        )
         self.assertEqual(projected, schema)
         _, policy = tool_schema.normalize_tools(
             [{"type": "function", "function": {"name": "echo", "parameters": schema}}],
