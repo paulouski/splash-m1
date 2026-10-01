@@ -16,6 +16,27 @@ Python, Xcode, and Terminal are not required for the packaged app. The first set
 
 Local review builds are not Developer ID signed or notarized. A public desktop release still needs signing and a check of the complete first-run flow.
 
+## Measured performance
+
+On an M1 Max with a 24-core GPU and 32 GB running macOS 15.7, selected measurements showed:
+
+| Workload | Comparison | Result |
+| --- | --- | --- |
+| English Python source edits | Prompt lookup off vs on | 37–38 → ~61 tok/s (~59–66% higher) |
+| Synthetic 2,048-token prefill | Combined package vs previous build (4 matched ABBA samples) | 20.0 → 18.8 s (~5.9% less wall time) |
+
+The code-edit A/B on 2026-09-30 used `Swift-Qwen3.8-27B-Uncensored-oQ4e-fp16-mtp` with mixed Q4/Q5 group-64 weights, Swift DFlash 2, INT8 KV cache, and 32K context. This experimental checkpoint differs from the app's recommended download. Prompt lookup used a 16-token minimum source match. The two prompts had 2,179 and 2,230 input tokens; each prompt and setting ran once with fixed seeds, `temperature=1.0`, `top_p=0.95`, `top_k=20`, no thinking, and a cap of 800 generated tokens. Outputs reached the cap. Rates count generation after the first token. These prompts allowed substantial source reuse, a best-case workload; this pre-release A/B does not measure complete task time, answer quality, or current default generation speed. The separate prefill result measures synthetic prompt time, not decode.
+
+## What this fork changes
+
+The fork builds on Splash's APIs, DFlash, and tool integrations, with a focus on the Apple7/8 text path and a local Mac workflow.
+
+- Runs the Apple7/8 text path on Metal 3.2 and macOS 15 without requiring a Metal 4 runtime for this path.
+- Supports mixed Q4/Q5 group-64 weights. Apple7 kernels handle weight unpacking and addressing, plus GDN and prefill work tuned for that GPU generation.
+- Offers prompt lookup that reuses likely next source tokens and asks the target model to verify them; the benefit depends on the prompt.
+- Preserves exact generated tokens and model state across turns so follow-up requests can reuse earlier answer text.
+- Adds a packaged Mac app and CLI workflow, an English browser UI, and Pi client setup. The app and CLI packages are implemented but not yet published.
+
 ## Platform and model support
 
 The tested configuration is an M1 Max with a 24-core GPU and 32 GB unified memory on macOS 15.7. M2 support is intended but unverified. Apple9 and newer GPUs are not a supported guarantee for this build.
