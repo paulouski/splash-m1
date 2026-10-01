@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <locale>
 #include <limits>
 #include <algorithm>
 #include <optional>
@@ -64,9 +65,11 @@ struct Options final {
 
 double positiveNumber(std::string_view value, std::string_view option) {
   double result = 0;
-  const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
-  if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
-      !std::isfinite(result) || result <= 0)
+  std::istringstream input{std::string(value)};
+  input.imbue(std::locale::classic());
+  if (value.starts_with('+') || !(input >> std::noskipws >> result) ||
+      input.peek() != std::char_traits<char>::eof() || !std::isfinite(result) ||
+      result <= 0)
     throw std::invalid_argument(std::string(option) + " requires a positive number");
   return result;
 }

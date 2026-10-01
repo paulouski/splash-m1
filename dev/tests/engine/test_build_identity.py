@@ -337,7 +337,11 @@ class CompileConfigurationTests(unittest.TestCase):
             q8_sources = [
                 kernel_root / phase / name
                 for phase in ("prefill", "decode")
-                for name in ("attention_q8.metal", "attention_q8_store.metal")
+                for name in (
+                    "attention_q8.metal",
+                    "attention_q8_sgf.metal",
+                    "attention_q8_store.metal",
+                )
             ]
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
@@ -356,7 +360,7 @@ class CompileConfigurationTests(unittest.TestCase):
 
             build = root / "build"
             compiler, log = self.recording_compiler(root)
-            options = ["-C", str(root), f"BUILD={build}"] + [
+            options = ["-C", str(root), f"BUILD={build}", "MACOS15=1"] + [
                 f"{name}={sys.executable} {compiler}"
                 for name in ("CXX", "METAL", "METALLIB", "AR")
             ]
@@ -372,6 +376,7 @@ class CompileConfigurationTests(unittest.TestCase):
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
                 for source in (*q8_sources, removed_source)
+                if source.name != "attention_q8.metal"
             }
             test_airs = {
                 str(

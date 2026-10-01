@@ -158,6 +158,9 @@ class ArchitectureTests(unittest.TestCase):
                 for header in headers:
                     with self.subTest(source="startup", header=header):
                         startup.write_text(f'#include "{header}"\n')
+                        if header == "model/ModelFactory.hpp":
+                            self.assertEqual(check_architecture.check(), [])
+                            continue
                         self.assertEqual(
                             check_architecture.check(),
                             [
