@@ -209,13 +209,7 @@ def _mlx_target(repo, language_only):
     else:
         # MLX states its quantization under "quantization"; a transformers
         # quantization_config alone describes another method (GPTQ, AWQ, ...).
-        quant = config.get("quantization")
-        if (
-            not isinstance(quant, dict)
-            or quant.get("mode", "affine") != "affine"
-            or quant.get("bits") != 4
-            or quant.get("group_size") != 64
-        ):
+        if not is_affine_q4(config.get("quantization")):
             raise models.ModelError(
                 "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
             )
@@ -241,6 +235,16 @@ def _mlx_target(repo, language_only):
         "none" if language_only else "safetensors",
         config,
         files,
+    )
+
+
+def is_affine_q4(quant):
+    """Whether an MLX quantization map states affine 4-bit/group-64 by default."""
+    return (
+        isinstance(quant, dict)
+        and quant.get("mode", "affine") == "affine"
+        and quant.get("bits") == 4
+        and quant.get("group_size") == 64
     )
 
 

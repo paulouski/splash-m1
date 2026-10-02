@@ -109,36 +109,21 @@ def _require_target_metadata(config, target_format="mlx-affine"):
             f"the desktop app supports {DESKTOP_FAMILY} text checkpoints only"
         )
 
-    expected = (
-        ("intermediate_size", 17408),
-        ("linear_num_key_heads", 16),
-        ("linear_num_value_heads", 48),
-        ("linear_key_head_dim", 128),
-        ("linear_value_head_dim", 128),
-        ("linear_conv_kernel_dim", 4),
-        ("full_attention_interval", 4),
-        ("rms_norm_eps", 1e-6),
-        ("attention_bias", (False, 0)),
-        ("attn_output_gate", (True, 1)),
-        ("tie_word_embeddings", (False, 0)),
-        ("hidden_act", "silu"),
-        ("rope_parameters.rope_theta", 10000000),
-        ("rope_parameters.partial_rotary_factor", 0.25),
-        ("rope_parameters.rope_type", "default"),
-    )
     text = config.get("text_config")
     if not isinstance(text, dict):
         raise models.ModelError("upstream configuration has no text_config")
-    for key, value in expected:
+    for key, value in family.layout:
         if not _matches(text, key, value):
             raise models.ModelError(
                 f"unsupported Qwen3.8 configuration: text_config.{key}"
             )
 
     layer_types = _config_value(text, "layer_types")
+    layers = dict(family.signature)["num_hidden_layers"]
+    interval = dict(family.layout)["full_attention_interval"]
     expected_layers = tuple(
-        "full_attention" if (layer + 1) % 4 == 0 else "linear_attention"
-        for layer in range(64)
+        "full_attention" if (layer + 1) % interval == 0 else "linear_attention"
+        for layer in range(layers)
     )
     if layer_types != expected_layers:
         raise models.ModelError("unsupported Qwen3.8 attention layer schedule")
@@ -151,11 +136,7 @@ def _require_target_metadata(config, target_format="mlx-affine"):
         if not set(quantization) <= {"mode", "bits", "group_size"}:
             raise models.ModelError("unsupported Prism quantization override")
         return family
-    if (
-        quantization.get("mode", "affine") != "affine"
-        or quantization.get("bits") != 4
-        or quantization.get("group_size") != 64
-    ):
+    if not upstream.is_affine_q4(quantization):
         raise models.ModelError(
             "desktop models require MLX affine Q4/group-64 quantization"
         )

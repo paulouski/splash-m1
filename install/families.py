@@ -58,6 +58,10 @@ class ModelFamily:
     # including every one the native source model inspection requires.
     signature: tuple[tuple[str, object], ...]
     draft: Draft
+    # The rest of the text_config the native Qwen target requires
+    # (AffineTarget.cpp validateConfiguration), which the desktop app checks
+    # before a download. A tuple of values lists the ones a config may state.
+    layout: tuple[tuple[str, object], ...] = ()
 
 
 FAMILIES = (
@@ -88,6 +92,23 @@ FAMILIES = (
                 ("dflash_config.mask_token_id", 248070),
                 ("dflash_config.target_layer_ids", (5, 19, 33, 47, 61)),
             ),
+        ),
+        (
+            ("intermediate_size", 17408),
+            ("linear_num_key_heads", 16),
+            ("linear_num_value_heads", 48),
+            ("linear_key_head_dim", 128),
+            ("linear_value_head_dim", 128),
+            ("linear_conv_kernel_dim", 4),
+            ("full_attention_interval", 4),
+            ("rms_norm_eps", 1e-6),
+            ("attention_bias", (False, 0)),
+            ("attn_output_gate", (True, 1)),
+            ("tie_word_embeddings", (False, 0)),
+            ("hidden_act", "silu"),
+            ("rope_parameters.rope_theta", 10000000),
+            ("rope_parameters.partial_rotary_factor", 0.25),
+            ("rope_parameters.rope_type", "default"),
         ),
     ),
     ModelFamily(

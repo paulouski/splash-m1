@@ -53,7 +53,7 @@ case "$major" in ''|*[!0-9]*) fail "could not read macOS version: $os.";; esac
 [ "$major" -ge 15 ] 2>/dev/null || fail "Splash M1 requires macOS 15.0 or newer; this Mac runs $os."
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 mem=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
-[ "$mem" -ge 30000000000 ] 2>/dev/null || echo "Note: this Mac has under 32 GB of memory; only the 2-bit Prism checkpoint (Ternary Bonsai 2) is supported." >&2
+[ "$mem" -ge 34359738368 ] 2>/dev/null || echo "Note: this Mac has under 32 GB of memory; only the 2-bit Prism checkpoint (Ternary Bonsai 2) is supported." >&2
 version=${SPLASH_VERSION:-}
 [ -z "$version" ] || valid_version "$version" || fail "invalid release version."
 if [ -z "$BASE_URL" ]; then
