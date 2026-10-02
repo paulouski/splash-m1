@@ -502,6 +502,8 @@ class InstallerTests(unittest.TestCase):
             folder.mkdir()
         self.app = self.root / "home/Library/Application Support/Splash M1/app"
         self.command = self.bin / "splash-m1"
+        self.apps = self.root / "apps"
+        self.apps.mkdir()
 
     def publish(self, version, help_status=0, completions=True):
         name = f"splash-m1-{version}-arm64-macos15"
@@ -539,22 +541,35 @@ class InstallerTests(unittest.TestCase):
             f"{digest}  {name}.tar.gz\n"
         )
         (self.releases / "latest").write_text(f"{version}\n")
+        bundle = self.root / "bundle/Splash M1.app/Contents"
+        bundle.mkdir(parents=True)
+        (bundle / "Info.plist").write_text(f"<plist>{version}</plist>\n")
+        app_zip = self.releases / f"{name}-app.zip"
+        subprocess.run(
+            ["ditto", "-c", "-k", "--keepParent", str(bundle.parent), str(app_zip)],
+            check=True,
+        )
+        shutil.rmtree(self.root / "bundle")
+        (self.releases / f"{app_zip.name}.sha256").write_text(
+            f"{hashlib.sha256(app_zip.read_bytes()).hexdigest()}  {app_zip.name}\n"
+        )
 
     def install(self):
         return self.run_installer()
 
-    def run_installer(self, public=False, extra_environment=None):
+    def run_installer(self, public=False, extra_environment=None, arguments=()):
         environment = {
             "PATH": str(self.root / "commands") + os.pathsep + os.environ["PATH"],
             "HOME": str(self.root / "home"),
             "SPLASH_BIN_DIR": str(self.bin),
+            "SPLASH_APP_DIR": str(self.apps),
         }
         if not public:
             environment["SPLASH_BASE_URL"] = self.releases.as_uri()
         if extra_environment:
             environment.update(extra_environment)
         return subprocess.run(
-            ["/bin/sh", str(package.ROOT / "dev/tools/install.sh")],
+            ["/bin/sh", str(package.ROOT / "dev/tools/install.sh"), *arguments],
             env=environment,
             capture_output=True,
             text=True,
@@ -626,6 +641,54 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
         self.assertEqual(self.command.read_text(), command)
         self.assertEqual(self.completion_version(), "1.0")
+
+    def test_app_is_installed_without_quarantine(self):
+        self.publish("1.0")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.apps / "Splash M1.app/Contents/Info.plist"
+        self.assertIn("1.0", plist.read_text())
+        attributes = subprocess.run(
+            ["xattr", "-r", str(self.apps / "Splash M1.app")],
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertNotIn("com.apple.quarantine", attributes)
+        self.assertEqual([entry.name for entry in self.apps.iterdir()], ["Splash M1.app"])
+
+    def test_app_checksum_mismatch_changes_nothing(self):
+        self.publish("1.0")
+        (self.releases / "splash-m1-1.0-arm64-macos15-app.zip.sha256").write_text(
+            "0" * 64 + "  app.zip\n"
+        )
+        result = self.install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("checksum mismatch", result.stderr)
+        self.assertFalse(self.command.exists())
+        self.assertFalse((self.app / "current").exists())
+        self.assertEqual(list(self.apps.iterdir()), [])
+
+    def test_cli_only_skips_the_app(self):
+        self.publish("1.0")
+        (self.releases / "splash-m1-1.0-arm64-macos15-app.zip").unlink()
+        result = self.run_installer(arguments=["--cli-only"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.current(), "splash-m1-1.0-arm64-macos15")
+        self.assertEqual(list(self.apps.iterdir()), [])
+        self.assertNotIn("Desktop app", result.stdout)
+
+    def test_running_app_blocks_the_install(self):
+        self.publish("1.0")
+        commands = self.root / "commands"
+        commands.mkdir()
+        pgrep = commands / "pgrep"
+        pgrep.write_text("#!/bin/sh\nexit 0\n")
+        pgrep.chmod(0o755)
+        result = self.install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("quit Splash M1", result.stderr)
+        self.assertFalse(self.command.exists())
+        self.assertEqual(list(self.apps.iterdir()), [])
 
     def test_install_points_the_command_at_the_new_version_and_prunes_the_old(self):
         self.publish("1.0")
@@ -839,6 +902,7 @@ class InstallerTests(unittest.TestCase):
                 "HOME": str(self.root / "home"),
                 "SPLASH_TOKEN": "test-token",
                 "SPLASH_BIN_DIR": str(self.bin),
+                "SPLASH_APP_DIR": str(self.apps),
             },
             capture_output=True,
             text=True,

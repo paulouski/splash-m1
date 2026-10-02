@@ -41,8 +41,10 @@ def main(argv=None):
     dist = ROOT / "dist"
     archive = dist / f"splash-m1-{args.version}-arm64-macos{macos.group(1)}.tar.gz"
     checksum = archive.with_suffix(archive.suffix + ".sha256")
+    app = dist / f"splash-m1-{args.version}-arm64-macos{macos.group(1)}-app.zip"
+    app_checksum = app.with_suffix(app.suffix + ".sha256")
     installer = dist / "install.sh"
-    required = (archive, checksum, installer)
+    required = (archive, checksum, app, app_checksum, installer)
     for path in required:
         if not path.is_file():
             sys.exit(
@@ -54,6 +56,8 @@ def main(argv=None):
     uploads = [
         (archive, archive.name),
         (checksum, checksum.name),
+        (app, app.name),
+        (app_checksum, app_checksum.name),
     ]
     uploads.append((installer, "install.sh"))
     for path, name in uploads:
