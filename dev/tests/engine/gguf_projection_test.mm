@@ -262,20 +262,28 @@ std::vector<uint16_t> storageRows(const std::vector<float> &x, uint32_t width, u
 
 // A plan's split scratch, as LinearPlan::scratchSize sizes it (the largest of several plans that share it).
 struct Scratch {
-  Guarded table, sums, partials, counters;
+  Guarded table, sums, partials, counters, rotated;
   Scratch(MetalBackend &backend, LinearScratchSize size)
       : table(backend, size.input, 0), sums(backend, size.sums, 0), partials(backend, size.partials, 0),
-        counters(backend, size.counters, 0) {}
-  [[nodiscard]] LinearScratch bindings() const { return {table.view, sums.view, partials.view, counters.view}; }
+        counters(backend, size.counters, 0), rotated(backend, size.rotated, 0) {}
+  [[nodiscard]] LinearScratch bindings() const {
+    return {table.view, sums.view, partials.view, counters.view, rotated.view};
+  }
   void poison(uint32_t bits) const {
     if (partials.bytes) std::fill_n(static_cast<uint32_t *>(partials.view.contents()), partials.bytes / 4, bits);
   }
   [[nodiscard]] bool intact() const {
     const auto *count = static_cast<const uint32_t *>(counters.view.contents());
-    return table.intact() && sums.intact() && partials.intact() && counters.intact() &&
+    return table.intact() && sums.intact() && partials.intact() && counters.intact() && rotated.intact() &&
            std::all_of(count, count + counters.bytes / 4, [](uint32_t c) { return c == 0; });
   }
 };
+// The scratch of `plan` over `p`, with the rotated rows of a rotated projection.
+Scratch scratchOf(MetalBackend &backend, const LinearPlan &plan, const Projection &p) {
+  LinearScratchSize size = plan.scratchSize();
+  if (p.rotation) size.rotated = rotatedBytes(p.inputSize, plan.storageRows());
+  return Scratch(backend, size);
+}
 // One projection's buffers for a plan: its input and auxiliary rows (the residual, or the gate an up-with-gate
 // prefill reads), and an output and gate scratch that start unwritten.
 struct Operands {
@@ -304,7 +312,7 @@ struct Outcome {
 Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan, const Projection &p,
             const Projection *gate, const std::vector<uint16_t> &x, const std::vector<uint16_t> &aux, uint32_t poison,
             uint32_t covered, const std::string &label) {
-  const Scratch scratch(backend, plan.scratchSize());
+  const Scratch scratch = scratchOf(backend, plan, p);
   const Operands o(backend, plan, x, aux);
   scratch.poison(poison);
   CommandGraph graph;
@@ -364,7 +372,7 @@ void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &
                  const std::vector<uint16_t> &x, const Outcome &bf16, const std::vector<Dot> &dots, uint32_t covered,
                  bool staged, const std::string &label) {
   const uint32_t columns = plan.workload().matrix.outputSize;
-  const Scratch scratch(backend, plan.scratchSize());
+  const Scratch scratch = scratchOf(backend, plan, p);
   const Guarded input = bfloats(backend, x);
   const Guarded output(backend, uint64_t{plan.storageRows()} * columns * sizeof(float), 0xFF);
   scratch.poison(kPoisonNaN);
@@ -691,6 +699,126 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
   }
 }
 
+// ---------------------------------------------------------------- Bonsai-27B shapes
+// H (D x) as gguf_rotate computes it: the fp32 butterflies of each block of signed inputs, scaled, rounded to bf16.
+std::vector<float> rotatedRows(const std::vector<float> &x, uint32_t rows, uint32_t K,
+                               const std::vector<int8_t> &signs) {
+  constexpr uint32_t kBlock = GGUF_ROTATION_BLOCK;
+  std::vector<float> out(x.size());
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t b = 0; b < K; b += kBlock) {
+      float *v = out.data() + uint64_t{r} * K + b;
+      for (uint32_t i = 0; i < kBlock; ++i) v[i] = x[uint64_t{r} * K + b + i] * float(signs[b + i]);
+      for (uint32_t stride = 1; stride < kBlock; stride *= 2)
+        for (uint32_t a = 0; a < kBlock; ++a)
+          if (!(a & stride)) {
+            const float p = v[a], q = v[a + stride];
+            v[a] = p + q;
+            v[a + stride] = p - q;
+          }
+      for (uint32_t i = 0; i < kBlock; ++i) v[i] = bf16(v[i] * (1.0f / 32.0f));
+    }
+  return out;
+}
+
+// A hot projection of the 27B in PQ2_0 over rotated inputs: PQ2_0 segments of `columns` outputs and a float segment of
+// `floatColumns` (the GDN alpha/beta, which reads the unrotated input), at each row count of `rows` (decode up to
+// 32 rows, a prefill chunk past them) on the plan the device's policy picks, every output within fp64.
+struct BonsaiShape {
+  const char *name;
+  std::vector<uint32_t> columns;
+  uint32_t floatColumns, K;
+  LinearEpilogue epilogue;
+  bool logits;   // a lone plain tensor, also checked into fp32
+  std::vector<uint32_t> rows;
+};
+void bonsaiShape(MetalBackend &backend, const Linear &linear, const BonsaiShape &s) {
+  const uint32_t K = s.K, maxRows = *std::max_element(s.rows.begin(), s.rows.end());
+  const bool gated = s.epilogue == LinearEpilogue::GateUp;
+  uint32_t quantized = 0;
+  for (const uint32_t n : s.columns) quantized += n;
+  const uint32_t covered = quantized + s.floatColumns, columns = (covered + kPadding - 1) / kPadding * kPadding;
+  std::vector<int8_t> signs(K);
+  for (int8_t &v : signs) v = rng() & 1 ? 1 : -1;
+  const InputRotation rotation{upload(backend, std::vector<uint8_t>(signs.begin(), signs.end()))};
+  std::vector<Tensor> up, gateTensors;
+  for (const uint32_t n : s.columns) {
+    up.push_back(tensor(backend, PQ20, n, K));
+    if (gated) gateTensors.push_back(tensor(backend, PQ20, n, K));
+  }
+  std::uniform_real_distribution<float> small(-0.1f, 0.1f);
+  std::vector<float> floats(uint64_t{s.floatColumns} * K);
+  for (float &v : floats) v = small(rng);
+  MetalBuffer floatBuffer = backend.allocateBuffer(std::max<uint64_t>(floats.size() * sizeof(float), 4));
+  std::memcpy(floatBuffer.contents(), floats.data(), floats.size() * sizeof(float));
+  const auto build = [&](const std::vector<Tensor> &tensors) {
+    BlockWeights blocks;
+    uint32_t offset = 0;
+    for (const Tensor &t : tensors) {
+      blocks.segments.push_back(t.segment);
+      blocks.segments.back().columnOffset = offset;
+      offset += t.N;
+    }
+    if (s.floatColumns) {
+      blocks.segments.push_back(QuantizedSegment::floats(s.floatColumns, K, floatBuffer));
+      blocks.segments.back().columnOffset = offset;
+    }
+    Projection p(columns, K, std::move(blocks));
+    p.rotation = rotation;
+    return p;
+  };
+  const Projection upProjection = build(up), gateProjection = gated ? build(gateTensors) : Projection();
+  const std::vector<float> x = activations(Inputs::Dense, maxRows, K), xr = rotatedRows(x, maxRows, K, signs);
+  const auto pointers = [](const std::vector<Tensor> &tensors) {
+    std::vector<const Tensor *> result;
+    for (const Tensor &t : tensors) result.push_back(&t);
+    return result;
+  };
+  std::vector<Dot> dots = products(pointers(up), columns, xr, maxRows);
+  for (uint32_t r = 0; r < maxRows; ++r)
+    for (uint32_t n = 0; n < s.floatColumns; ++n)
+      dots[uint64_t{r} * columns + quantized + n] = dot(x.data() + uint64_t{r} * K, floats.data() + uint64_t{n} * K, K);
+  const std::vector<Dot> gateDots = gated ? products(pointers(gateTensors), columns, xr, maxRows) : std::vector<Dot>{};
+  const std::vector<float> residual = residuals(maxRows, columns);
+  const Projection *gate = gated ? &gateProjection : nullptr;
+  for (const uint32_t rows : s.rows) {
+    const bool prefill = rows > kMaximumRows;
+    const std::string label = std::string(s.name) + " M=" + std::to_string(rows);
+    const auto staged = [](const LinearPlan &plan) { return plan.configuration().tile == LinearTile::GgufStaged; };
+    const auto input = [&](const LinearPlan &plan) { return storageRows(x, K, rows, plan.storageRows()); };
+    const auto summary = [&](const LinearPlan &plan) {
+      std::cout << "  " << label << ": " << tileName(plan.configuration().tile) << " S="
+                << plan.configuration().splits << '\n';
+    };
+    if (prefill && gated) {
+      // The gate pass, then the up pass reading its rows, as QwenTarget::addPrefillFfn runs them.
+      const LinearPlan gatePlan = linear.prefillPlan(gateProjection, rows, LinearEpilogue::None);
+      const Outcome g = run(backend, linear, gatePlan, gateProjection, nullptr, input(gatePlan), {}, kPoisonNaN,
+                            covered, label + " gate pass");
+      checkValues(g, gateDots, {}, {}, gatePlan.workload(), rows, covered, staged(gatePlan), label + " gate pass");
+      std::vector<uint16_t> gateRows = g.output;
+      std::replace(gateRows.begin(), gateRows.end(), kUnwritten, uint16_t{0});
+      const LinearPlan plan = linear.prefillPlan(upProjection, rows, LinearEpilogue::UpWithGate);
+      summary(plan);
+      const Outcome out = run(backend, linear, plan, upProjection, nullptr, input(plan), gateRows, kPoisonNaN,
+                              covered, label);
+      checkValues(out, dots, {}, gateRows, plan.workload(), rows, covered, staged(plan), label);
+      continue;
+    }
+    const LinearPlan plan = prefill ? linear.prefillPlan(upProjection, rows, s.epilogue)
+                                    : linear.plan(decode({columns, K}, rows / kLaneRows, s.epilogue), upProjection, gate);
+    summary(plan);
+    const std::vector<uint16_t> aux = storageRows(residual, columns, rows, plan.storageRows());
+    const Outcome out = run(backend, linear, plan, upProjection, gate, input(plan), aux, kPoisonFinite, covered, label);
+    checkValues(out, dots, gateDots, aux, plan.workload(), rows, covered, staged(plan), label);
+    if (s.logits && !prefill)
+      floatOutput(backend, linear, Linear::plan(plan.workload(), plan.configuration(), FloatOutput::Float32),
+                  upProjection, input(plan), out, dots, covered, staged(plan), label);
+  }
+  section(std::string("Bonsai ") + s.name + ": PQ2_0 " + std::to_string(columns) + "x" + std::to_string(K) +
+          " rotated, policy plans, within fp64");
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- token gather
@@ -754,6 +882,17 @@ int main(int argc, char **argv) {
         }
       section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, "
               "independent of poisoned partials and within fp64");
+      // Bonsai-27B (hidden 5120, FFN 17408): decode at 8-32 rows, a 77-row prefill chunk with a tail.
+      const std::vector<uint32_t> all{8, 16, 32, 77}, decodeOnly{8, 16, 32};
+      using E = LinearEpilogue;
+      for (const BonsaiShape &shape : {
+               BonsaiShape{"gate/up", {17408}, 0, 5120, E::GateUp, false, all},
+               BonsaiShape{"down", {5120}, 0, 17408, E::Residual, false, all},
+               BonsaiShape{"out", {5120}, 0, 6144, E::Residual, false, all},
+               BonsaiShape{"gdn in", {10240, 6144}, 96, 5120, E::None, false, all},
+               BonsaiShape{"attention in", {12288, 1024, 1024}, 0, 5120, E::None, false, all},
+               BonsaiShape{"vocab head", {248320}, 0, 5120, E::None, true, decodeOnly}})
+        bonsaiShape(backend, linear, shape);
       tokenGather(backend);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';

@@ -9,8 +9,10 @@
 #include "metal/abi/Gguf.h"
 #include "metal/kernels/common/sgmatrix.h"
 
+#if __METAL_VERSION__ >= 400
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
+#endif
 
 namespace gguf_float {
 
@@ -79,6 +81,7 @@ GGUF_FLOAT_KERNEL(gguf_float_bf16, bfloat)
 GGUF_FLOAT_KERNEL(gguf_float_f32, float)
 #undef GGUF_FLOAT_KERNEL
 
+#if __METAL_VERSION__ >= 400   // MPP-only; Apple7/8 (MACOS15 build) uses gguf_float_{bf16,f32}
 // The same projections on the neural accelerator (ops::FloatTile::NeuralAccelerator), whose matmul takes bf16
 // operands: each F32 weight is split into three bf16 parts, its leading 8 significant bits, the next 8 and the last 8,
 // so hi + mid + lo == w exactly (fp32 has 24) and each part's product with a bf16 activation is exact in fp32. The
@@ -199,3 +202,4 @@ static_assert(gguf_float_na::kStep % gguf_float_na::kPerThread == 0 && gguf_floa
 GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16, bfloat)
 GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32, float)
 #undef GGUF_FLOAT_NA_KERNEL
+#endif
