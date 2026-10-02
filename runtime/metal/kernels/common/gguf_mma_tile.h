@@ -53,8 +53,8 @@ inline float bf16_at(uint2 v, uint j) {
 }
 
 // A lane's activations of one group: rows 8r + fn (+1) of x (row 0 of the tile), inputs k0 + 4 (fm / 2) + 16 (fm & 1).
-template <uint FM>
-inline void load_inputs(device const bfloat *x, uint input_size, uint k0, sgmatrix::Lane l, thread uint2 (&v)[FM][2]) {
+template <uint FM, class T>
+inline void load_inputs(device const T *x, uint input_size, uint k0, sgmatrix::Lane l, thread uint2 (&v)[FM][2]) {
   const uint k = k0 + 4 * (l.fm >> 1) + 16 * (l.fm & 1);
 #pragma unroll
   for (uint r = 0; r < FM; ++r)
@@ -154,6 +154,83 @@ inline void accumulate_any(uint fmt, device const bfloat *x, device uchar *w0, d
     quant_pair_table<F>(tl, thread_index, threads);
     accumulate<F, FM>(x, w0, w1, meta, input_size, origin, stage, tl, lane, step_begin, step_end, acc);
   });
+}
+
+// PQ2_0 without staging (rotated inputs from gguf_rotate_half): the A fragments are the biased half codes 1024 + q
+// straight from the packed bits, the B ones the half activations, and a 128-input unit's four steps sum into fp32
+// tmp, so value = d (q - 1) gives acc += d (tmp - 1025 S) with S the unit's sum of the half activations the MMAs read,
+// [unit][row] in `sums`. Steps [step_begin, step_end) hold whole units.
+template <uint FM>
+inline void accumulate_pq20_rb(device const half *x, device const float *sums, device uchar *w0, device uchar *meta,
+                               uint input_size, uint origin, uint lane, uint step_begin, uint step_end,
+                               thread float2 (&acc)[FN][FM]) {
+  using F = FmtPQ20;
+  static_assert(F::P0 == 8 && F::P1 == 0 && F::MetaGroups == 4 && F::MetaBytes == 2, "PQ2_0 plane layout");
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint groups = input_size / 32, units = groups / F::MetaGroups;
+  const uint plane_tile = origin / QUANT_TILE_ROWS, row0 = origin % QUANT_TILE_ROWS + l.fm;
+  device uchar *cw[FN];
+  device uchar *cd[FN];
+#pragma unroll
+  for (uint i = 0; i < FN; ++i) {
+    cw[i] = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + row0 + 8 * i) * F::P0 + (l.fn >> 1) * 2;
+    cd[i] = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + row0 + 8 * i) * F::MetaBytes;
+  }
+  uint r[FN];
+#pragma unroll
+  for (uint i = 0; i < FN; ++i) r[i] = *reinterpret_cast<device ushort *>(cw[i] + ulong(step_begin) * QUANT_TILE_ROWS * F::P0);
+  for (uint u = step_begin / F::MetaGroups; u < step_end / F::MetaGroups; ++u) {
+    float d[FN];
+#pragma unroll
+    for (uint i = 0; i < FN; ++i)
+      d[i] = float(as_type<half>(*reinterpret_cast<device ushort *>(cd[i] + ulong(u) * QUANT_TILE_ROWS * F::MetaBytes)));
+    float2 corr[FM];
+#pragma unroll
+    for (uint rr = 0; rr < FM; ++rr)
+      corr[rr] = 1025.0f * *reinterpret_cast<device const float2 *>(sums + u * 8 * FM + 8 * rr + l.fn);
+    float2 tmp[FN][FM];
+    zero(tmp);
+#pragma unroll
+    for (uint k = 0; k < 4; ++k) {
+      const uint step = u * 4 + k;
+      // Byte 0 of the chunk holds the low elements' codes, byte 1 the high ones': code j of both at bits 2j of each halfword.
+      uint s[FN];
+#pragma unroll
+      for (uint i = 0; i < FN; ++i) s[i] = r[i] | ((r[i] & 0xFF00u) << 8);
+      if (step + 1 < step_end)
+#pragma unroll
+        for (uint i = 0; i < FN; ++i)
+          r[i] = *reinterpret_cast<device ushort *>(cw[i] + ulong(step + 1) * QUANT_TILE_ROWS * F::P0);
+      uint2 v[FM][2];
+      load_inputs<FM>(x, input_size, step * kStep, l, v);
+#pragma unroll
+      for (uint j = 0; j < 4; ++j) {
+        simdgroup_half8x8 b[FM];
+#pragma unroll
+        for (uint rr = 0; rr < FM; ++rr)
+          sgmatrix::te(b[rr]) = half2(as_type<half4>(v[rr][0])[j], as_type<half4>(v[rr][1])[j]);
+#pragma unroll
+        for (uint i = 0; i < FN; ++i) {
+          simdgroup_half8x8 m;
+          sgmatrix::te(m) = as_type<half2>(((s[i] >> (2 * j)) & 0x00030003u) | 0x64006400u);
+#pragma unroll
+          for (uint rr = 0; rr < FM; ++rr) {
+            simdgroup_float8x8 c, e;
+            sgmatrix::te(c) = tmp[i][rr];
+            simdgroup_multiply_accumulate(e, m, b[rr], c);
+            tmp[i][rr] = sgmatrix::te(e);
+          }
+        }
+      }
+    }
+#pragma unroll
+    for (uint i = 0; i < FN; ++i)
+#pragma unroll
+      for (uint rr = 0; rr < FM; ++rr) {
+        const float2 value = tmp[i][rr] - corr[rr];
+        acc[i][rr] = fma(float2(d[i]), value, acc[i][rr]);
+      }
+  }
 }
 
 // A simdgroup's sums over every K partition, handed to store(row, column, sum), as gguf_store_sums: one partition

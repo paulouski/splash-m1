@@ -53,10 +53,65 @@ QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
 #undef GGUF_DECODE_MMA_ROWS
 #undef GGUF_DECODE_MMA
 
+// PQ2_0 decode on the register-A tile (accumulate_pq20_rb) over gguf_rotate_half's input: Rows half rows, then their
+// group sums. The bindings and outputs of gguf_decode_mma, which stages.
+template <ushort Rows, GgufEpilogue Ep, class Out>
+kernel void gguf_decode_mma_pq20rb(device half *input [[buffer(0)]], device uchar *w0 [[buffer(1)]],
+                                   device uchar *w1 [[buffer(2)]], device uchar *meta [[buffer(3)]],
+                                   device Out *output [[buffer(4)]], device coherent(device) float *partials [[buffer(5)]],
+                                   device atomic_uint *counters [[buffer(6)]], device bfloat *aux [[buffer(7)]],
+                                   constant GgufDecodeParams &p [[buffer(8)]], uint2 group [[threadgroup_position_in_grid]],
+                                   uint simd_lane [[thread_index_in_simdgroup]],
+                                   uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint FM = Rows / 8;
+  static_cast<void>(w1);  // PQ2_0 has no second plane
+  threadgroup uint arrival;
+  const uint thread_index = simd_group * 32 + simd_lane;
+  const uint per = p.input_size / kStep / p.splits, origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns,
+             column0 = p.out_offset + origin;
+  float2 acc[FN][FM];
+  zero(acc);
+  accumulate_pq20_rb<FM>(input, reinterpret_cast<device const float *>(input + ulong(Rows) * p.input_size), w0, meta,
+                         p.input_size, origin, simd_lane, group.y * per, (group.y + 1) * per, acc);
+  store_sums<Rows>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,
+                   counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0, thread_index, &arrival,
+                   [&](uint row, uint column, float v) {
+                     const ulong o = ulong(row) * p.out_stride + column0 + column;
+                     if constexpr (Ep == EpResidual) v += float(aux[o]);
+                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+                     output[o] = Out(v);
+                   });
+}
+template <class Out>
+using GgufDecodeMmaRbKernel = void(device half *, device uchar *, device uchar *, device uchar *, device Out *,
+                                   device coherent(device) float *, device atomic_uint *, device bfloat *,
+                                   constant GgufDecodeParams &, uint2, uint, uint);
+#define GGUF_DECODE_MMA_RB(R, ep, Ep, Out)                                                                         \
+  template [[host_name("gguf_decode_mma_pq20rb_m" #R "_" #ep)]] kernel GgufDecodeMmaRbKernel<Out>                  \
+      gguf_decode_mma_pq20rb<R, Ep, Out>;
+#define GGUF_DECODE_MMA_RB_ROWS(ep, Ep, Out) GGUF_DECODE_MMA_RB(8, ep, Ep, Out) GGUF_DECODE_MMA_RB(16, ep, Ep, Out) GGUF_DECODE_MMA_RB(32, ep, Ep, Out)
+GGUF_DECODE_MMA_RB_ROWS(a, EpNone, bfloat) GGUF_DECODE_MMA_RB_ROWS(a_f32, EpNone, float)
+GGUF_DECODE_MMA_RB_ROWS(r, EpResidual, bfloat) GGUF_DECODE_MMA_RB_ROWS(g, EpUpWithGate, bfloat)
+#undef GGUF_DECODE_MMA_RB_ROWS
+#undef GGUF_DECODE_MMA_RB
+
 // Fused projections: up to three column segments of any formats in one dispatch, as gguf_decode_fused_m*.
 #define GGUF_SEGMENT(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
-#define GGUF_DECODE_MMA_FUSED(R)                                                                                   \
-  kernel void gguf_decode_mma_fused_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),      \
+// Run-time format `fmt` over every format, or the one PQ20 instance when every segment is PQ20.
+template <bool Pq20Only, uint FM>
+inline void fused_accumulate(uint fmt, device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
+                             uint input_size, uint origin, threadgroup half *stage, threadgroup half2 *tl,
+                             uint thread_index, uint lane, uint step_begin, uint step_end, thread float2 (&acc)[FN][FM]) {
+  if constexpr (Pq20Only) {
+    quant_pair_table<FmtPQ20>(tl, thread_index, GGUF_STAGED_THREADS);
+    accumulate<FmtPQ20, FM>(x, w0, w1, meta, input_size, origin, stage, tl, lane, step_begin, step_end, acc);
+  } else {
+    accumulate_any<FM>(fmt, x, w0, w1, meta, input_size, origin, stage, tl, thread_index, GGUF_STAGED_THREADS, lane,
+                       step_begin, step_end, acc);
+  }
+}
+#define GGUF_DECODE_MMA_FUSED(R, name, Pq20Only)                                                                   \
+  kernel void gguf_decode_mma_fused##name##_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),      \
                                          GGUF_SEGMENT(4, w0b, w1b, mb), GGUF_SEGMENT(7, w0c, w1c, mc),            \
                                          device bfloat *output [[buffer(10)]],                                    \
                                          device coherent(device) float *partials [[buffer(11)]],                  \
@@ -77,14 +132,47 @@ QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
     const uint thread_index = simd_group * 32 + simd_lane;                                                        \
     float2 acc[FN][R / 8];                                                                                        \
     zero(acc);                                                                                                    \
-    accumulate_any<R / 8>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, \
-                          tl, thread_index, GGUF_STAGED_THREADS, simd_lane, group.y * per, (group.y + 1) * per, acc); \
+    fused_accumulate<Pq20Only, R / 8>(p.fmt[s], input, w0, w1, meta, p.input_size, origin,                         \
+                                      stage + simd_group * kSimdgroupStage, tl, thread_index, simd_lane,          \
+                                      group.y * per, (group.y + 1) * per, acc);                                   \
     store_sums<R>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,                                \
                   counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.out_stride, column0, thread_index, &arrival, \
                   [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_MMA_FUSED(8) GGUF_DECODE_MMA_FUSED(16) GGUF_DECODE_MMA_FUSED(32)
+GGUF_DECODE_MMA_FUSED(8, , false) GGUF_DECODE_MMA_FUSED(16, , false) GGUF_DECODE_MMA_FUSED(32, , false)
+GGUF_DECODE_MMA_FUSED(8, _pq20, true) GGUF_DECODE_MMA_FUSED(16, _pq20, true) GGUF_DECODE_MMA_FUSED(32, _pq20, true)
 #undef GGUF_DECODE_MMA_FUSED
+
+// The fused PQ2_0 projection on the register-A tile, as gguf_decode_mma_fused_pq20_m*.
+#define GGUF_DECODE_MMA_FUSED_RB(R)                                                                                \
+  kernel void gguf_decode_mma_fused_pq20rb_m##R(device half *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),  \
+                                         GGUF_SEGMENT(4, w0b, w1b, mb), GGUF_SEGMENT(7, w0c, w1c, mc),            \
+                                         device bfloat *output [[buffer(10)]],                                    \
+                                         device coherent(device) float *partials [[buffer(11)]],                  \
+                                         device atomic_uint *counters [[buffer(12)]],                             \
+                                         constant GgufDecodeFusedParams &p [[buffer(13)]],                        \
+                                         uint2 group [[threadgroup_position_in_grid]],                            \
+                                         uint simd_lane [[thread_index_in_simdgroup]],                            \
+                                         uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
+    static_cast<void>(w1a), static_cast<void>(w1b), static_cast<void>(w1c);                                       \
+    threadgroup uint arrival;                                                                                     \
+    const uint t0 = p.cols[0] / GGUF_TILE_COLUMNS, t1 = t0 + p.cols[1] / GGUF_TILE_COLUMNS;                        \
+    const uint s = group.x < t0 ? 0 : group.x < t1 ? 1 : 2;                                                       \
+    device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;                                                         \
+    device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;                                                          \
+    const uint local = group.x - (s == 0 ? 0 : s == 1 ? t0 : t1), per = p.input_size / kStep / p.splits;          \
+    const uint origin = local * GGUF_TILE_COLUMNS + simd_group * kColumns, column0 = p.offset[s] + origin;         \
+    const uint thread_index = simd_group * 32 + simd_lane;                                                        \
+    float2 acc[FN][R / 8];                                                                                        \
+    zero(acc);                                                                                                    \
+    accumulate_pq20_rb<R / 8>(input, reinterpret_cast<device const float *>(input + ulong(R) * p.input_size), w0,   \
+                              meta, p.input_size, origin, simd_lane, group.y * per, (group.y + 1) * per, acc);     \
+    store_sums<R>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,                                \
+                  counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.out_stride, column0, thread_index, &arrival, \
+                  [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
+  }
+GGUF_DECODE_MMA_FUSED_RB(8) GGUF_DECODE_MMA_FUSED_RB(16) GGUF_DECODE_MMA_FUSED_RB(32)
+#undef GGUF_DECODE_MMA_FUSED_RB
 #undef GGUF_SEGMENT
 
 // The prefill kernels: grid (64-row tiles of the chunk, column tiles of the segment), four simdgroups; the residual

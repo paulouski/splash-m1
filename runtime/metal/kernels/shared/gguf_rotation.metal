@@ -52,6 +52,31 @@ kernel void gguf_rotate(device const bfloat *input [[buffer(0)]], device const c
   }
 }
 
+// gguf_rotate for the PQ20 register-A tiles (gguf_mma_tile.h): the values round to bf16 as above and are stored as
+// half, followed by p.rows rows' fp32 sums of each 128-value group of the stored values, [group][row].
+// Grid (width / GGUF_ROTATION_BLOCK, rows).
+kernel void gguf_rotate_half(device const bfloat *input [[buffer(0)]], device const char *signs [[buffer(1)]],
+                             device half *output [[buffer(2)]], constant GgufRotationParams &p [[buffer(3)]],
+                             uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float values[GGUF_ROTATION_BLOCK];
+  const uint column = group.x * GGUF_ROTATION_BLOCK;
+  const ulong row = ulong(group.y) * p.width + column;
+  float4 v;
+  for (uint i = 0; i < 4; ++i) {
+    const uint j = tid + i * GGUF_ROTATION_THREADS;
+    v[i] = float(input[row + j]) * float(signs[column + j]);
+  }
+  rotation_butterflies(v, values, tid);
+  const uint j = simd_group * 128 + lane * 4;
+  half4 h;
+  for (uint i = 0; i < 4; ++i) h[i] = half(bfloat(values[j + i] * kRotationScale));
+  *reinterpret_cast<device half4 *>(output + row + j) = h;
+  const float sum = simd_sum(float(h.x) + float(h.y) + float(h.z) + float(h.w));
+  if (lane == 0)
+    reinterpret_cast<device float *>(output + ulong(p.rows) * p.width)[(column / 128 + simd_group) * p.rows + group.y] = sum;
+}
+
 // The token rows of a PQ2_0 table stored rotated (block_pq2_0: half d, then the 2-bit codes q of 128 weights worth
 // d (q - 1)), as D (H r): the gathered values enter the transform in fp32, so each output rounds once.
 // Grid (hidden / GGUF_ROTATION_BLOCK, rows).

@@ -234,6 +234,16 @@ bool gemvEligible(const LinearWorkload &w, FloatOutput destination, const std::v
   return std::all_of(segments.begin(), segments.end(), fits) && (!gate || fits(gate->blocks().segments.front()));
 }
 
+// Whether the staged MMA decode tile runs the plan's PQ2_0 segments (and gate) on the register-A tile
+// (accumulate_pq20_rb), which reads whole 128-input units of K per split.
+bool registerAEligible(uint32_t appleGpuFamily, const LinearConfig &config, uint32_t k,
+                       const std::vector<QuantizedSegment> &segments, const Projection *gate) {
+  const auto pq20 = [](const QuantizedSegment &s) { return s.formatId == GGUF_FMT_PQ20; };
+  return mmaTiles(appleGpuFamily) && config.tile == LinearTile::GgufStaged && config.simdgroups == LinearSimdgroups::Two &&
+         (k / 32 / config.splits) % 4 == 0 && std::all_of(segments.begin(), segments.end(), pq20) &&
+         (!gate || std::all_of(gate->blocks().segments.begin(), gate->blocks().segments.end(), pq20));
+}
+
 } // namespace
 
 uint32_t gemvSplits(uint32_t n, uint32_t k) noexcept {
@@ -364,11 +374,14 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
       throw std::invalid_argument("a rotated gate/up pair takes one rotation");
     if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
       throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
-    graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
-              {k / GGUF_ROTATION_BLOCK, gemv ? 1u : w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+    const bool halfInput = !gemv && registerAEligible(appleGpuFamily_, config, k, segments, gate);
+    graph.add(halfInput ? "gguf_rotate_half" : "gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated},
+              GgufRotationParams{k, plan.storageRows()}, {k / GGUF_ROTATION_BLOCK, gemv ? 1u : w.rows, 1},
+              {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;
     rotated.input = b.scratch.rotated;
     rotated.prepared = {};
+    rotated.halfInput = halfInput;
     Projection plain = p;
     plain.rotation = {};
     addGguf(graph, rotated, plain, plan, gate, stats);
@@ -419,7 +432,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue, mmaTiles(appleGpuFamily_)), plan.destination()),
+    graph.add(kernelInstance(decodeKernel(b.halfInput ? "pq20rb" : s.name(), rows, epilogue, mmaTiles(appleGpuFamily_)),
+                             plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
               {GGUF_STAGED_THREADS, 1, 1});
@@ -447,8 +461,12 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   std::vector<metal::MetalBuffer> bindings{b.input};
   const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
   bindings.insert(bindings.end(), {b.output, partials, counters});
-  graph.add(std::string(mmaTiles(appleGpuFamily_) ? "gguf_decode_mma_fused_m" : "gguf_decode_fused_m") +
-                std::to_string(rows), std::move(bindings), params,
+  const bool pq20 = std::all_of(order.begin(), order.end(),
+                                [](const QuantizedSegment *s) { return s->formatId == GGUF_FMT_PQ20; });
+  graph.add(std::string(!mmaTiles(appleGpuFamily_) ? "gguf_decode_fused_m"
+                        : b.halfInput             ? "gguf_decode_mma_fused_pq20rb_m"
+                        : pq20                    ? "gguf_decode_mma_fused_pq20_m"
+                                                  : "gguf_decode_mma_fused_m") + std::to_string(rows), std::move(bindings), params,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
 }
 

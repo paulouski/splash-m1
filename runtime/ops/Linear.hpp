@@ -145,9 +145,10 @@ struct LinearScratchSize final {
   }
 };
 // LinearScratch::rotated bytes of a rotated projection's plan of storageRows
-// rows of `width` inputs.
+// rows of `width` inputs: the rows, then (gguf_rotate_half) the fp32 sums of
+// each 128-input group of their values, [group][row].
 [[nodiscard]] constexpr uint64_t rotatedBytes(uint32_t width, uint64_t storageRows) noexcept {
-  return uint64_t{width} * storageRows * 2;
+  return uint64_t{width} * storageRows * 2 + uint64_t{width} / 128 * storageRows * 4;
 }
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
@@ -233,6 +234,8 @@ struct LinearBuffers final {
   // What the scratch table holds (for example after fused RMSNorm). A plan
   // that reads a table prepares one unless this describes its input.
   PreparedInput prepared{};
+  // The input holds half rows and their group sums (gguf_rotate_half), which the PQ20 register-A tiles read.
+  bool halfInput = false;
 };
 
 struct LinearDispatchStats final {
