@@ -214,6 +214,7 @@ ModelMemoryProfile bonsai() {
       kv::Layout{16, 4, 256},
       {7'251'165'184, 1'266'040'832, 0, 350'224'384, 785'580'032,
        262'662'272, 256 * kMiB, 512 * kMiB}};
+  result.footprint.cachedStateBytes = 196'083'712;
   return result;
 }
 
@@ -308,8 +309,10 @@ void testAdaptivePrefillFitsBonsaiOn16Gb() {
 //   hard budget 10,379,509,760 = fixed 9,635,255,383 + dynamic 744,254,377
 //   fixed = weights 8,517,206,016 + prefill 50,080,727 (128 rows) + decode
 //           262,662,272 + pipelines 256 MiB + overhead 512 MiB
-//   dynamic = one state cell 350,224,384 + 369 KV pages x 1,064,960 B
-//   369 pages = 11,808 tokens, 11,801 after the 7 speculative scratch rows.
+//   dynamic = one state cell 350,224,384 + one cached state 196,083,712
+//             + 184 KV pages x 1,064,960 B
+//   184 pages = 5,888 tokens, 5,881 after the 7 speculative scratch rows.
+//   Without the cached-state reserve: 369 pages, 11,801 tokens.
 void testBonsaiOn16GbMacos15() {
   const DeviceCapabilities dense = device16NonSparse();
   ModelMemoryProfile requested = bonsai();
@@ -323,8 +326,8 @@ void testBonsaiOn16GbMacos15() {
                 budget.sharedPrefillBytes == 50'080'727ULL &&
                 budget.fixedRuntimeBytes == 9'635'255'383ULL &&
                 budget.dynamicBudgetBytes == 744'254'377ULL &&
-                budget.kvVirtualPages == 369 &&
-                plan.plan->maximumContextTokens() == 11'801,
+                budget.kvVirtualPages == 184 &&
+                plan.plan->maximumContextTokens() == 5'881,
             "16 GB macOS 15 Bonsai plan changed");
   }
   // Each larger rung fits only fewer pages: 512 rows hold 228, 256 rows 322.
@@ -342,6 +345,7 @@ void testBonsaiOn16GbMacos15() {
   // codebooks (-125,153,280 B) alone would not (487 pages, 15,577 tokens).
   const auto holds = [&](uint64_t decodeLess, uint64_t draftLess) {
     ModelMemoryProfile profile = bonsai();
+    profile.footprint.cachedStateBytes = 0;
     profile.footprint.sharedDecodeBytes -= decodeLess;
     profile.footprint.draftWeightsBytes -= draftLess;
     return evaluateAdaptiveMemoryPlan(dense, profile, 0, bonsaiPrefillBytes)
@@ -351,7 +355,8 @@ void testBonsaiOn16GbMacos15() {
           "the remaining 16K levers changed");
 }
 
-// With one decode lane the 16 GB macOS 15 ladder reaches the 16K goal. Rows
+// With one decode lane the 16 GB macOS 15 ladder keeps one snapshot slot and
+// ~11.8K tokens (16K would leave no room for cached states). Rows
 // outrank lanes, so each chunk size tries 4 lanes before 1, and the first rung
 // that reaches the goal wins.
 void testBonsaiOn16GbReaches16kWithOneLane() {
@@ -366,16 +371,16 @@ void testBonsaiOn16GbReaches16kWithOneLane() {
             << " tokens\n";
   require(budget.prefillRows == 128 && budget.maximumBatchWidth == 1 &&
               budget.sharedDecodeBytes == bonsaiDecodeBytes(1) &&
-              budget.kvVirtualPages == 554 &&
-              plan.plan->maximumContextTokens() == 17'721,
-          "16 GB macOS 15 Bonsai did not reach 16K with the chosen rung");
+              budget.kvVirtualPages == 369 &&
+              plan.plan->maximumContextTokens() == 11'801,
+          "16 GB macOS 15 Bonsai did not keep a snapshot slot with one lane");
   // Without the lane rungs the plan is the 4-lane one of the test above.
   const auto fourLanes =
       evaluateAdaptiveMemoryPlan(dense, bonsai(), 0, bonsaiPrefillBytes);
   require(fourLanes.plan &&
               fourLanes.plan->breakdown().maximumBatchWidth ==
                   model::ExecutionLimits::maximumBatchWidth &&
-              fourLanes.plan->maximumContextTokens() == 11'801,
+              fourLanes.plan->maximumContextTokens() == 5'881,
           "the lane rung changed the plan that does not ask for it");
 }
 

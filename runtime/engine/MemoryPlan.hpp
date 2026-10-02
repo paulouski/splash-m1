@@ -40,6 +40,8 @@ struct ModelMemoryFootprint final {
   uint64_t kvStagingBytes = 0;
   // Concurrent decode lanes sharedDecodeBytes was sized for.
   uint32_t decodeLanes = model::ExecutionLimits::maximumBatchWidth;
+  // One cached composite state (prefix-cache snapshot), zero when unknown.
+  uint64_t cachedStateBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -56,6 +58,9 @@ struct ModelMemoryProfile final {
   // Non-sparse pools in whole pages instead of sparse-mapping batches; set by
   // the adaptive low-memory profile only.
   bool exactKvPages = false;
+  // Dynamic bytes kept out of the KV pool for prefix-cache snapshots; set by
+  // the adaptive low-memory profile only.
+  uint64_t snapshotReserveBytes = 0;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
@@ -225,7 +230,8 @@ inline constexpr uint32_t kAdaptiveContextGoalTokens = 16384;
 // given, with one lane: a single desktop user keeps the faster prefill chunk
 // and only gives up concurrency (requests queue). It stops at the first rung
 // whose context reaches the request (or 16K), else keeps the last rung that
-// fits.
+// fits. Each rung first keeps one prefix-cache snapshot out of the KV pool
+// (multi-turn reuse beats raw context); only if none fits does it drop that.
 [[nodiscard]] EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
     const DeviceCapabilities &device, ModelMemoryProfile model,
     uint64_t maximumMemoryBytes,

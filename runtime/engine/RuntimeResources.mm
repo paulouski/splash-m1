@@ -394,6 +394,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         model::ExecutionLimits::prefillTokenBudget,
         kvStagingBytes,
     };
+    footprint.cachedStateBytes = package.stateLayout().cachedBytes();
 
     ModelMemoryProfile modelProfile{
         package.name(), package.maximumContextTokens(),

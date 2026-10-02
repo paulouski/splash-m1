@@ -346,9 +346,13 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
     geometryMaximum -= geometryMaximum % breakdown.kvSparseMappingBatchPages;
   }
   breakdown.maximumKvPages = static_cast<uint32_t>(geometryMaximum);
+  uint64_t reservedBytes = 0;
+  if (!checkedAdd(breakdown.activeStateCellBytes, model.snapshotReserveBytes,
+                  reservedBytes))
+    reservedBytes = std::numeric_limits<uint64_t>::max();
   const uint64_t availableForOneRequestKv =
-      breakdown.dynamicBudgetBytes > breakdown.activeStateCellBytes
-          ? breakdown.dynamicBudgetBytes - breakdown.activeStateCellBytes
+      breakdown.dynamicBudgetBytes > reservedBytes
+          ? breakdown.dynamicBudgetBytes - reservedBytes
           : 0;
   uint64_t clampedKvPages =
       std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
@@ -407,15 +411,12 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   return {std::move(plan), std::move(status)};
 }
 
-EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
+static EngineMemoryPlanResult adaptiveLadder(
     const DeviceCapabilities &device, ModelMemoryProfile model,
     uint64_t maximumMemoryBytes,
     const std::function<uint64_t(uint32_t)> &prefillBytesForRows,
-    const std::function<uint64_t(uint32_t)> &decodeBytesForLanes) {
-  EngineMemoryPlanResult result =
-      evaluateEngineMemoryPlan(device, model, maximumMemoryBytes);
-  if (result.plan || result.status.code != BudgetErrorCode::KvPoolDoesNotFit)
-    return result;
+    const std::function<uint64_t(uint32_t)> &decodeBytesForLanes,
+    EngineMemoryPlanResult result) {
   const uint32_t goal =
       std::min(model.requestedContextTokens ? model.requestedContextTokens
                                             : kAdaptiveContextGoalTokens,
@@ -467,6 +468,31 @@ EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
   result.status.message +=
       "; packed prefill chunks of " + tried + " rows were tried";
   return result;
+}
+
+EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
+    const DeviceCapabilities &device, ModelMemoryProfile model,
+    uint64_t maximumMemoryBytes,
+    const std::function<uint64_t(uint32_t)> &prefillBytesForRows,
+    const std::function<uint64_t(uint32_t)> &decodeBytesForLanes) {
+  EngineMemoryPlanResult result =
+      evaluateEngineMemoryPlan(device, model, maximumMemoryBytes);
+  if (result.plan || result.status.code != BudgetErrorCode::KvPoolDoesNotFit)
+    return result;
+  // Sparse pools grow KV on demand, so only dense pools lose context to snapshots.
+  if (model.footprint.cachedStateBytes && !device.supportsPlacementSparse) {
+    ModelMemoryProfile reserved = model;
+    // 1 MiB covers backend allocations the plan does not count.
+    reserved.snapshotReserveBytes = model.footprint.cachedStateBytes + kMiB;
+    EngineMemoryPlanResult withSnapshot =
+        adaptiveLadder(device, std::move(reserved), maximumMemoryBytes,
+                       prefillBytesForRows, decodeBytesForLanes, result);
+    if (withSnapshot.plan)
+      return withSnapshot;
+  }
+  return adaptiveLadder(device, std::move(model), maximumMemoryBytes,
+                        prefillBytesForRows, decodeBytesForLanes,
+                        std::move(result));
 }
 
 EngineMemoryPlan requireEngineMemoryPlan(const DeviceCapabilities &device,
