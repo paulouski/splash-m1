@@ -135,6 +135,16 @@ void skipValue(Reader &reader, uint32_t type, unsigned depth) {
   }
 }
 
+// Sets tensor.bytes of its type and shape.
+void sizeTensor(GgufTensor &tensor) {
+  const GgmlTypeTraits *traits = ggmlTypeTraits(tensor.type);
+  if (!traits) throw GgufError("unknown ggml type " + std::to_string(tensor.type) + " for " + tensor.name);
+  if (tensor.columns() % traits->blockElements)
+    throw GgufError("tensor row is not block aligned: " + tensor.name);
+  tensor.bytes = checkedMultiply(checkedMultiply(tensor.rows(), tensor.columns() / traits->blockElements),
+                                 traits->blockBytes);
+}
+
 } // namespace
 
 std::string ggmlTypeName(uint32_t type) {
@@ -229,12 +239,7 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     (void)tensor.elements(); // Reject overflowing shapes even when quantized bytes would fit.
     tensor.type = reader.scalar<uint32_t>();
     tensor.offset = reader.scalar<uint64_t>();
-    const GgmlTypeTraits *traits = ggmlTypeTraits(tensor.type);
-    if (!traits) throw GgufError("unknown ggml type " + std::to_string(tensor.type) + " for " + tensor.name);
-    if (tensor.columns() % traits->blockElements)
-      throw GgufError("tensor row is not block aligned: " + tensor.name);
-    tensor.bytes = checkedMultiply(checkedMultiply(tensor.rows(), tensor.columns() / traits->blockElements),
-                                   traits->blockBytes);
+    sizeTensor(tensor);
     if (!index_.emplace(tensor.name, tensors_.size()).second)
       throw GgufError("duplicate GGUF tensor: " + tensor.name);
     tensors_.push_back(std::move(tensor));
@@ -248,6 +253,21 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
+  }
+  rotation_ = readRotation();
+}
+
+GgufFile::GgufFile(WeightSource &source, GgufMemoryHeader header)
+    : source_(source), unsigned_(std::move(header.unsignedValues)), strings_(std::move(header.stringValues)),
+      floats_(std::move(header.floatValues)), arrays_(std::move(header.arrays)), names_(std::move(header.names)),
+      valueRowsGrouped_(header.valueRowsGrouped) {
+  architecture_ = stringValue("general.architecture").value_or("");
+  tensors_ = std::move(header.tensors);
+  for (GgufTensor &tensor : tensors_) {
+    (void)tensor.elements();
+    sizeTensor(tensor);
+    if (!index_.emplace(tensor.name, &tensor - tensors_.data()).second)
+      throw GgufError("duplicate GGUF tensor: " + tensor.name);
   }
   rotation_ = readRotation();
 }

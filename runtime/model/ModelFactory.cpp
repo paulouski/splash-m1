@@ -89,6 +89,11 @@ ModelPackage loadPackage(metal::MetalBackend &backend,
                                   admitConversion);
           return read(loader, loader.weights(), [&] { loader.prepare(); });
         }
+        case TargetSource::PrismMlx: {
+          GgufTargetLoader loader(backend, PrismMlxDirectory{directory}, ggufTargetGeometry(layout),
+                                  admitConversion);
+          return read(loader, loader.weights(), [&] { loader.prepare(); });
+        }
         }
         throw std::invalid_argument("unknown target source");
       },
@@ -167,6 +172,17 @@ uint64_t preparedModelWeightBytes(const ModelPaths &paths, const ModelDescriptor
     for (const gguf::Image &image :
          std::visit([&](const auto &layout) { return gguf::planImages(file, ggufTargetGeometry(layout)); },
                     descriptor.target))
+      bytes += image.bytes;
+  } else if (descriptor.targetSource == TargetSource::PrismMlx) {
+    // The planned images alone: their identity would hash the whole checkpoint.
+    WeightSource source(prismMlxFile(paths.target));
+    for (const gguf::Image &image : std::visit(
+             [&](const auto &layout) {
+               const gguf::TargetGeometry geometry = ggufTargetGeometry(layout);
+               PrismMlxView view = bindPrismMlx(source, paths.target, geometry);
+               return gguf::planImages(GgufFile(source, std::move(view.header)), geometry);
+             },
+             descriptor.target))
       bytes += image.bytes;
   } else if (descriptor.targetSource == TargetSource::Mlx) {
     // The checkpoint's real per-tensor bits (a Q5 override adds 8 B per 64

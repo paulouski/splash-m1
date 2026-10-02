@@ -36,6 +36,7 @@ INPUTS = {
         "runtime/metal/abi/QuantFormat.h",
         "runtime/metal/kernels/shared/gguf_repack.metal",
     ),
+    "PRISM": ("runtime/model/PrismMlx.mm",),
     "VISION": (
         "runtime/model/VisionPreparation.cpp",
         "runtime/model/WeightLayout.hpp",

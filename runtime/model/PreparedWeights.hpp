@@ -60,6 +60,9 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept;
   void setDataOffset(uint64_t offset);
   [[nodiscard]] uint64_t dataOffset() const noexcept;
+  // Serves readData from `read` instead of the file: the tensor data of a
+  // source whose bytes are synthesized from another format's.
+  void setReader(std::function<void(uint64_t offset, std::span<uint8_t> bytes)> read);
   // Bytes [offset, offset + size) of the tensor data.
   void readData(uint64_t offset, std::span<uint8_t> bytes) const;
   // SHA-256 of the tensor data: editing only the metadata keeps the identity

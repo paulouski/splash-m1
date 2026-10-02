@@ -143,6 +143,7 @@ public:
 
   // Value heads of headRows rows from row `from` on, in grouped order.
   RowOrder grouped(uint64_t from, uint32_t headRows) const {
+    if (file_.valueRowsGrouped()) return {};
     return {from, headRows, geometry_.gdnKeyHeads, geometry_.gdnValueHeads / geometry_.gdnKeyHeads};
   }
 

@@ -431,6 +431,7 @@ struct WeightSource::Impl {
   struct stat state{};
   PreparationCheck check;
   uint64_t dataOffset = 0;
+  std::function<void(uint64_t, std::span<uint8_t>)> reader;
   // The tensor data's digest, once hashed.
   std::optional<std::string> digest;
   Impl(const std::filesystem::path &path, PreparationCheck check)
@@ -450,7 +451,9 @@ void WeightSource::setDataOffset(uint64_t offset) {
   impl_->dataOffset = offset;
 }
 uint64_t WeightSource::dataOffset() const noexcept { return impl_->dataOffset; }
+void WeightSource::setReader(std::function<void(uint64_t, std::span<uint8_t>)> read) { impl_->reader = std::move(read); }
 void WeightSource::readData(uint64_t offset, std::span<uint8_t> bytes) const {
+  if (impl_->reader) return impl_->reader(offset, bytes);
   if (offset > std::numeric_limits<uint64_t>::max() - impl_->dataOffset)
     throw std::overflow_error("weight read offset overflow");
   readWeightBytes(impl_->file, impl_->dataOffset + offset, bytes);

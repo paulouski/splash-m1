@@ -24,11 +24,28 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::file
   const GgufFile file(source_);
   source_.checkUnchanged();
   // Validates the whole source before its tensor data is hashed.
+  plan(file, geometry, {});
+}
+
+GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const PrismMlxDirectory &directory,
+                                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion)
+    : backend_(backend), source_(prismMlxFile(directory.path), [&backend] { backend.checkOperation(); }),
+      files_([&backend] { backend.checkOperation(); }, std::move(admitConversion),
+             [this] { source_.checkUnchanged(); }) {
+  PrismMlxView view = bindPrismMlx(source_, directory.path, geometry);
+  const GgufFile file(source_, std::move(view.header));
+  source_.checkUnchanged();
+  plan(file, geometry, view.identity);
+}
+
+void GgufTargetLoader::plan(const GgufFile &file, const gguf::TargetGeometry &geometry,
+                            std::string_view prismIdentity) {
   images_ = gguf::planImages(file, geometry);
   rotation_ = file.rotation();
   for (const gguf::Image &image : images_) {
-    backend.checkOperation();
+    backend_.checkOperation();
     weights_.push_back(ggufImageWeight(source_, image));
+    if (!prismIdentity.empty()) weights_.back().key = prismMlxKey(weights_.back().key, prismIdentity);
   }
 }
 

@@ -88,10 +88,27 @@ struct GgufRotation {
   std::map<uint32_t, std::vector<int8_t>> signs;
 };
 
+// The metadata and tensor table of a source that presents itself as a GGUF
+// without being one (model/PrismMlx.hpp); tensors carry name, type, dims and
+// offset, and the values are those a GGUF header holds.
+struct GgufMemoryHeader {
+  std::map<std::string, uint64_t, std::less<>> unsignedValues;
+  std::map<std::string, std::string, std::less<>> stringValues;
+  std::map<std::string, double, std::less<>> floatValues;
+  std::map<std::string, std::vector<double>, std::less<>> arrays;
+  std::map<std::string, std::vector<std::string>, std::less<>> names;
+  std::vector<GgufTensor> tensors;
+  // The GDN value-head rows of the tensors are already in splash's grouped
+  // order, not llama.cpp's tiled one.
+  bool valueRowsGrouped = false;
+};
+
 class GgufFile final {
 public:
   // Parses the header of source and sets where its tensor data starts.
   explicit GgufFile(WeightSource &source);
+  // The header held in memory; source serves the tensors' bytes.
+  GgufFile(WeightSource &source, GgufMemoryHeader header);
 
   [[nodiscard]] const WeightSource &source() const noexcept { return source_; }
   [[nodiscard]] const std::string &architecture() const noexcept { return architecture_; }
@@ -102,6 +119,7 @@ public:
   [[nodiscard]] std::optional<std::span<const double>> numericArray(std::string_view key) const;
   // The rotation the metadata declares, if any.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
+  [[nodiscard]] bool valueRowsGrouped() const noexcept { return valueRowsGrouped_; }
 
   [[nodiscard]] const std::vector<GgufTensor> &tensors() const noexcept { return tensors_; }
   [[nodiscard]] const GgufTensor *find(std::string_view name) const noexcept;
@@ -117,6 +135,7 @@ private:
   // The string arrays of the rotation keys, the only ones kept.
   std::map<std::string, std::vector<std::string>, std::less<>> names_;
   std::optional<GgufRotation> rotation_;
+  bool valueRowsGrouped_ = false;
 
   [[nodiscard]] std::optional<GgufRotation> readRotation() const;
   std::vector<GgufTensor> tensors_;

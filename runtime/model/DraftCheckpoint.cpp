@@ -3,6 +3,7 @@
 #include "model/DFlashDraft.hpp"
 
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -59,23 +60,23 @@ Image layerImage(const DFlashDraftLayout &layout, uint32_t layer) {
   return result;
 }
 
-Image modelImage(const DFlashDraftLayout &layout) {
+Image modelImage(const DFlashDraftLayout &layout, std::string_view codebookSuffix) {
   Image result = affine::image("model.bin", kDFlashLayerMagic, layout.layers, 1);
   const std::string selector = "candidate_selector.";
   quantized(result, {{"fc", layout.hiddenSize}}, layout.hiddenSize, layout.targetHiddenSize);
   copy(result, "hidden_norm.weight", {layout.hiddenSize});
   copy(result, "norm.weight", {layout.hiddenSize});
   quantized(result, {{selector + "hidden_projection", layout.selectorRank}}, layout.selectorRank, layout.hiddenSize);
-  copy(result, selector + "predecessor_codebook", {layout.vocabularySize, layout.selectorRank});
-  copy(result, selector + "successor_codebook", {layout.vocabularySize, layout.selectorRank});
+  copy(result, selector + "predecessor_codebook" + std::string(codebookSuffix), {layout.vocabularySize, layout.selectorRank});
+  copy(result, selector + "successor_codebook" + std::string(codebookSuffix), {layout.vocabularySize, layout.selectorRank});
   return result;
 }
 
 // Every file of a layout: the layers, then model.bin.
-std::vector<Image> draftImages(const DFlashDraftLayout &layout) {
+std::vector<Image> draftImages(const DFlashDraftLayout &layout, std::string_view codebookSuffix = {}) {
   std::vector<Image> result;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) result.push_back(layerImage(layout, layer));
-  result.push_back(modelImage(layout));
+  result.push_back(modelImage(layout, codebookSuffix));
   return result;
 }
 
@@ -92,7 +93,10 @@ struct DraftCheckpointLoader::Impl {
       : backend(backend), source(directory, [&backend] { backend.checkOperation(); }),
         files([&backend] { backend.checkOperation(); }, std::move(admitConversion),
               [this] { source.checkUnchanged(); }) {
-    images = draftImages(layout);
+    // A Prism ML draft names its codebooks like its other tensors, with a ".weight" suffix.
+    const bool suffixed = !source.find("candidate_selector.predecessor_codebook") &&
+                          source.find("candidate_selector.predecessor_codebook.weight");
+    images = draftImages(layout, suffixed ? ".weight" : "");
     for (Image &image : images) {
       backend.checkOperation();
       affine::bind(image, source);

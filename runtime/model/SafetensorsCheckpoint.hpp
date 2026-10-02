@@ -3,7 +3,9 @@
 #include "model/PreparedWeights.hpp"
 
 #include <memory>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace splash::model {
 
@@ -18,6 +20,7 @@ public:
   ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
+  [[nodiscard]] std::vector<std::string> names() const;
   void requireQuantization(std::string_view projection, uint32_t bits) const;
   // The bits of an affine projection's per-tensor quantization entry, or the
   // checkpoint's default entry when it has none: the group_size/mode/dtype

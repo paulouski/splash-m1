@@ -16,10 +16,10 @@ namespace splash::model {
 using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
-// an MLX or GGUF checkpoint, and the draft's DFlash2 checkpoint, prepared
+// an MLX, Prism Hadamard MLX or GGUF checkpoint, and the draft's DFlash2 checkpoint, prepared
 // into cached files when it loads. The vision tower is None for a model
 // installed with --language-only.
-enum class TargetSource : uint8_t { Packed, Mlx, Gguf };
+enum class TargetSource : uint8_t { Packed, Mlx, Gguf, PrismMlx };
 enum class DraftSource : uint8_t { Packed, Checkpoint };
 enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 

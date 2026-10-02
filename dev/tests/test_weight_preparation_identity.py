@@ -20,6 +20,7 @@ REVIEWED = {
     "runtime/model/AffinePreparation.hpp": "the affine plan, which keys record whole",
     "runtime/model/SafetensorsCheckpoint.hpp": "the parser; preparation binds and identifies its tensors",
     "runtime/model/GgufPreparation.hpp": "the executor's declarations",
+    "runtime/model/PrismMlx.hpp": "the binder's declarations",
     "runtime/model/VisionPreparation.hpp": "the vision plan, which keys record whole",
     "runtime/model/WeightStore.hpp": "the reader; preparation uses its error type",
     "runtime/metal/MetalBackend.hpp": "the backend the repack is dispatched through",
@@ -136,7 +137,7 @@ class PreparationIdentityTest(unittest.TestCase):
                 )
 
     def test_every_input_says_which_models_editing_it_prepares_again(self):
-        names = {"AFFINE": "affine", "GGUF": "GGUF", "VISION": "vision"}
+        names = {"AFFINE": "affine", "GGUF": "GGUF", "PRISM": "Prism MLX", "VISION": "vision"}
         for name in {path for paths in INPUTS.values() for path in paths}:
             with self.subTest(input=name):
                 kinds = " and ".join(

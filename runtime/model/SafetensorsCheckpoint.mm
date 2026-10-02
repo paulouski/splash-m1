@@ -160,6 +160,11 @@ const SourceTensor &SafetensorsCheckpoint::require(std::string_view name) const 
   if (!tensor) throw WeightStoreError("missing source tensor: " + std::string(name));
   return *tensor;
 }
+std::vector<std::string> SafetensorsCheckpoint::names() const {
+  std::vector<std::string> names;
+  for (const auto &[name, tensor] : impl_->tensors) names.push_back(name);
+  return names;
+}
 void SafetensorsCheckpoint::requireQuantization(std::string_view projection, uint32_t bits) const {
   @autoreleasepool {
     NSString *key = [[NSString alloc] initWithBytes:projection.data() length:projection.size() encoding:NSUTF8StringEncoding];

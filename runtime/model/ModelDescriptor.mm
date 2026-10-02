@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "QwenVision.hpp"
+#include "PrismMlx.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -358,8 +359,9 @@ NSDictionary *textConfigOf(const std::filesystem::path &directory) {
   return [text isKindOfClass:[NSDictionary class]] ? text : config;
 }
 
-// A local target directory's own weight format: a GGUF file, else safetensors
-// shards. No manifest names it; the files present do.
+// A local target directory's own weight format: a GGUF file, else a Prism
+// Hadamard checkpoint, else safetensors shards. No manifest names it; the
+// files present do.
 TargetSource detectTargetFormat(const std::filesystem::path &directory) {
   bool sawSafetensors = false;
   for (const auto &entry : std::filesystem::directory_iterator(directory)) {
@@ -367,6 +369,10 @@ TargetSource detectTargetFormat(const std::filesystem::path &directory) {
     const auto extension = entry.path().extension();
     if (extension == ".gguf") return TargetSource::Gguf;
     if (extension == ".safetensors") sawSafetensors = true;
+  }
+  if (sawSafetensors && isPrismMlx(directory)) {
+    requirePrismMlxConfig(directory);
+    return TargetSource::PrismMlx;
   }
   if (sawSafetensors) return TargetSource::Mlx;
   throw std::invalid_argument("target directory contains neither safetensors nor gguf weights");
@@ -392,12 +398,17 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
   const auto target = requireString(record, @"target_format", "target format");
   if (target == "mlx-affine") result.targetSource = TargetSource::Mlx;
   else if (target == "gguf") result.targetSource = TargetSource::Gguf;
+  else if (target == "mlx-prism") result.targetSource = TargetSource::PrismMlx;
   else throw std::invalid_argument("unsupported target source format: " + target);
 
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   validateSourceDraft(draft, result);
 
   const auto vision = requireString(record, @"vision_format", "vision format");
+  if (result.targetSource == TargetSource::PrismMlx) {
+    if (vision != "none") throw std::invalid_argument("a Prism Hadamard checkpoint serves text only");
+    requirePrismMlxConfig(root / "target");
+  }
   if (vision == "none") result.visionSource = VisionSource::None;
   else {
     if (vision == "safetensors") result.visionSource = VisionSource::Mlx;
@@ -447,7 +458,8 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
 }
 
 bool ModelDescriptor::valid() const noexcept {
-  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Mlx && targetSource != TargetSource::Gguf) ||
+  if ((targetSource != TargetSource::Packed && targetSource != TargetSource::Mlx && targetSource != TargetSource::Gguf &&
+       targetSource != TargetSource::PrismMlx) ||
       name.empty() || !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       capabilities.maximumBatchWidth != ExecutionLimits::maximumBatchWidth ||

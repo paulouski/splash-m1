@@ -56,6 +56,8 @@ PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 # __METAL_VERSION__ >= 400; DraftAttention.cpp dispatches the register
 # alternative draft_attention_bf16_split_sgf (decode/draft_sgf.metal) on
 # Apple7/8 instead.
+# shared/gguf_float.metal likewise keeps its simdgroup kernels and guards the
+# MPP-only gguf_float_na_* kernels.
 MACOS15 ?= 1
 MACOS15_EXCLUDED_KERNELS := \
 	runtime/metal/kernels/prefill/attention_q8.metal \
@@ -64,7 +66,6 @@ MACOS15_EXCLUDED_KERNELS := \
 	runtime/metal/kernels/decode/attention_q8.metal \
 	runtime/metal/kernels/decode/linear_q4.metal \
 	runtime/metal/kernels/decode/linear_q4_split.metal \
-	runtime/metal/kernels/shared/gguf_float.metal \
 	runtime/metal/kernels/shared/gguf_linear.metal \
 	runtime/metal/kernels/shared/moe.metal \
 	runtime/metal/kernels/shared/moe_gguf.metal \
@@ -315,6 +316,7 @@ ENGINE_CPP_SOURCES := \
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \
 	runtime/model/ModelDescriptor.mm \
+	runtime/model/PrismMlx.mm \
 	runtime/model/Runtime.mm \
 	runtime/model/RuntimeArenas.mm \
 	runtime/ops/Vision.mm \
