@@ -118,7 +118,19 @@ struct LinearScratch final {
   // The bf16 input rows a rotated projection's quantized segments read
   // (ProjectionShape::rotated): rotatedBytes() of its plan.
   metal::MetalBuffer rotated{};
+  // The staged row and fp32 partials of the one-row PQ2_0 GEMV (gemvStageBytes, gemvPartialBytes). Set only on the
+  // scratch of a single-lane step that decodes row 0 alone: its eligible projections run the GEMV, the rest their tiles.
+  metal::MetalBuffer gemvStaged{};
+  metal::MetalBuffer gemvPartials{};
 };
+// K partitions of the one-row GEMV of an n x k PQ2_0 matrix (0: k does not divide into 128-input groups).
+[[nodiscard]] uint32_t gemvSplits(uint32_t n, uint32_t k) noexcept;
+// Bytes of LinearScratch::gemvStaged for inputs of k columns, and of gemvPartials for an n x k matrix (a gate/up pair
+// takes two sets).
+[[nodiscard]] constexpr uint64_t gemvStageBytes(uint32_t k) noexcept { return uint64_t{k} * 4 + k / 32; }
+[[nodiscard]] inline uint64_t gemvPartialBytes(uint32_t n, uint32_t k, bool pair) noexcept {
+  return uint64_t{gemvSplits(n, k)} * n * sizeof(float) * (pair ? 2 : 1);
+}
 struct LinearScratchSize final {
   uint64_t input = 0, sums = 0, partials = 0, counters = 0, rotated = 0;
   [[nodiscard]] uint64_t bytes() const noexcept { return input + sums + partials + counters + rotated; }
@@ -342,6 +354,8 @@ private:
                        const Projection *gate) const;
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
+  void addGgufGemv(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
+                   const LinearPlan &plan, const Projection *gate) const;
   uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
   std::vector<LinearChoice> choices_;

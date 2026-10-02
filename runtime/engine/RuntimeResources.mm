@@ -391,6 +391,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         modelMemoryPlan.sharedDecodePlannedAllocatedBytes,
         modelMemoryPlan.pipelineReserveBytes,
         modelMemoryPlan.runtimeOverheadReserveBytes,
+        model::ExecutionLimits::prefillTokenBudget,
         kvStagingBytes,
     };
 
@@ -398,14 +399,36 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
         package.name(), package.maximumContextTokens(),
         config.requestedContextTokens,
         package.targetKvLayout(config.kvFormat), footprint};
-    EngineMemoryPlanResult planResult =
-        evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+    EngineMemoryPlanResult planResult = evaluateAdaptiveMemoryPlan(
+        device, modelProfile, config.maximumMemoryBytes, [&](uint32_t rows) {
+          return model::plannedRuntimeMemory(device, package, operators,
+                                             config.kvFormat, rows)
+              .sharedPrefillPlannedAllocatedBytes;
+        },
+        [&](uint32_t lanes) {
+          return model::plannedRuntimeMemory(
+                     device, package, operators, config.kvFormat,
+                     model::ExecutionLimits::prefillTokenBudget, lanes)
+              .sharedDecodePlannedAllocatedBytes;
+        });
     if (!planResult.plan) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning, planResult.status.message,
           planResult.status.toStatusJson(), planResult.status.describe());
     }
     EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
+    const EngineMemoryBreakdown &chosen = memoryPlan.breakdown();
+    if (chosen.prefillRows != model::ExecutionLimits::prefillTokenBudget ||
+        chosen.maximumBatchWidth != model::ExecutionLimits::maximumBatchWidth) {
+      // The bootstrap arena reservation must match the rung the plan chose.
+      modelMemoryPlan = model::plannedRuntimeMemory(
+          device, package, operators, config.kvFormat, chosen.prefillRows,
+          chosen.maximumBatchWidth);
+      logKernelStartup("Memory budget too small for the default configuration; "
+                       "packed prefill chunks reduced to ",
+                       chosen.prefillRows, " rows and decoding limited to ",
+                       chosen.maximumBatchWidth, " concurrent lane(s).");
+    }
     return memoryPlan;
   };
   // Establish the serving baseline and the one real memory governor before
@@ -567,6 +590,8 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       budget.pipelineReserveBytes,
       budget.runtimeOverheadReserveBytes,
       kvTier_.get(),
+      budget.prefillRows,
+      budget.maximumBatchWidth,
   };
 }
 

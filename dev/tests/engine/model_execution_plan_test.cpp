@@ -245,6 +245,62 @@ void checkGdnWidths() {
 
 } // namespace
 
+// The packed-prefill row cap sizes only the prefill arena; the default cap is
+// the plan before the memory-adaptive profile existed (pinned bytes).
+void checkPrefillRowCap(const model::ModelPackage &package) {
+  for (const auto [family, decode] : {std::pair{7U, 262'662'272ULL}, std::pair{9U, 260'301'824ULL}}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    ops::ExecutionPlans plans(device);
+    const auto full = model::plannedRuntimeMemory(device, package, plans);
+    const auto half = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 1024);
+    const auto quarter = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 512);
+    const auto eighth = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 256);
+    const auto sixteenth = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 128);
+    require(full.sharedPrefillPlannedAllocatedBytes == 705'888'256ULL &&
+                full.sharedDecodePlannedAllocatedBytes == decode &&
+                full.activeStateCellPlannedAllocatedBytes == 350'224'384ULL,
+            "the default prefill cap changed the planned arenas");
+    require(half.sharedPrefillPlannedAllocatedBytes * 100 <
+                full.sharedPrefillPlannedAllocatedBytes * 51 &&
+                quarter.sharedPrefillPlannedAllocatedBytes * 100 <
+                    full.sharedPrefillPlannedAllocatedBytes * 26 &&
+                eighth.sharedPrefillPlannedAllocatedBytes * 100 <
+                    full.sharedPrefillPlannedAllocatedBytes * 14 &&
+                sixteenth.sharedPrefillPlannedAllocatedBytes * 100 <
+                    full.sharedPrefillPlannedAllocatedBytes * 8 &&
+                sixteenth.sharedDecodePlannedAllocatedBytes == decode &&
+                half.sharedDecodePlannedAllocatedBytes == decode &&
+                quarter.activeStateCellPlannedAllocatedBytes ==
+                    full.activeStateCellPlannedAllocatedBytes,
+            "a smaller prefill cap did not shrink only the prefill arena");
+  }
+}
+
+// One decode lane shrinks only the shared decode arena (the replay tensors'
+// layer stride follows the arena's lanes); four lanes are the pinned default.
+void checkDecodeLanes(const model::ModelPackage &package) {
+  for (const auto [family, one] : {std::pair{7U, 66'042'400ULL}, std::pair{9U, 65'452'288ULL}}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    ops::ExecutionPlans plans(device);
+    const auto full = model::plannedRuntimeMemory(device, package, plans);
+    const auto single = model::plannedRuntimeMemory(
+        device, package, plans, kv::Format::Int8,
+        model::ExecutionLimits::prefillTokenBudget, 1);
+    require(single.sharedDecodePlannedAllocatedBytes == one &&
+                single.sharedPrefillPlannedAllocatedBytes ==
+                    full.sharedPrefillPlannedAllocatedBytes &&
+                single.activeStateCellPlannedAllocatedBytes ==
+                    full.activeStateCellPlannedAllocatedBytes,
+            "one decode lane did not shrink only the decode arena");
+    const auto geometry = model::RuntimeGeometry::from(package);
+    require(model::decodeArenaLanes(geometry, plans, 1) == 1 &&
+                model::decodeArenaLanes(geometry, plans, 4) == 4,
+            "the decode arena lanes differ from the lane cap");
+  }
+}
+
 int main() {
   try {
     checkUnsizedProjection();
@@ -252,6 +308,8 @@ int main() {
     checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
+    checkPrefillRowCap(dense);
+    checkDecodeLanes(dense);
     for (uint32_t family : {9U, 10U}) {
       checkPackage(dense, family);
       checkPackage(sparse, family);

@@ -29,6 +29,10 @@ struct EngineConfig final {
   // Keep isolated prefill commands short enough that macOS does not abort
   // them for starving the display; false sends full-budget commands.
   bool boundPrefillCommands = true;
+  // Largest packed prefill command the model's arena holds.
+  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
+  // Requests decoding at once; the rest wait for a state cell.
+  uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
   // Host growth admission, supplied by the runtime governor. Queried only on
   // failed allocation and, after a suspension the pause caused, while
   // resident lanes drain; never on the ordinary decode path.

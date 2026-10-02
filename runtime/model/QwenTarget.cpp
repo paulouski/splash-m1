@@ -2,6 +2,7 @@
 
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
+#include "metal/abi/Gguf.h"
 #include "model/WeightStore.hpp"
 #include "ops/DraftAttention.hpp"
 #include "ops/Embedding.hpp"
@@ -169,6 +170,23 @@ uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
   for (const auto &shape : geometry_.decodeProjections)
     storageRows = std::max(storageRows, operators_.linear().decodeStorageRows(rows, shape));
   return storageRows / ExecutionLimits::targetVerifyRows;
+}
+
+void QwenTarget::requireSingleRowDecode() const {
+  const auto check = [](const ops::Projection &projection) {
+    if (projection.layout() != ops::WeightLayout::Block32)
+      throw std::invalid_argument("single-row decode needs a PQ2_0 GGUF target, not an affine one");
+    for (const ops::QuantizedSegment &s : projection.blocks().segments)
+      if (!s.isFloat() && s.formatId != GGUF_FMT_PQ20)
+        throw std::invalid_argument(std::string("single-row decode needs a PQ2_0 GGUF target, found ") + s.name());
+  };
+  const auto *const *dense = std::get_if<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *>(&weights_);
+  if (!dense) throw std::invalid_argument("single-row decode does not support MoE targets");
+  for (const Qwen3_8LayerWeights &layer : (*dense)->layers) {
+    std::visit([&](const auto &mixer) { check(mixer.inputProjection); check(mixer.outputProjection); }, layer.mixer);
+    for (const ops::Projection *p : {&layer.gateProjection, &layer.upProjection, &layer.downProjection}) check(*p);
+  }
+  check(weightsBase_.logitsProjection);
 }
 
 namespace {
@@ -538,7 +556,8 @@ void QwenTarget::addStateCommit(metal::CommandGraph &graph,
       geometry_.gdnShape(), geometry_.stateLayout.layers, lanes,
       {geometry_.stateLayout.convolutionLayerBytes(),
        geometry_.stateLayout.recurrentLayerBytes(),
-       geometry_.stateLayout.convolutionBytes()});
+       geometry_.stateLayout.convolutionBytes()},
+      buffers.layerLanes);
 }
 
 } // namespace splash::model

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
@@ -109,7 +110,8 @@ public:
                                  bool qkOnce = false);
   static void addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                         GdnShape shape, uint32_t layers, uint32_t lanes,
-                        GdnStateStrides state);
+                        GdnStateStrides state,
+                        uint32_t layerLanes = SPLASH_MAXIMUM_BATCH_WIDTH);
 };
 
 } // namespace splash::ops

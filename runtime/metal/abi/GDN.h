@@ -58,7 +58,7 @@ struct GDNBatchCommitParams {
   uint32_t mixed_stride;
   uint32_t decay_stride;
   uint32_t beta_stride;
-  uint32_t reserved0;
+  uint32_t layer_lanes;
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;
   uint64_t convolution_state_bytes;

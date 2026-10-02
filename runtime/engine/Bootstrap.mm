@@ -176,16 +176,16 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   model::WarmupStepResult maximumPrefill =
       run(RuntimeBootstrapStage::MaximumPrefill, report.warmup.maximumPrefill,
           [&] {
-            return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
+            return modelRuntime.warmupPrefill(memoryPlan.breakdown().prefillRows);
           });
-  nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
+  nativeLoop.observePrefill(memoryPlan.breakdown().prefillRows,
                            maximumPrefill.wallSeconds * 1000.0);
   report.warmup.maximumPrefillDetail = maximumPrefill.detail;
   const auto &budget = memoryPlan.breakdown();
-  // Startup exercises only widths that fit this budget. This is not a
-  // serving concurrency limit: the engine still admits lanes dynamically.
+  // Startup exercises only widths that fit this budget and the lane cap the
+  // decode arena was sized for; the engine admits lanes dynamically up to it.
   const uint32_t affordableWidth = static_cast<uint32_t>(std::min<uint64_t>(
-      model::ExecutionLimits::maximumBatchWidth,
+      budget.maximumBatchWidth,
       (budget.dynamicBudgetBytes - budget.kvExtentBytes) /
           budget.activeStateCellBytes));
   for (uint32_t width = 1;
@@ -297,6 +297,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   config.protocolLimits.maxPromptTokens = config.nativeLoop.engine.maxContext;
   config.protocolLimits.maxLogicalOutputTokens =
       config.nativeLoop.engine.maxContext;
+  config.nativeLoop.engine.prefillRows =
+      resources->memoryPlan().breakdown().prefillRows;
+  config.nativeLoop.engine.maximumLanes =
+      resources->memoryPlan().breakdown().maximumBatchWidth;
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
   // Images fit the vision scratch; a model without vision admits none.

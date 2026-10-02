@@ -37,7 +37,7 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     if (!layout_.valid()) {
         throw std::invalid_argument("KV page storage layout is invalid");
     }
-    if (!pageCount || pageCount % sparseMappingBatchPages()) {
+    if (!pageCount || (sparse_ && pageCount % sparseMappingBatchPages())) {
         throw std::invalid_argument(
             "KV page pool is not sparse-mapping aligned");
     }
@@ -102,7 +102,7 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     for (uint32_t first = 0; first < pageCount_;
          first += backingExtentPages()) {
         uint32_t count = std::min(backingExtentPages(), pageCount_ - first);
-        if (count % sparseMappingBatchPages()) {
+        if (sparse_ && count % sparseMappingBatchPages()) {
             throw std::logic_error("KV backing extent is not tile aligned");
         }
         extents_.push_back(Extent{first, count, std::nullopt});

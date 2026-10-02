@@ -127,14 +127,14 @@ T *contents(const MetalBuffer &buffer, std::string_view label) {
 }
 
 void validatePlan(const BatchPlan &plan, std::span<const ModelBatchItem> items,
-                  WorkKind expected) {
-  if (plan.kind != expected || plan.empty() || plan.width() > kLaneCount ||
+                  WorkKind expected, uint32_t decodeLanes) {
+  if (plan.kind != expected || plan.empty() || plan.width() > decodeLanes ||
       items.size() != plan.items.size()) {
     throw std::invalid_argument("model runtime received an invalid batch plan");
   }
   for (size_t index = 0; index < items.size(); ++index) {
     if (items[index].requestId != plan.items[index].requestId ||
-        items[index].stateSlot >= kLaneCount ||
+        items[index].stateSlot >= decodeLanes ||
         (expected == WorkKind::Prefill &&
          (!plan.items[index].tokenCount ||
           plan.items[index].tokenCount != items[index].tokenCount ||
@@ -160,8 +160,8 @@ QwenStateStorage &requireQwenStateStorage(StateStorage &storage) {
 // the governor is asked only for what the pool lacks.
 template <class Activate>
 StateAdmission admitIdleSlot(const QwenStateStorage &states,
-                             Activate activate) {
-  for (uint32_t slot = 0; slot < kLaneCount; ++slot) {
+                             uint32_t decodeLanes, Activate activate) {
+  for (uint32_t slot = 0; slot < decodeLanes; ++slot) {
     if (states.metadata(slot).assigned)
       continue;
     const metal::AllocationResult admission = activate(slot);
@@ -246,6 +246,8 @@ struct Runtime::Impl {
     bool draftForMask = false;
     bool draftComputed = false;
     bool lookup = false;
+    // Row 0 alone is decoded, through the one-row GEMV (SPLASH_DECODE_M1).
+    bool singleRow = false;
   };
 
   struct PageTableBinding final {
@@ -284,6 +286,8 @@ struct Runtime::Impl {
   uint32_t maximumImagePatches = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint32_t prefillRows = kPrefillRows;
+  uint32_t decodeLanes = kLaneCount;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
@@ -294,6 +298,10 @@ struct Runtime::Impl {
   // (runtime/main.mm).
   const engine::DecodePolicyConfig decodeLadderConfig =
       engine::decodePolicyConfigFromEnvironment();
+  // SPLASH_DECODE_M1: prompt-lookup misses decode row 0 alone; the GEMV scratch exists only then.
+  const bool decodeSingleRow = engine::decodeSingleRowFromEnvironment();
+  MetalBuffer gemvStaged;
+  MetalBuffer gemvPartials;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         admitAllocation(std::move(value.admitAllocation)),
@@ -306,6 +314,8 @@ struct Runtime::Impl {
         maximumImagePatches(value.maximumImagePatches),
         pipelineReserveBytes(value.pipelineReserveBytes),
         runtimeOverheadReserveBytes(value.runtimeOverheadReserveBytes),
+        prefillRows(value.prefillRows),
+        decodeLanes(value.decodeLanes),
         sampling(value.backend, geometry.target.vocabularySize, kDecodeRows),
         targetModel(std::visit(
                         [&](const auto &weights) {
@@ -322,8 +332,21 @@ struct Runtime::Impl {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded package");
     }
-    prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
-    decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
+    if (decodeSingleRow) {
+      targetModel.requireSingleRowDecode();
+      uint64_t staged = 0, partials = 0;
+      for (const auto &shape : geometry.target.decodeProjections) {
+        staged = std::max(staged, ops::gemvStageBytes(shape.inputSize));
+        partials = std::max(partials, ops::gemvPartialBytes(shape.outputSize, shape.inputSize, false));
+      }
+      for (const auto &shape : geometry.target.gateUpProjections)
+        partials = std::max(partials, ops::gemvPartialBytes(shape.outputSize, shape.inputSize, true));
+      gemvStaged = backend.allocateBuffer(staged, BufferStorage::Private, "gemv-staged");
+      gemvPartials = backend.allocateBuffer(partials, BufferStorage::Private, "gemv-partials");
+    }
+    prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators, prefillRows);
+    decodeArena =
+        std::make_unique<DecodeArena>(backend, geometry, operators, decodeLanes);
   }
 
   Request &request(uint64_t id) {
@@ -713,7 +736,7 @@ struct Runtime::Impl {
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
         prefillArena->get(PrefillTensor::DraftInverseFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
-        std::move(draftSin), {targetRows, draftRows}, kPrefillRows);
+        std::move(draftSin), {targetRows, draftRows}, prefillRows);
   }
 
   void captureFinalHidden(Request &entry, const MetalBuffer &rows,
@@ -739,12 +762,12 @@ struct Runtime::Impl {
         static_cast<uint32_t>(next));
   }
 
-  static uint32_t captureRows(const DispatchDraftCapturePlan &captures) {
+  uint32_t captureRows(const DispatchDraftCapturePlan &captures) const {
     uint64_t rows = 0;
     for (const auto &capture : captures) {
       rows += capture.absoluteEnd - capture.absoluteBegin;
     }
-    if (rows > kPrefillRows) {
+    if (rows > prefillRows) {
       throw std::logic_error("draft capture exceeds packed prefill capacity");
     }
     return static_cast<uint32_t>(rows);
@@ -908,7 +931,7 @@ struct Runtime::Impl {
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = request(item.requestId);
-      if (item.tokenCount > kPrefillRows ||
+      if (item.tokenCount > prefillRows ||
           item.promptOffset > entry.promptTokens ||
           item.tokenCount > entry.promptTokens - item.promptOffset ||
           item.logicalPosition != item.promptOffset || !entry.resident ||
@@ -920,12 +943,12 @@ struct Runtime::Impl {
           metadata.lengths.targetTokens != item.logicalPosition) {
         throw std::logic_error("packed prefill state length is not exact");
       }
-      if (item.tokenCount > kPrefillRows - batch.rows) {
+      if (item.tokenCount > prefillRows - batch.rows) {
         throw std::invalid_argument("packed prefill exceeds actual-row budget");
       }
       auto captures = activeDraftCaptures(entry, item);
       const uint32_t capturedRows = captureRows(captures);
-      if (capturedRows > kPrefillRows - batch.capturedRows) {
+      if (capturedRows > prefillRows - batch.capturedRows) {
         throw std::invalid_argument("packed draft capture exceeds row budget");
       }
       const uint32_t attentionStride =
@@ -1295,7 +1318,8 @@ struct Runtime::Impl {
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
-                                      ops::LinearDispatchStats &stats) {
+                                      ops::LinearDispatchStats &stats,
+                                      bool singleRow = false) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1322,6 +1346,10 @@ struct Runtime::Impl {
     std::vector<MetalBuffer> chunkValues(attentionLayers);
     QwenTargetVerifyBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
+    if (singleRow && lanes == 1) {
+      buffers.linearScratch.gemvStaged = gemvStaged;
+      buffers.linearScratch.gemvPartials = gemvPartials;
+    }
     buffers.hidden = {d(DecodeTensor::Hidden0), d(DecodeTensor::Hidden1)};
     buffers.normalized = d(DecodeTensor::Normalized);
     buffers.recurrent = d(DecodeTensor::Recurrent);
@@ -1523,7 +1551,8 @@ struct Runtime::Impl {
          decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
          decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),
          decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase), currentStates,
-         nextStates, decodeArena->packed(DecodeTensor::RetainedCount, width)},
+         nextStates, decodeArena->packed(DecodeTensor::RetainedCount, width),
+         decodeArena->laneCount()},
         width);
   }
 
@@ -1969,7 +1998,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::ImageAdmission images(*impl_, request.id);
-  StateAdmission admission = admitIdleSlot(impl_->states, [&](uint32_t slot) {
+  StateAdmission admission = admitIdleSlot(impl_->states, impl_->decodeLanes, [&](uint32_t slot) {
     if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
       return imageAdmission;
     return beginAt(request, slot);
@@ -2005,7 +2034,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   }
   Impl::ImageAdmission images(*impl_, request.id);
   StateAdmission admission =
-      admitIdleSlot(impl_->states, [&](uint32_t slot) {
+      admitIdleSlot(impl_->states, impl_->decodeLanes, [&](uint32_t slot) {
         if (auto imageAdmission = impl_->stageImages(request); !imageAdmission)
           return imageAdmission;
         return impl_->states.tryActivateSlot(slot, request.id);
@@ -2022,7 +2051,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
 }
 
 metal::AllocationResult Runtime::beginAt(const ModelRequest &request, uint32_t stateSlot) {
-  if (!request.id || stateSlot >= kLaneCount || request.prompt.empty()) {
+  if (!request.id || stateSlot >= impl_->decodeLanes || request.prompt.empty()) {
     throw std::invalid_argument("invalid executor request activation");
   }
   if (impl_->requests.contains(request.id)) {
@@ -2200,7 +2229,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::prefillAsync(const BatchPlan &plan,
                       std::span<const ModelBatchItem> items,
                       std::function<void()> completion) {
-  validatePlan(plan, items, WorkKind::Prefill);
+  validatePlan(plan, items, WorkKind::Prefill, impl_->decodeLanes);
   if (plan.decodeStage != DecodeStage::Regular) {
     throw std::invalid_argument("Qwen prefill cannot resume a mask plan");
   }
@@ -2245,7 +2274,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       Impl::Request &entry = *entries[lane];
       const ModelBatchItem &item = items[lane];
       const auto captures = Impl::activeDraftCaptures(entry, item);
-      const uint32_t capturedRows = Impl::captureRows(captures);
+      const uint32_t capturedRows = impl->captureRows(captures);
       uint32_t activeRows = 0;
       uint32_t materializationRows = 0;
       for (const auto &capture : captures) {
@@ -2354,7 +2383,7 @@ std::unique_ptr<ModelBatchTicket>
 Runtime::decodeAsync(const BatchPlan &plan,
                      std::span<const ModelBatchItem> items,
                      std::function<void()> completion) {
-  validatePlan(plan, items, WorkKind::Decode);
+  validatePlan(plan, items, WorkKind::Decode, impl_->decodeLanes);
   const bool constrained = plan.cohort == BatchCohort::Constrained;
   if (plan.decodeStage != DecodeStage::Regular && !constrained) {
     throw std::invalid_argument(
@@ -2471,7 +2500,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (laneResult.lookup && Impl::samplingEnabled(entry)) {
       impl_->stageLookupSamplingProposal(lane, lookupTokens);
     }
-    laneResult.draftComputed = !arLane && !laneResult.lookup;
+    // A prompt-lookup miss decodes row 0 alone: no draft, one token retained.
+    laneResult.singleRow = impl_->decodeSingleRow && items.size() == 1 && !laneResult.lookup;
+    if (laneResult.singleRow) laneResult.maximumRetained = 1;
+    laneResult.draftComputed = !arLane && !laneResult.lookup && !laneResult.singleRow;
     laneResult.verify = true;
   }
 
@@ -2527,7 +2559,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
       maximumRetained[lane] = lanes[lane].maximumRetained;
     }
     impl_->encodeTargetVerifyBatchForward(
-        commandGraph, {requests.data(), lanes.size()}, items, batchStats);
+        commandGraph, {requests.data(), lanes.size()}, items, batchStats,
+        lanes.size() == 1 && lanes[0].singleRow);
     impl_->encodeTargetVerifyBatchPolicy(commandGraph,
                                          {requests.data(), lanes.size()});
     impl_->encodeBatchAcceptance(commandGraph, {requests.data(), lanes.size()},
@@ -2723,7 +2756,7 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
 
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   using Clock = std::chrono::steady_clock;
-  if (!rows || rows > kPrefillRows)
+  if (!rows || rows > impl_->prefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
   double wallSeconds = 0.0;
@@ -2765,14 +2798,17 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   using Clock = std::chrono::steady_clock;
-  if (!width || width > kLaneCount) {
+  if (!width || width > impl_->decodeLanes) {
     throw std::invalid_argument("invalid decode warmup width");
   }
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
   // Plan order is deliberately unrelated to physical slot order. DecodeArena
   // lanes belong to the explicit BatchPlan, while recurrent/KV state remains
   // addressed by each item.stateSlot; batching must never assume slot 0..3.
-  constexpr std::array<uint32_t, kLaneCount> slotOrder{2, 0, 3, 1};
+  constexpr std::array<uint32_t, kLaneCount> shuffledSlots{2, 0, 3, 1};
+  std::array<uint32_t, kLaneCount> slotOrder{0, 1, 2, 3};
+  if (impl_->decodeLanes == kLaneCount)
+    slotOrder = shuffledSlots;
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::array<std::vector<uint32_t>, kLaneCount> pages;
@@ -2914,6 +2950,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
   std::shared_ptr<const CompositeState> cachedState;
   uint64_t estimatedPeakBytes = impl_->estimatedWarmupPeak();
   double wallSeconds = 0.0;
+  const uint32_t restoreSlot = impl_->decodeLanes > 1 ? 1 : 0;
   beginColdRequest(request, 0);
   try {
     if (impl_->kvPages.pageCount() <= 12) {
@@ -2939,11 +2976,11 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     // covers it.
     estimatedPeakBytes = impl_->estimatedWarmupPeak();
     end(id);
-    beginColdRequest(request, 1);
+    beginColdRequest(request, restoreSlot);
     restore(id, prefixTokens, cachedState, true);
     setDraftContextPlan(
         id, planDraftContext(prefixTokens, promptTokens, prefixTokens, {}));
-    const auto &restored = impl_->states.metadata(1).lengths;
+    const auto &restored = impl_->states.metadata(restoreSlot).lengths;
     if (restored.targetTokens != prefixTokens ||
         !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
       throw std::runtime_error("prefix restore length mismatch");
@@ -2956,7 +2993,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
                          BatchCohort::Greedy,
                          {{id, suffixTokens}},
                          DecodeStage::Regular};
-    ModelBatchItem suffix{id,           1,    prefixTokens, prefixTokens,
+    ModelBatchItem suffix{id,           restoreSlot, prefixTokens, prefixTokens,
                           suffixTokens, pages};
     suffix.inputTokens = std::span<const uint32_t>(request.prompt)
                              .subspan(prefixTokens, suffixTokens);
@@ -2968,13 +3005,13 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += continuationWallSeconds;
     BatchPlan decodePlan{
         WorkKind::Decode, BatchCohort::Greedy, {{id, 0}}, DecodeStage::Regular};
-    ModelBatchItem decodeItem{id, 1, promptTokens, 0, 0, pages};
+    ModelBatchItem decodeItem{id, restoreSlot, promptTokens, 0, 0, pages};
     auto decoded =
         decode(decodePlan, std::span<const ModelBatchItem>(&decodeItem, 1));
     const double historicalDecodeWallSeconds =
         impl_->counters.lastDecodeWallSeconds;
     wallSeconds += historicalDecodeWallSeconds;
-    const auto &continued = impl_->states.metadata(1).lengths;
+    const auto &continued = impl_->states.metadata(restoreSlot).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
         !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
         continued.targetTokens <= promptTokens ||
@@ -3010,15 +3047,16 @@ ModelTelemetry Runtime::telemetry() const noexcept {
 ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
                                      const ModelPackage &package,
                                      const ops::ExecutionPlans &operators,
-                                     kv::Format format) {
+                                     kv::Format format, uint32_t prefillRows,
+                                     uint32_t decodeLanes) {
   requireCompatibleModelPackage(package);
   if (device.appleGpuFamily < DeviceCapabilities::kMinimumAppleGpuFamily) {
     throw std::invalid_argument("model runtime requires Apple tensor BF16");
   }
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   return {package.stateLayout().activeCellBytes(),
-          plannedPrefillBytes(geometry, operators),
-          plannedDecodeBytes(geometry, operators), kPipelineReserveBytes,
+          plannedPrefillBytes(geometry, operators, prefillRows),
+          plannedDecodeBytes(geometry, operators, decodeLanes), kPipelineReserveBytes,
           kRuntimeOverheadReserveBytes};
 }
 

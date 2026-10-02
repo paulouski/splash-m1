@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -289,6 +290,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.pipelineReserveBytes = model.footprint.pipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes =
       model.footprint.runtimeOverheadReserveBytes;
+  breakdown.prefillRows = model.footprint.prefillRows;
+  breakdown.maximumBatchWidth = model.footprint.decodeLanes;
   breakdown.kvStagingBytes = model.footprint.kvStagingBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
   breakdown.kvSparseMappingBatchPages =
@@ -350,7 +353,13 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   uint64_t clampedKvPages =
       std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
                          breakdown.maximumKvPages);
-  clampedKvPages -= clampedKvPages % breakdown.kvSparseMappingBatchPages;
+  // Non-sparse pools are plain buffers, so the 64-KiB sparse tile alignment
+  // behind the mapping batch is policy, not a requirement; the low-memory
+  // profile sizes them to whole pages.
+  const uint32_t kvPageUnit = !device.supportsPlacementSparse && model.exactKvPages
+                                  ? 1
+                                  : breakdown.kvSparseMappingBatchPages;
+  clampedKvPages -= clampedKvPages % kvPageUnit;
   if (!device.supportsPlacementSparse && model.requestedContextTokens) {
     // Non-sparse backing is committed in full at load, not grown on demand:
     // shrink the pool to what --max-context plus speculative scratch needs,
@@ -361,8 +370,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                                      model::ExecutionLimits::speculativeScratchTokens;
     uint64_t requestedPages =
         (requestedTokens + breakdown.kvPageTokens - 1) / breakdown.kvPageTokens;
-    requestedPages += breakdown.kvSparseMappingBatchPages - 1;
-    requestedPages -= requestedPages % breakdown.kvSparseMappingBatchPages;
+    requestedPages += kvPageUnit - 1;
+    requestedPages -= requestedPages % kvPageUnit;
     requestedPages = std::max<uint64_t>(requestedPages, breakdown.kvExtentPages);
     clampedKvPages = std::min(clampedKvPages, requestedPages);
   }
@@ -396,6 +405,68 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                                 "memory plan fits hard budget", breakdown};
   EngineMemoryPlan plan(device, model, breakdown);
   return {std::move(plan), std::move(status)};
+}
+
+EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
+    const DeviceCapabilities &device, ModelMemoryProfile model,
+    uint64_t maximumMemoryBytes,
+    const std::function<uint64_t(uint32_t)> &prefillBytesForRows,
+    const std::function<uint64_t(uint32_t)> &decodeBytesForLanes) {
+  EngineMemoryPlanResult result =
+      evaluateEngineMemoryPlan(device, model, maximumMemoryBytes);
+  if (result.plan || result.status.code != BudgetErrorCode::KvPoolDoesNotFit)
+    return result;
+  const uint32_t goal =
+      std::min(model.requestedContextTokens ? model.requestedContextTokens
+                                            : kAdaptiveContextGoalTokens,
+               model.maximumContextTokens);
+  model.exactKvPages = true;
+  const ModelMemoryFootprint full = model.footprint;
+  std::vector<uint32_t> rungs{full.prefillRows};
+  for (const uint32_t rows : kReducedPrefillRows) {
+    if (rows < full.prefillRows)
+      rungs.push_back(rows);
+  }
+  std::vector<uint32_t> laneRungs{full.decodeLanes};
+  if (decodeBytesForLanes && full.decodeLanes > 1)
+    laneRungs.push_back(1);
+  std::string tried = std::to_string(full.prefillRows);
+  std::optional<EngineMemoryPlanResult> fitted;
+  for (const uint32_t rows : rungs) {
+    bool rowFits = false;
+    for (const uint32_t lanes : laneRungs) {
+      if (rows == full.prefillRows && lanes == full.decodeLanes)
+        continue;
+      model.footprint = full;
+      if (rows != full.prefillRows) {
+        model.footprint.prefillRows = rows;
+        model.footprint.sharedPrefillBytes = prefillBytesForRows(rows);
+      }
+      if (lanes != full.decodeLanes) {
+        model.footprint.decodeLanes = lanes;
+        model.footprint.sharedDecodeBytes = decodeBytesForLanes(lanes);
+      }
+      EngineMemoryPlanResult attempt =
+          evaluateEngineMemoryPlan(device, model, maximumMemoryBytes);
+      if (attempt.plan) {
+        rowFits = true;
+        fitted = std::move(attempt);
+        if (fitted->plan->maximumContextTokens() >= goal)
+          return std::move(*fitted);
+        continue;
+      }
+      if (attempt.status.code != BudgetErrorCode::KvPoolDoesNotFit)
+        return attempt;
+      result = std::move(attempt);
+    }
+    if (!rowFits && rows != full.prefillRows)
+      tried += ", " + std::to_string(rows);
+  }
+  if (fitted)
+    return std::move(*fitted);
+  result.status.message +=
+      "; packed prefill chunks of " + tried + " rows were tried";
+  return result;
 }
 
 EngineMemoryPlan requireEngineMemoryPlan(const DeviceCapabilities &device,

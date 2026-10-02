@@ -204,8 +204,247 @@ void testModelProvidedKvGeometry() {
           "model-provided Q8 geometry is missing from status");
 }
 
+// Ternary-Bonsai-2-27B with its DFlash draft: prepared target 7,251,165,184 B,
+// target + draft 8,517,206,016 B. The prefill arena is the 2048-row figure;
+// smaller rungs are scaled estimates (2% over linear) until a GPU run
+// reports the real arena.
+ModelMemoryProfile bonsai() {
+  ModelMemoryProfile result{
+      "Ternary-Bonsai-2-27B", kv::kMaximumLogicalTokens, 0,
+      kv::Layout{16, 4, 256},
+      {7'251'165'184, 1'266'040'832, 0, 350'224'384, 785'580'032,
+       262'662'272, 256 * kMiB, 512 * kMiB}};
+  return result;
+}
+
+uint64_t bonsaiPrefillBytes(uint32_t rows) {
+  return 785'580'032ULL * rows / 2048 * 102 / 100;
+}
+
+DeviceCapabilities device16() {
+  DeviceCapabilities result = device(11'453'251'584);
+  result.physicalMemoryBytes = 17'179'869'184;
+  return result;
+}
+
+#if defined(SPLASH_MACOS15_BUILD)
+// One lane of the shared decode arena (model_execution_plan_test pins it).
+uint64_t bonsaiDecodeBytes(uint32_t lanes) {
+  return lanes == 1 ? 66'042'400ULL : 262'662'272ULL;
+}
+
+DeviceCapabilities device16NonSparse() {
+  DeviceCapabilities result = device16();
+  result.appleGpuFamily = 7;
+  result.macosMajor = 15;
+  result.macosMinor = 7;
+  result.supportsPlacementSparse = false;
+  return result;
+}
+#endif
+
+void requireSameBreakdown(const EngineMemoryBreakdown &a,
+                          const EngineMemoryBreakdown &b, const char *message) {
+  require(a.hardBudgetBytes == b.hardBudgetBytes &&
+              a.sharedPrefillBytes == b.sharedPrefillBytes &&
+              a.sharedDecodeBytes == b.sharedDecodeBytes &&
+              a.prefillRows == b.prefillRows &&
+              a.maximumBatchWidth == b.maximumBatchWidth &&
+              a.fixedRuntimeBytes == b.fixedRuntimeBytes &&
+              a.dynamicBudgetBytes == b.dynamicBudgetBytes &&
+              a.kvVirtualPages == b.kvVirtualPages,
+          message);
+}
+
+void testAdaptivePrefillKeepsFittingPlansUnchanged() {
+  const auto neverCalled = [](uint32_t) -> uint64_t {
+    throw std::runtime_error("a plan that fits was resized");
+  };
+  // 32 GB M1 Max (~24 GiB automatic budget, 22 GiB cap) with Qwen Q4/Q5.
+  DeviceCapabilities max = device(26'800'000'000ULL);
+  max.physicalMemoryBytes = 32 * kGiB;
+  for (const uint64_t target : {15'000'000'000ULL, 18'000'000'000ULL}) {
+    const ModelMemoryProfile profile =
+        test::modelMemoryProfile(target, 1'266'040'832, 0);
+    for (const uint64_t cap : {uint64_t{0}, 22 * kGiB}) {
+      const auto direct = requireEngineMemoryPlan(max, profile, cap);
+      const auto adaptive =
+          evaluateAdaptiveMemoryPlan(max, profile, cap, neverCalled);
+      require(adaptive.plan && adaptive.plan->breakdown().prefillRows ==
+                                   model::ExecutionLimits::prefillTokenBudget,
+              "a fitting plan changed its prefill rows");
+      requireSameBreakdown(adaptive.plan->breakdown(), direct.breakdown(),
+                           "a fitting plan differs from the direct plan");
+    }
+  }
+}
+
+void testAdaptivePrefillFitsBonsaiOn16Gb() {
+  const auto direct = evaluateEngineMemoryPlan(device16(), bonsai());
+  require(!direct.plan &&
+              direct.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
+              direct.status.breakdown.hardBudgetBytes == 10'379'509'760ULL &&
+              direct.status.breakdown.deficitBytes == 477'784'192ULL,
+          "Bonsai no longer misses the 16 GB budget by 477,784,192 bytes");
+  const auto adaptive = evaluateAdaptiveMemoryPlan(
+      device16(), bonsai(), 0, bonsaiPrefillBytes);
+  require(adaptive.plan.has_value(), "Bonsai with its draft does not fit 16 GB");
+  const auto &budget = adaptive.plan->breakdown();
+  require(budget.prefillRows == 128 &&
+              budget.sharedPrefillBytes == bonsaiPrefillBytes(128) &&
+              budget.sharedDecodeBytes == 262'662'272ULL &&
+              budget.minimumRequiredBytes <= budget.hardBudgetBytes,
+          "16 GB Bonsai did not take the smallest prefill rung");
+  // Sparse mappings stay whole 128-page batches (64 KiB scale tiles), so the
+  // 369 pages that fit floor to 256 (8,192 tokens less the scratch rows).
+  require(budget.kvVirtualPages == 256 &&
+              adaptive.plan->maximumContextTokens() == 8185,
+          "16 GB sparse Bonsai KV pool changed");
+}
+
+#if defined(SPLASH_MACOS15_BUILD)
+// macOS 15 has no placement sparse: the pool is plain buffers, committed whole.
+// The 16 GB Bonsai plan (rungs after 2048 are estimates: 2% over linear):
+//   hard budget 10,379,509,760 = fixed 9,635,255,383 + dynamic 744,254,377
+//   fixed = weights 8,517,206,016 + prefill 50,080,727 (128 rows) + decode
+//           262,662,272 + pipelines 256 MiB + overhead 512 MiB
+//   dynamic = one state cell 350,224,384 + 369 KV pages x 1,064,960 B
+//   369 pages = 11,808 tokens, 11,801 after the 7 speculative scratch rows.
+void testBonsaiOn16GbMacos15() {
+  const DeviceCapabilities dense = device16NonSparse();
+  ModelMemoryProfile requested = bonsai();
+  requested.requestedContextTokens = 16384;
+  for (const ModelMemoryProfile &profile : {bonsai(), requested}) {
+    const auto plan = evaluateAdaptiveMemoryPlan(dense, profile, 0,
+                                                 bonsaiPrefillBytes);
+    require(plan.plan.has_value(), "16 GB macOS 15 Bonsai does not fit");
+    const auto &budget = plan.plan->breakdown();
+    require(budget.prefillRows == 128 &&
+                budget.sharedPrefillBytes == 50'080'727ULL &&
+                budget.fixedRuntimeBytes == 9'635'255'383ULL &&
+                budget.dynamicBudgetBytes == 744'254'377ULL &&
+                budget.kvVirtualPages == 369 &&
+                plan.plan->maximumContextTokens() == 11'801,
+            "16 GB macOS 15 Bonsai plan changed");
+  }
+  // Each larger rung fits only fewer pages: 512 rows hold 228, 256 rows 322.
+  for (const auto &[rows, pages] : {std::pair{512u, 228u}, std::pair{256u, 322u}}) {
+    ModelMemoryProfile rung = bonsai();
+    rung.footprint.prefillRows = rows;
+    rung.footprint.sharedPrefillBytes = bonsaiPrefillBytes(rows);
+    rung.exactKvPages = true;
+    const auto result = evaluateEngineMemoryPlan(dense, rung);
+    require(result.plan && result.plan->breakdown().kvVirtualPages == pages,
+            "a Bonsai prefill rung holds a different KV page count");
+  }
+  // 16K int8 KV needs 513 pages; 144 pages (153,354,240 B) are missing.
+  // Decode buffers of one lane (-188 MiB) alone would cover it; INT8 draft
+  // codebooks (-125,153,280 B) alone would not (487 pages, 15,577 tokens).
+  const auto holds = [&](uint64_t decodeLess, uint64_t draftLess) {
+    ModelMemoryProfile profile = bonsai();
+    profile.footprint.sharedDecodeBytes -= decodeLess;
+    profile.footprint.draftWeightsBytes -= draftLess;
+    return evaluateAdaptiveMemoryPlan(dense, profile, 0, bonsaiPrefillBytes)
+        .plan->maximumContextTokens();
+  };
+  require(holds(188 * kMiB, 0) >= 16384 && holds(0, 125'153'280ULL) == 15'577,
+          "the remaining 16K levers changed");
+}
+
+// With one decode lane the 16 GB macOS 15 ladder reaches the 16K goal. Rows
+// outrank lanes, so each chunk size tries 4 lanes before 1, and the first rung
+// that reaches the goal wins.
+void testBonsaiOn16GbReaches16kWithOneLane() {
+  const DeviceCapabilities dense = device16NonSparse();
+  const auto plan = evaluateAdaptiveMemoryPlan(
+      dense, bonsai(), 0, bonsaiPrefillBytes, bonsaiDecodeBytes);
+  require(plan.plan.has_value(), "16 GB macOS 15 Bonsai does not fit");
+  const auto &budget = plan.plan->breakdown();
+  std::cout << "16 GB Bonsai macOS 15: " << budget.prefillRows << " rows, "
+            << budget.maximumBatchWidth << " lane(s), " << budget.kvVirtualPages
+            << " KV pages, " << plan.plan->maximumContextTokens()
+            << " tokens\n";
+  require(budget.prefillRows == 128 && budget.maximumBatchWidth == 1 &&
+              budget.sharedDecodeBytes == bonsaiDecodeBytes(1) &&
+              budget.kvVirtualPages == 554 &&
+              plan.plan->maximumContextTokens() == 17'721,
+          "16 GB macOS 15 Bonsai did not reach 16K with the chosen rung");
+  // Without the lane rungs the plan is the 4-lane one of the test above.
+  const auto fourLanes =
+      evaluateAdaptiveMemoryPlan(dense, bonsai(), 0, bonsaiPrefillBytes);
+  require(fourLanes.plan &&
+              fourLanes.plan->breakdown().maximumBatchWidth ==
+                  model::ExecutionLimits::maximumBatchWidth &&
+              fourLanes.plan->maximumContextTokens() == 11'801,
+          "the lane rung changed the plan that does not ask for it");
+}
+
+// A plan that fits keeps all lanes and the model's prefill chunk.
+void testFittingPlanKeepsAllLanes() {
+  DeviceCapabilities max = device(26'800'000'000ULL);
+  max.physicalMemoryBytes = 32 * kGiB;
+  const auto neverCalled = [](uint32_t) -> uint64_t {
+    throw std::runtime_error("a plan that fits was resized");
+  };
+  const auto plan = evaluateAdaptiveMemoryPlan(
+      max, test::modelMemoryProfile(15'000'000'000ULL, 1'266'040'832, 0), 0,
+      neverCalled, neverCalled);
+  require(plan.plan &&
+              plan.plan->breakdown().prefillRows ==
+                  model::ExecutionLimits::prefillTokenBudget &&
+              plan.plan->breakdown().maximumBatchWidth ==
+                  model::ExecutionLimits::maximumBatchWidth,
+          "a fitting plan lost lanes or prefill rows");
+}
+
+// The default plan of a 32 GB macOS 15 Mac keeps its 128-page KV rounding.
+void testDefaultPlanKeepsKvRounding() {
+  DeviceCapabilities max = device(26'800'000'000ULL);
+  max.physicalMemoryBytes = 32 * kGiB;
+  max.appleGpuFamily = 7;
+  max.supportsPlacementSparse = false;
+  const auto neverCalled = [](uint32_t) -> uint64_t {
+    throw std::runtime_error("a plan that fits was resized");
+  };
+  ModelMemoryProfile profile = test::modelMemoryProfile(15'000'000'000ULL,
+                                                        1'266'040'832, 0);
+  profile.requestedContextTokens = 16384;
+  const auto plan = evaluateAdaptiveMemoryPlan(max, profile, 0, neverCalled);
+  require(plan.plan && plan.plan->breakdown().kvVirtualPages == 640 &&
+              plan.plan->breakdown().prefillRows ==
+                  model::ExecutionLimits::prefillTokenBudget,
+          "the default macOS 15 plan changed its KV pool rounding");
+}
+#endif
+
+// A 32 GB Mac capped at the 16 GB budget plans the same arenas.
+void testAdaptivePrefillFollowsTheCapNotPhysicalMemory() {
+  DeviceCapabilities max = device(26'800'000'000ULL);
+  max.physicalMemoryBytes = 32 * kGiB;
+  const auto capped = evaluateAdaptiveMemoryPlan(
+      max, bonsai(), 10'379'509'760ULL, bonsaiPrefillBytes);
+  const auto small = evaluateAdaptiveMemoryPlan(
+      device16(), bonsai(), 0, bonsaiPrefillBytes);
+  require(capped.plan && small.plan,
+          "capped 32 GB or 16 GB Bonsai plan does not fit");
+  requireSameBreakdown(capped.plan->breakdown(), small.plan->breakdown(),
+                       "the capped 32 GB plan differs from the 16 GB plan");
+}
+
+void testAdaptivePrefillNamesTheRungsWhenNothingFits() {
+  const auto result = evaluateAdaptiveMemoryPlan(
+      device16(), bonsai(), 9 * kGiB, bonsaiPrefillBytes);
+  require(!result.plan &&
+              result.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
+              result.status.message.find("2048, 1024, 512, 256, 128 rows") !=
+                  std::string::npos &&
+              result.status.breakdown.prefillRows == 128,
+          "an unfittable plan did not report the prefill rungs it tried");
+}
+
 } // namespace
 
+#if !defined(SPLASH_MACOS15_BUILD)
 void testDeviceValidationNamesTheMacosFloor() {
   require(!device().validationError(),
           "the reference device reported a validation error");
@@ -261,6 +500,7 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
                       "placement-sparse buffers (placement_sparse_required)",
           "missing placement-sparse buffers were not named");
 }
+#endif
 
 int main() {
   try {
@@ -271,8 +511,20 @@ int main() {
     testHardBudgetBoundaries();
     testContextTokensWithin();
     testModelProvidedKvGeometry();
+    testAdaptivePrefillKeepsFittingPlansUnchanged();
+    testAdaptivePrefillFitsBonsaiOn16Gb();
+    testAdaptivePrefillFollowsTheCapNotPhysicalMemory();
+#if defined(SPLASH_MACOS15_BUILD)
+    testBonsaiOn16GbMacos15();
+    testBonsaiOn16GbReaches16kWithOneLane();
+    testFittingPlanKeepsAllLanes();
+    testDefaultPlanKeepsKvRounding();
+#endif
+    testAdaptivePrefillNamesTheRungsWhenNothingFits();
+#if !defined(SPLASH_MACOS15_BUILD)
     testDeviceValidationNamesTheMacosFloor();
     testDeviceValidationMessageNamesWhatTheMacHas();
+#endif
     std::cout << "elastic memory plan tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

@@ -69,6 +69,7 @@ public:
   void boundIsolatedPrefill(bool bounded) noexcept {
     boundIsolatedPrefill_ = bounded;
   }
+  void maximumPrefillRows(uint32_t rows) noexcept { maximumPrefillRows_ = rows; }
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -142,6 +143,7 @@ private:
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
   bool boundIsolatedPrefill_ = true;
+  uint32_t maximumPrefillRows_ = model::ExecutionLimits::prefillTokenBudget;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };

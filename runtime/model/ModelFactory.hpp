@@ -74,6 +74,10 @@ struct RuntimeContext final {
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
   KvPageTier *kvTier = nullptr;
+  // Packed-prefill row cap the shared prefill arena is sized for.
+  uint32_t prefillRows = ExecutionLimits::prefillTokenBudget;
+  // Concurrent lanes the shared decode arena is sized for.
+  uint32_t decodeLanes = ExecutionLimits::maximumBatchWidth;
 };
 
 // Validates only the interface between independently defined target and draft
@@ -141,7 +145,9 @@ inline constexpr uint64_t kRuntimeOverheadReserveBytes = 512ULL << 20;
 plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
-                     kv::Format format = kv::Format::Int8);
+                     kv::Format format = kv::Format::Int8,
+                     uint32_t prefillRows = ExecutionLimits::prefillTokenBudget,
+                     uint32_t decodeLanes = ExecutionLimits::maximumBatchWidth);
 // The file, when given, holds one state per slot and shares the cache's
 // disk budget.
 [[nodiscard]] std::unique_ptr<StateStorage>

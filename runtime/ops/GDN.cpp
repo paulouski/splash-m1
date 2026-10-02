@@ -127,8 +127,9 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
 
 void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                     GdnShape shape, uint32_t layers, uint32_t lanes,
-                    GdnStateStrides state) {
+                    GdnStateStrides state, uint32_t layerLanes) {
   if (!layers || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
+      layerLanes < lanes || layerLanes > SPLASH_MAXIMUM_BATCH_WIDTH ||
       !state.valid())
     throw std::invalid_argument("invalid GDN commit geometry");
   const KernelLayout kernel = kernelShape(shape);
@@ -145,7 +146,7 @@ void GDN::addCommit(metal::CommandGraph &graph, GdnCommitBuffers buffers,
                                     rows * shape.convolutionDimension,
                                     rows * shape.valueHeads,
                                     rows * shape.valueHeads,
-                                    0,
+                                    layerLanes,
                                     state.convolutionLayerBytes,
                                     state.recurrentLayerBytes,
                                     state.convolutionStateBytes};

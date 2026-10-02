@@ -5,7 +5,9 @@
 #include "ops/PagedKv.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -30,10 +32,14 @@ struct ModelMemoryFootprint final {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  // Rows of the packed prefill chunk sharedPrefillBytes was sized for.
+  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
   // Metal staging of the disk tier's KV transfers, set aside whenever
   // --max-cache-disk is set, even if the tier then fails to start; zero
   // without the flag.
   uint64_t kvStagingBytes = 0;
+  // Concurrent decode lanes sharedDecodeBytes was sized for.
+  uint32_t decodeLanes = model::ExecutionLimits::maximumBatchWidth;
 };
 
 struct ModelMemoryProfile final {
@@ -47,6 +53,9 @@ struct ModelMemoryProfile final {
   uint32_t requestedContextTokens = 0;
   kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
+  // Non-sparse pools in whole pages instead of sparse-mapping batches; set by
+  // the adaptive low-memory profile only.
+  bool exactKvPages = false;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
@@ -119,6 +128,7 @@ struct EngineMemoryBreakdown {
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
+  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
   uint64_t kvStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
@@ -200,6 +210,27 @@ struct EngineMemoryPlanResult {
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
                          uint64_t maximumMemoryBytes = 0);
+
+// Smaller packed-prefill chunks the planner falls back to, largest first.
+inline constexpr std::array<uint32_t, 4> kReducedPrefillRows{1024, 512, 256, 128};
+
+// Context the low-memory profile keeps shrinking prefill chunks for when no
+// --max-context is requested.
+inline constexpr uint32_t kAdaptiveContextGoalTokens = 16384;
+
+// evaluateEngineMemoryPlan with the model's own prefill chunk; only when that
+// leaves no room for one state cell and one KV extent does it retry with
+// smaller chunks, sizing each rung's arena with prefillBytesForRows. Each
+// chunk size is tried with all decode lanes, then, when decodeBytesForLanes is
+// given, with one lane: a single desktop user keeps the faster prefill chunk
+// and only gives up concurrency (requests queue). It stops at the first rung
+// whose context reaches the request (or 16K), else keeps the last rung that
+// fits.
+[[nodiscard]] EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
+    const DeviceCapabilities &device, ModelMemoryProfile model,
+    uint64_t maximumMemoryBytes,
+    const std::function<uint64_t(uint32_t)> &prefillBytesForRows,
+    const std::function<uint64_t(uint32_t)> &decodeBytesForLanes = {});
 
 [[nodiscard]] EngineMemoryPlan
 requireEngineMemoryPlan(const DeviceCapabilities &device,

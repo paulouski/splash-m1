@@ -34,7 +34,14 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument(
         "prefill checkpoint interval must span a draft window and whole KV pages");
   }
+  if (!config_.prefillRows ||
+      config_.prefillRows > model::ExecutionLimits::prefillTokenBudget)
+    throw std::invalid_argument("invalid prefill row cap");
+  if (!config_.maximumLanes ||
+      config_.maximumLanes > model::ExecutionLimits::maximumBatchWidth)
+    throw std::invalid_argument("invalid decode lane cap");
   scheduler_.boundIsolatedPrefill(config_.boundPrefillCommands);
+  scheduler_.maximumPrefillRows(config_.prefillRows);
 }
 
 void Engine::submit(EngineRequest value) {
@@ -360,7 +367,7 @@ bool Engine::admitQueued(double now) {
   const bool cellsFull =
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.stateCell.has_value();
-      }) >= model::ExecutionLimits::maximumBatchWidth;
+      }) >= config_.maximumLanes;
   std::vector<PrefillAdmission> candidates;
   for (uint64_t id : order) {
     Request &active = request(id);

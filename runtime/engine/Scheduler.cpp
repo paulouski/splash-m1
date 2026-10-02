@@ -306,7 +306,7 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
 uint32_t Scheduler::prefillBudget(
     const PrefillRequestView &leader,
     std::span<const PrefillRequestView> ready) const {
-  const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
+  const uint32_t maximum = maximumPrefillRows_;
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
   const auto boundedRows = [&](double milliseconds) {

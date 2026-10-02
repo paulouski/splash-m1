@@ -29,8 +29,9 @@ inline constexpr uint32_t kSamplingUniformCount = 16;
 inline constexpr uint32_t kDraftProposalTokens = ExecutionLimits::draftProposalTokens;
 inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
-inline constexpr uint32_t kPackedAttentionRows =
-    kPrefillRows + kLaneCount * (kTileRows - 1);
+constexpr uint32_t packedAttentionRows(uint32_t prefillRows) noexcept {
+  return prefillRows + kLaneCount * (kTileRows - 1);
+}
 inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextTokens;
 inline constexpr uint64_t kArenaAlignment = 16 * 1024;
 inline constexpr uint32_t kMaximumPageTableEntries =
@@ -158,7 +159,8 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
 // bounds include the operator defaults and every installed configuration.
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
-                   const ops::ExecutionPlans &operators);
+                   const ops::ExecutionPlans &operators,
+                   uint32_t rows = kPrefillRows);
 struct PrefillArenaLayout final {
   std::array<uint64_t, prefillTensorCount> offsets{};
   uint64_t bytes = 0;
@@ -166,14 +168,16 @@ struct PrefillArenaLayout final {
 [[nodiscard]] PrefillArenaLayout prefillArenaLayout(
     const std::array<uint64_t, prefillTensorCount> &sizes);
 [[nodiscard]] uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
-                                           const ops::ExecutionPlans &operators);
+                                           const ops::ExecutionPlans &operators,
+                                           uint32_t rows = kPrefillRows);
 
 class PrefillArena final {
 public:
   PrefillArena(metal::MetalBackend &backend, const RuntimeGeometry &geometry,
-                const ops::ExecutionPlans &operators)
-      : bytes_(plannedPrefillBytes(geometry, operators)) {
-    const auto sizes = prefillTensorBytes(geometry, operators);
+                const ops::ExecutionPlans &operators,
+                uint32_t rows = kPrefillRows)
+      : bytes_(plannedPrefillBytes(geometry, operators, rows)) {
+    const auto sizes = prefillTensorBytes(geometry, operators, rows);
     const PrefillArenaLayout layout = prefillArenaLayout(sizes);
     if (layout.bytes != bytes_)
       throw std::logic_error("prefill arena mismatch");
@@ -325,15 +329,24 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 // A decode tensor is one packed M32 allocation.  B1/B2/B3/B4 are prefixes
 // containing 8/16/24/32 rows. Lanes are never separated by arena-alignment
 // holes; only whole tensor boundaries are aligned.
+// `activeLanes` below the compile-time ceiling sizes the low-memory arena for
+// that many concurrent lanes; it is raised to the lanes the decode linears
+// store rows for, and returns the ceiling when it is not smaller.
+[[nodiscard]] uint32_t decodeArenaLanes(const RuntimeGeometry &geometry,
+                                        const ops::ExecutionPlans &operators,
+                                        uint32_t activeLanes);
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
-                                            const ops::ExecutionPlans &operators);
+                                            const ops::ExecutionPlans &operators,
+                                            uint32_t laneCount = kLaneCount);
 
 class DecodeArena final {
 public:
   DecodeArena(metal::MetalBackend &backend, RuntimeGeometry geometry,
-               const ops::ExecutionPlans &operators)
-      : backend_(backend), geometry_(std::move(geometry)) {
-    const uint64_t baseBytes = decodeArenaBaseBytes(geometry_, operators);
+               const ops::ExecutionPlans &operators,
+               uint32_t activeLanes = kLaneCount)
+      : backend_(backend), geometry_(std::move(geometry)),
+        lanes_(decodeArenaLanes(geometry_, operators, activeLanes)) {
+    const uint64_t baseBytes = decodeArenaBaseBytes(geometry_, operators, lanes_);
     auto sizes = decodeTensorBytes(geometry_, operators);
     base_ = backend_.allocateBuffer(baseBytes, metal::BufferStorage::Shared,
                                     "qwen-shared-decode");
@@ -344,13 +357,13 @@ public:
       sizes_[tensor] = sizes[tensor];
       const DecodeTensor kind = static_cast<DecodeTensor>(tensor);
       if (sizes[tensor] && !isLayerMajorTensor(kind)) {
-        for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
+        for (uint32_t lane = 0; lane < lanes_; ++lane) {
           tensors_[lane][tensor] = backend_.view(
               base_, cursor + uint64_t{lane} * stride, sizes[tensor]);
         }
       }
       cursor +=
-          alignArena(checkedMultiply(stride, kLaneCount, "decode tensor"));
+          alignArena(checkedMultiply(stride, lanes_, "decode tensor"));
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");
@@ -362,7 +375,7 @@ public:
     }
     // Each field exists only when some plan uses it (split-only plans have
     // partials and counters but no activation table).
-    const auto linearSize = linearScratchSize(geometry_, operators);
+    const auto linearSize = linearScratchSize(geometry_, operators, lanes_);
     const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
       return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
     };
@@ -380,7 +393,7 @@ public:
   }
 
   [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
-    if (lane >= kLaneCount)
+    if (lane >= lanes_)
       throw std::out_of_range("invalid decode lane");
     if (isLayerMajorTensor(tensor)) {
       throw std::logic_error(
@@ -390,7 +403,7 @@ public:
   }
 
   [[nodiscard]] metal::MetalBuffer packed(DecodeTensor tensor, uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount)
+    if (!lanes || lanes > lanes_)
       throw std::out_of_range("invalid packed decode width");
     if (isLayerMajorTensor(tensor)) {
       throw std::logic_error(
@@ -416,7 +429,12 @@ public:
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
-                                                 const ops::ExecutionPlans &operators);
+                                                 const ops::ExecutionPlans &operators,
+                                                 uint32_t laneCount = kLaneCount);
+
+  // Lanes the arena is laid out for: the layer stride of the batched replay
+  // tensors.
+  [[nodiscard]] uint32_t laneCount() const noexcept { return lanes_; }
 
   [[nodiscard]] metal::MetalBuffer gateScratch() const { return gateScratch_; }
 
@@ -436,16 +454,16 @@ public:
   [[nodiscard]] metal::MetalBuffer gdnBatchSlice(DecodeTensor base, uint32_t gdnLayer,
                                           uint32_t lanes) const {
     const uint32_t layers = geometry_.target.stateLayout.layers;
-    if (!lanes || lanes > kLaneCount || gdnLayer >= layers ||
+    if (!lanes || lanes > lanes_ || gdnLayer >= layers ||
         !isGdnLayerTensor(base))
       throw std::out_of_range("invalid batched GDN layer");
     const uint32_t index = static_cast<uint32_t>(base);
     // Each GDN tensor holds one stride per layer per lane; the planner sized
     // it as layers x stride, so the stride is recovered here, not supplied.
     const uint64_t stride = sizes_[index] / layers;
-    const uint64_t relative = uint64_t{gdnLayer} * kLaneCount * stride;
+    const uint64_t relative = uint64_t{gdnLayer} * lanes_ * stride;
     const uint64_t bytes = uint64_t{lanes} * stride;
-    if (relative + bytes > sizes_[index] * kLaneCount)
+    if (relative + bytes > sizes_[index] * lanes_)
       throw std::logic_error("batched GDN layer exceeds decode arena");
     return backend_.view(base_, offsets_[index] + relative, bytes);
   }
@@ -454,24 +472,24 @@ public:
     if (!isGdnLayerTensor(base))
       throw std::invalid_argument("tensor is not GDN replay scratch");
     const uint32_t index = static_cast<uint32_t>(base);
-    return backend_.view(base_, offsets_[index], sizes_[index] * kLaneCount);
+    return backend_.view(base_, offsets_[index], sizes_[index] * lanes_);
   }
 
   [[nodiscard]] metal::MetalBuffer attentionBatchSlice(DecodeTensor base,
                                                 uint32_t attentionLayer,
                                                 uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount ||
+    if (!lanes || lanes > lanes_ ||
         attentionLayer >= geometry_.target.kvLayout.attentionLayers ||
         !isAttentionLayerTensor(base)) {
       throw std::out_of_range("invalid batched attention layer");
     }
     const uint32_t index = static_cast<uint32_t>(base);
     const uint64_t relative =
-        uint64_t{attentionLayer} * kLaneCount *
+        uint64_t{attentionLayer} * lanes_ *
         decodeChunkLayerBytes(geometry_);
     const uint64_t bytes =
         uint64_t{lanes} * decodeChunkLayerBytes(geometry_);
-    if (relative + bytes > sizes_[index] * kLaneCount)
+    if (relative + bytes > sizes_[index] * lanes_)
       throw std::logic_error("batched attention layer exceeds decode arena");
     return backend_.view(base_, offsets_[index] + relative, bytes);
   }
@@ -481,6 +499,7 @@ public:
 private:
   metal::MetalBackend &backend_;
   RuntimeGeometry geometry_;
+  uint32_t lanes_;
   metal::MetalBuffer base_;
   std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> tensors_{};
   std::array<uint64_t, decodeTensorCount> offsets_{};
@@ -491,6 +510,7 @@ private:
 };
 
 [[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
-                                          const ops::ExecutionPlans &operators);
+                                          const ops::ExecutionPlans &operators,
+                                          uint32_t activeLanes = kLaneCount);
 
 } // namespace splash::model

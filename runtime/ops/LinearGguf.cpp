@@ -212,7 +212,36 @@ void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const Quan
   tensor(segment, epilogueSuffix(LinearEpilogue::UpWithGate), b.output, b.gateScratch);
 }
 
+// Output rows of one threadgroup of the one-row GEMV (decode/linear_gguf_gemv.metal).
+constexpr uint32_t kGemvRows = 256;
+
+// Whether the one-row GEMV runs a single-lane decode step's quantized segments: all PQ2_0 in whole 256-row tiles, a
+// residual, gate/up or fp32 output only on a single tensor, and the GEMV scratch holds the row and the partials.
+bool gemvEligible(const LinearWorkload &w, FloatOutput destination, const std::vector<QuantizedSegment> &segments,
+                  const Projection *gate, const LinearScratch &scratch) {
+  if (!scratch.gemvStaged || w.phase != LinearPhase::Decode || w.rows != SPLASH_TARGET_VERIFY_ROWS ||
+      (w.epilogue != LinearEpilogue::None && w.epilogue != LinearEpilogue::Residual &&
+       w.epilogue != LinearEpilogue::GateUp))
+    return false;
+  if ((w.epilogue != LinearEpilogue::None || destination == FloatOutput::Float32) && segments.size() != 1) return false;
+  if (destination == FloatOutput::Float32 && w.epilogue != LinearEpilogue::None) return false;
+  if (gate && gate->blocks().segments.size() != 1) return false;
+  const auto fits = [&](const QuantizedSegment &s) {
+    return s.formatId == GGUF_FMT_PQ20 && s.outputSize % kGemvRows == 0 && gemvSplits(s.outputSize, s.inputSize) &&
+           gemvStageBytes(s.inputSize) <= scratch.gemvStaged.sizeBytes() &&
+           gemvPartialBytes(s.outputSize, s.inputSize, gate != nullptr) <= scratch.gemvPartials.sizeBytes();
+  };
+  return std::all_of(segments.begin(), segments.end(), fits) && (!gate || fits(gate->blocks().segments.front()));
+}
+
 } // namespace
+
+uint32_t gemvSplits(uint32_t n, uint32_t k) noexcept {
+  if (k % 128) return 0;
+  uint32_t splits = n >= 65536 ? 4 : 8;
+  while (splits > 1 && (k / 128) % splits) splits /= 2;
+  return splits;
+}
 
 void LinearPlan::requireBlockConfiguration() const {
   const auto [n, k] = workload_.matrix;
@@ -326,6 +355,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     }
     return;
   }
+  const bool gemv = gemvEligible(w, plan.destination(), segments, gate, b.scratch);
   if (p.rotation) {
     // Weights stored for rotated inputs (InputRotation): the quantized
     // segments, and a gate/up pair's gate too, read H (D x) from the scratch,
@@ -335,7 +365,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     if (k % GGUF_ROTATION_BLOCK || p.rotation.signs.sizeBytes() < k)
       throw std::invalid_argument("a rotated projection takes whole rotation blocks and their signs");
     graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
-              {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+              {k / GGUF_ROTATION_BLOCK, gemv ? 1u : w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;
     rotated.input = b.scratch.rotated;
     rotated.prepared = {};
@@ -344,7 +374,9 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     addGguf(graph, rotated, plain, plan, gate, stats);
     return;
   }
-  if (config.tile == LinearTile::GgufRegister) {
+  if (gemv) {
+    addGgufGemv(graph, b, p, plan, gate);
+  } else if (config.tile == LinearTile::GgufRegister) {
     addGgufRegister(graph, b, p, plan, gate);
   } else if (config.simdgroups == LinearSimdgroups::Two) {
     addGgufStaged(graph, b, p, plan, gate);
@@ -418,6 +450,36 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   graph.add(std::string(mmaTiles(appleGpuFamily_) ? "gguf_decode_mma_fused_m" : "gguf_decode_fused_m") +
                 std::to_string(rows), std::move(bindings), params,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+}
+
+// Row 0 of a single-lane step through the one-row GEMV: the staged row, then per segment the GEMV and, with K splits,
+// the reduction that finishes it; a gate/up pair is one GEMV pass over both tensors. Rows 1-7 of the output stay as
+// they were.
+void Linear::addGgufGemv(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
+                         const LinearPlan &plan, const Projection *gate) const {
+  const LinearWorkload w = plan.workload();
+  const uint32_t k = w.matrix.inputSize;
+  const metal::MetalBuffer &staged = b.scratch.gemvStaged, &partials = b.scratch.gemvPartials;
+  graph.add("gguf_gemv_stage", {b.input, staged}, GgufDecodeParams{k, 1, 0, 0}, {(k / 128 + 7) / 8, 1, 1}, {256, 1, 1});
+  const std::string epilogue = w.epilogue == LinearEpilogue::GateUp
+      ? "g" : kernelInstance(std::string(1, epilogueSuffix(w.epilogue)), plan.destination());
+  for (const QuantizedSegment &s : p.blocks().segments) {
+    const uint32_t n = s.outputSize, splits = gemvSplits(n, k);
+    const GgufDecodeParams params{k, splits, n, s.columnOffset};
+    const metal::DispatchSize grid{n / kGemvRows, splits, 1}, reduceGrid{(n + 255) / 256, 1, 1};
+    if (gate) {
+      const QuantizedSegment &g = gate->blocks().segments.front();
+      graph.add("gguf_gemv_pq20_g", {staged, g.plane0, g.meta, s.plane0, s.meta, b.output, partials}, params, grid,
+                {256, 1, 1});
+      if (splits > 1) graph.add("gguf_gemv_reduce_g", {partials, b.output}, params, reduceGrid, {256, 1, 1});
+      continue;
+    }
+    const metal::MetalBuffer &aux = epilogueInput(b, w.epilogue);
+    graph.add("gguf_gemv_pq20_" + epilogue, {staged, s.plane0, s.meta, b.output, partials, aux}, params, grid,
+              {128, 1, 1});
+    if (splits > 1)
+      graph.add("gguf_gemv_reduce_" + epilogue, {partials, b.output, aux}, params, reduceGrid, {256, 1, 1});
+  }
 }
 
 // All lanes in each threadgroup, decode only: single tensors and gate/up

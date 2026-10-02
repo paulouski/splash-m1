@@ -439,10 +439,10 @@ inline void gdn_commit_prefix_batch_phase(
                        : batch == 1 ? next_1
                        : batch == 2 ? next_2
                                     : next_3;
-  packed += (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * params.packed_stride;
-  mixed_qkv += (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * params.mixed_stride;
-  decay += (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * params.decay_stride;
-  beta += (ulong(layer) * SPLASH_MAXIMUM_BATCH_WIDTH + batch) * params.beta_stride;
+  packed += (ulong(layer) * params.layer_lanes + batch) * params.packed_stride;
+  mixed_qkv += (ulong(layer) * params.layer_lanes + batch) * params.mixed_stride;
+  decay += (ulong(layer) * params.layer_lanes + batch) * params.decay_stride;
+  beta += (ulong(layer) * params.layer_lanes + batch) * params.beta_stride;
   device const bfloat *conv_state_in = reinterpret_cast<device const bfloat *>(
       current + ulong(layer) * params.conv_layer_bytes);
   device bfloat *conv_state_out = reinterpret_cast<device bfloat *>(

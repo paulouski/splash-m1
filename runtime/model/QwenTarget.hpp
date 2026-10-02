@@ -268,6 +268,8 @@ struct QwenTargetCommitBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       nextStates;
   metal::MetalBuffer retainedCounts;
+  // Lanes per layer of the replay tensors above.
+  uint32_t layerLanes = ExecutionLimits::maximumBatchWidth;
 };
 
 template <class Layout, class Layer>
@@ -294,6 +296,9 @@ public:
   // lanes). Every op still processes the step's lanes; padding rows read
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
+  // Throws unless every projection is PQ2_0 (or float) GGUF blocks of a dense target, which the one-row decode
+  // GEMV (ops::LinearScratch::gemvStaged) runs.
+  void requireSingleRowDecode() const;
 
   // Returns the hidden buffer that holds the last layer's output rows.
   [[nodiscard]] metal::MetalBuffer addPrefill(
