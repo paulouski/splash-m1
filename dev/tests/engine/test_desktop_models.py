@@ -444,6 +444,69 @@ def prism_config(**changes):
     return config
 
 
+class DiskSpaceTests(unittest.TestCase):
+    GB = 10**9
+
+    def repo(self, name, sizes):
+        return mock.Mock(
+            directory=None,
+            files=set(sizes),
+            name=name,
+            sizes={n: (s, "blob-" + n) for n, s in sizes.items()},
+        )
+
+    def require(self, free, *, fmt="mlx-affine", cached=(), target_sizes=None):
+        target = self.repo(MODEL, target_sizes or {"a.safetensors": 10 * self.GB})
+        draft = self.repo("team/draft", {"d.safetensors": 2 * self.GB})
+        draft.files |= {"model.safetensors.index.json"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for blob in cached:
+                (root / "blobs").mkdir(exist_ok=True)
+                (root / "blobs" / blob).touch()
+            with (
+                mock.patch.object(hub, "folder", return_value=root),
+                mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "w")}),
+                mock.patch.object(upstream, "_weight_files", return_value={"d.safetensors"}),
+                mock.patch.object(
+                    desktop_models.shutil, "disk_usage", return_value=mock.Mock(free=free)
+                ),
+            ):
+                desktop_models._require_disk_space(
+                    MODEL, fmt, target, set(target.files), draft
+                )
+
+    def test_insufficient_space_names_needed_and_available(self):
+        # affine: 10 + 2 download + 10 prepared + 2.1 reserve = 24.1 GB
+        with self.assertRaisesRegex(models.ModelError, r"24\.1 GB, 20\.0 GB available"):
+            self.require(20 * self.GB)
+
+    def test_sufficient_space_passes(self):
+        self.require(25 * self.GB)
+
+    def test_cached_files_are_not_counted_as_downloads(self):
+        # target cached: 2 download + 10 prepared + 2.1 reserve = 14.1 GB
+        self.require(15 * self.GB, cached=["blob-a.safetensors"])
+        with self.assertRaises(models.ModelError):
+            self.require(14 * self.GB, cached=["blob-a.safetensors"])
+
+    def test_prism_estimates_prepared_images(self):
+        # 10 + 2 download + 8.6 prepared + 2.1 reserve = 22.7 GB
+        self.require(23 * self.GB, fmt="mlx-prism")
+        with self.assertRaises(models.ModelError):
+            self.require(22 * self.GB, fmt="mlx-prism")
+
+    def test_unknown_sizes_skip_the_check(self):
+        target = self.repo(MODEL, {})
+        target.sizes = {}
+        target.files = {"a.safetensors"}
+        with (
+            mock.patch.object(upstream, "_weight_files", return_value={"a.safetensors"}),
+            mock.patch.object(desktop_models.shutil, "disk_usage", side_effect=AssertionError),
+        ):
+            desktop_models._require_disk_space(MODEL, "mlx-affine", target, target.files, target)
+
+
 class PrismModelTests(unittest.TestCase):
     def check(self, config, *, hadamard=True, language_only=True):
         with tempfile.TemporaryDirectory() as temporary:

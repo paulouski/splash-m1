@@ -28,6 +28,11 @@ DESKTOP_FAMILY = "Qwen3.8-27B"
 # Below this only the 2-bit Prism checkpoint fits, with an automatic context.
 FULL_MEMORY_BYTES = 32 * 1024**3
 HF_HOSTS = {"hf.co", "huggingface.co"}
+# Prepared Prism target images and draft, in bytes; an affine target prepares
+# to about its own weight size.
+PRISM_PREPARED_BYTES = 8_600_000_000
+# Free space left after a download, as the native weight preparation requires.
+DISK_RESERVE = 2 * 1024**3
 
 
 def _memory_bytes():
@@ -280,7 +285,50 @@ def check_model(value, *, models_root=None):
     )
     with hub.as_model_errors(f"cannot inspect the {family.name} draft"):
         _require_draft_repository(draft_repo, family)
+    _require_disk_space(
+        model, target.format, target_repo, set(target.files.values()), draft_repo
+    )
     return model
+
+
+def _weight_bytes(repo, names):
+    """(total, bytes the Hub cache lacks) of the safetensors in names, or None
+    when the Hub gave no sizes for them."""
+    weights = [n for n in names if n.endswith(".safetensors")]
+    if repo.directory is not None or not all(n in repo.sizes for n in weights):
+        return None
+    blobs = hub.folder(repo.name) / "blobs"
+    total = missing = 0
+    for size, blob in (repo.sizes[n] for n in weights):
+        total += size
+        if not (blob and (blobs / blob).exists()):
+            missing += size
+    return total, missing
+
+
+def _require_disk_space(model, target_format, target_repo, target_names, draft_repo):
+    """Refuse before any download when the files still to fetch, their
+    prepared weights and a reserve do not fit. Unknown sizes skip the check."""
+    target = _weight_bytes(target_repo, target_names)
+    draft = _weight_bytes(draft_repo, upstream._weight_files(draft_repo))
+    if target is None or draft is None:
+        return
+    prepared = PRISM_PREPARED_BYTES if target_format == upstream.PRISM_FORMAT else target[0]
+    volumes = {}
+    for path, size in (
+        (hub.folder(target_repo.name).parent, target[1] + draft[1]),
+        (_weight_cache(), prepared),
+    ):
+        while not path.exists():
+            path = path.parent
+        need = volumes.setdefault(path.stat().st_dev, [path, shutil.disk_usage(path).free, 0])
+        need[2] += size
+    for path, free, size in volumes.values():
+        if free < size + DISK_RESERVE:
+            raise models.ModelError(
+                f"not enough free disk space for {model}: needs about "
+                f"{(size + DISK_RESERVE) / 1e9:.1f} GB, {free / 1e9:.1f} GB available on {path}"
+            )
 
 
 def installed_models(models_root=None):

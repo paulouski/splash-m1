@@ -6,15 +6,22 @@ Splash M1 is an unofficial community fork of [Inco's Splash](https://github.com/
 
 The desktop app is being prepared for release. No public download has been published yet. Check the [releases page](https://github.com/paulouski/splash-m1/releases) for availability.
 
-Once a desktop release is available:
+Once a desktop release is available, install the app and the `splash-m1` command with one line in Terminal:
 
-1. Download the **Mac app** ZIP, unzip it, and drag **Splash M1.app** to Applications.
-2. Open Splash M1. Use the recommended model, or paste a Hugging Face model link or repository ID and click **Check Model**. Unsupported configurations are refused before model weights are downloaded. Click **Download & Start** to download the selected model and its matching draft, then prepare them for your Mac.
+~~~sh
+curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | bash
+~~~
+
+The installer verifies the download and puts **Splash M1.app** in /Applications (or ~/Applications if that is not writable). Files downloaded by curl carry no quarantine flag, so the app opens without a Gatekeeper warning. Add `-s -- --cli-only` after `bash` to skip the app. Alternatively, download the **Mac app** ZIP from the releases page, unzip it, and drag **Splash M1.app** to Applications (see **First launch** below).
+
+1. Open Splash M1 (`open -a "Splash M1"`). Use the recommended model, or paste a Hugging Face model link or repository ID and click **Check Model**. Unsupported configurations are refused before model weights are downloaded. Click **Download & Start** to download the selected model and its matching draft, then prepare them for your Mac.
 3. The app opens your browser when the chat is ready. Keep Splash M1 running while you chat; use **Stop** or quit the app to release the model.
 
 The **Installed models** menu lists compatible models already installed through Splash. Select one and start it to reuse its files; stop the running model before choosing another. **Show Details** displays installation and server output. The compatibility check inspects model metadata; the engine validates the actual tensors during startup.
 
 For [Pi](https://pi.dev/) or [OpenCode](https://opencode.ai/docs/), install the client first, start Splash, and wait until it is ready. Click **Copy Pi Command** or **Copy OpenCode Command**, then paste the command into Terminal in your project folder. The launcher connects the client to the currently loaded model and context. Pi's launcher adds a Splash provider to its model configuration; OpenCode receives settings for that launch. Keep Splash M1 running while the client uses it. **Copy API URL** provides the OpenAI-compatible endpoint for other clients.
+
+**First launch of a manually downloaded ZIP:** the app is ad-hoc signed and not notarized, so macOS 15 shows "“Splash M1” is damaged and can't be opened" for a quarantined copy, and Open Anyway may not be offered. Clear the quarantine flag in Terminal: `xattr -dr com.apple.quarantine "/Applications/Splash M1.app"`. The app also checks free disk space before downloading and stops with the needed and available amounts if the model, its prepared weights, and a 2 GiB reserve do not fit.
 
 Python, Xcode, and Terminal are not required for the packaged app. The first setup needs internet access and additional disk space for model weights; download and preparation status appears in the app. Later launches reuse cached weights and settings. The default desktop configuration uses a 32K context and requires 32 GB of memory. Macs with 16 GB can run only the 2-bit Prism checkpoint (Ternary Bonsai 2), with a context sized automatically to the available memory; this 16 GB configuration has not been tested on 16 GB hardware.
 
@@ -62,14 +69,14 @@ This fork builds on Inco's Splash engine and the community Apple7 kernel port. S
 
 ## Command-line installation
 
-The command-line package is also implemented but has not been published yet. After a release containing the installer asset is published, install and run it with:
+The command-line package is also implemented but has not been published yet. After a release containing the installer asset is published, the same one-line installer provides the command (`-s -- --cli-only` skips the app); run it with:
 
 ~~~sh
-curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | bash
 splash-m1 start
 ~~~
 
-Follow any PATH instruction printed by the installer. `start` uses the recommended Qwen3.8-27B Q4 model, text-only mode, and a 32K context. The server stays in the terminal and prints its address and logs; when it reports Ready, open http://127.0.0.1:8000. Press Ctrl+C to stop it. The desktop app is optional.
+Follow any PATH instruction printed by the installer. `start` uses the recommended Qwen3.8-27B Q4 model, text-only mode, and a 32K context. The server stays in the terminal and prints its address and logs; when it reports Ready, open http://127.0.0.1:8000. Press Ctrl+C to stop it.
 
 To connect an installed coding client, open a second terminal in your project folder and run `splash-m1 pi` or `splash-m1 opencode`. Keep the server terminal open. For another checkpoint or server settings, use `splash-m1 start --model OWNER/REPO --max-context 32K` or `splash-m1 serve --help`. No Homebrew tap is available.
 

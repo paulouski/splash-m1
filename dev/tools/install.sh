@@ -1,16 +1,21 @@
 #!/bin/sh
 # Splash M1 installer for Apple Silicon Macs.
 #
-#   curl -qfsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | sh
+#   curl -qfsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | bash
 #
 # Downloads a release from GitHub Releases, verifies its SHA-256, unpacks it
 # under ~/Library/Application Support/Splash M1/app, and writes `splash-m1` to PATH.
+# It also installs the desktop app (Splash M1.app) into /Applications, or
+# ~/Applications when /Applications is not writable; files fetched by curl carry
+# no quarantine flag, so the ad-hoc-signed app opens without Gatekeeper's dialog.
 # Running it again upgrades in place; model weights and sessions are untouched.
+# Pass `--cli-only` (or `--no-app`) to skip the app:  ... | bash -s -- --cli-only
 #
 #   SPLASH_VERSION   install this version instead of the latest release
 #   SPLASH_REPO      GitHub repository (default: paulouski/splash-m1)
 #   SPLASH_BASE_URL  custom asset base, e.g. a private Hugging Face repo or local fixture
 #   SPLASH_TOKEN     optional Bearer token for a private custom asset base
+#   SPLASH_APP_DIR   where to put Splash M1.app (default: /Applications or ~/Applications)
 #   SPLASH_BIN_DIR   where to put `splash-m1` (default: Homebrew bin or ~/.local/bin)
 set -eu
 
@@ -21,6 +26,14 @@ APP="$HOME/Library/Application Support/Splash M1/app"
 MARKER="Splash M1/app/current"
 
 fail() { echo "splash-m1 install: $*" >&2; exit 1; }
+
+want_app=1
+for arg in "$@"; do
+    case "$arg" in
+        --cli-only|--no-app) want_app=0 ;;
+        *) fail "unknown option: $arg" ;;
+    esac
+done
 
 valid_version() {
     case "$1" in
@@ -39,6 +52,8 @@ major=${os%%.*}
 case "$major" in ''|*[!0-9]*) fail "could not read macOS version: $os.";; esac
 [ "$major" -ge 15 ] 2>/dev/null || fail "Splash M1 requires macOS 15.0 or newer; this Mac runs $os."
 command -v curl >/dev/null 2>&1 || fail "curl is required."
+mem=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+[ "$mem" -ge 30000000000 ] 2>/dev/null || echo "Note: this Mac has under 32 GB of memory; only the 2-bit Prism checkpoint (Ternary Bonsai 2) is supported." >&2
 version=${SPLASH_VERSION:-}
 [ -z "$version" ] || valid_version "$version" || fail "invalid release version."
 if [ -z "$BASE_URL" ]; then
@@ -58,6 +73,16 @@ dir=${SPLASH_BIN_DIR:-}
 done
 [ -n "$dir" ] || dir="$HOME/.local/bin"
 wrapper="$dir/splash-m1"
+if [ "$want_app" = 1 ]; then
+    appdir=${SPLASH_APP_DIR:-}
+    if [ -z "$appdir" ]; then
+        if [ -w /Applications ]; then appdir=/Applications; else appdir="$HOME/Applications"; fi
+    fi
+    mkdir -p "$appdir" || fail "could not create $appdir."
+    [ -w "$appdir" ] || fail "$appdir is not writable; set SPLASH_APP_DIR."
+    dest="$appdir/Splash M1.app"
+    if pgrep -x SplashM1 >/dev/null 2>&1; then fail "quit Splash M1 before installing."; fi
+fi
 if [ -e "$wrapper" ] && ! grep -q "$MARKER" "$wrapper" 2>/dev/null; then
     fail "$wrapper exists and was not created by this installer; remove it first."
 fi
@@ -71,7 +96,8 @@ fetch() {
 }
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/splash-install.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+stage=
+trap 'rm -rf "$work" ${stage:+"$stage"}' EXIT
 if [ -n "$TOKEN" ]; then
     case "$TOKEN" in *[!A-Za-z0-9_./~+=-]*) fail "invalid access token format.";; esac
     (umask 077; printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$work/curl.conf")
@@ -113,6 +139,19 @@ fi
 if ! PYTHONDONTWRITEBYTECODE=1 "$candidate/python/bin/python3" -u \
         "$candidate/install/launcher.py" --help >/dev/null 2>&1; then
     fail "Splash M1 $version fails 'splash-m1 --help'; nothing was changed."
+fi
+if [ "$want_app" = 1 ]; then
+    app="$name-app.zip"
+    fetch "$app" "$work/$app"
+    fetch "$app.sha256" "$work/$app.sha256"
+    expected=$(cut -d' ' -f1 < "$work/$app.sha256")
+    actual=$(shasum -a 256 "$work/$app" | cut -d' ' -f1)
+    [ -n "$expected" ] && [ "$expected" = "$actual" ] || fail "checksum mismatch for $app."
+    # Stage beside the destination so the final moves are same-volume renames.
+    stage=$(mktemp -d "$appdir/.splash-app.XXXXXX") || fail "could not stage the app in $appdir."
+    ditto -x -k "$work/$app" "$stage" || fail "could not extract $app."
+    [ -f "$stage/Splash M1.app/Contents/Info.plist" ] || fail "unexpected app archive layout."
+    xattr -dr com.apple.quarantine "$stage/Splash M1.app" 2>/dev/null || true
 fi
 cat > "$work/apply.sh" <<'INSTALL'
 set -eu
@@ -167,8 +206,22 @@ with path.open("a+") as lock:
     os.execv("/bin/sh", ["/bin/sh", *sys.argv[2:]])
 PYTHON
 
+if [ "$want_app" = 1 ]; then
+    # Swap in the staged app; put the old one back if the move fails.
+    if [ -e "$dest" ]; then
+        mv "$dest" "$stage/old.app" || fail "could not replace $dest; the CLI was installed."
+        mv "$stage/Splash M1.app" "$dest" || { mv "$stage/old.app" "$dest"; fail "could not install $dest; the CLI was installed."; }
+    else
+        mv "$stage/Splash M1.app" "$dest" || fail "could not install $dest; the CLI was installed."
+    fi
+fi
+
 echo
 echo "Splash M1 $version installed: $wrapper"
+if [ "$want_app" = 1 ]; then
+    echo "Desktop app installed: $dest"
+    echo "  Open it with:  open -a \"Splash M1\"   (or open \"$dest\")"
+fi
 case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "Add it to your PATH first:  export PATH=\"$dir:\$PATH\"" ;;
