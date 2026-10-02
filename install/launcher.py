@@ -269,6 +269,12 @@ def serve(args):
         catalog.spawn_refresh()
         os.set_inheritable(installation.fileno(), True)
         os.set_inheritable(lock.fileno(), True)
+        if args.simple_start:
+            url = f"http://{args.host}:{args.port}"
+            if not args.no_webui:
+                print(f"After Ready, browser: {url}", flush=True)
+            print(f"After Ready, API: {url}/v1", flush=True)
+            print("Server logs follow; Ctrl+C stops Splash.", flush=True)
         os.execve(command[0], command, environment)
 
 
@@ -430,6 +436,7 @@ def _parse_max_image_pixels(value):
 
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    simple_start = bool(argv and argv[0] == "start")
     client_args = []
     if argv and argv[0] in clients.INSTALL_URLS:
         argv, client_args = argv[:1], argv[1:]
@@ -455,11 +462,21 @@ def parse_args(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     server = commands.add_parser(
         "serve",
+        aliases=["start"],
         help="run the local server; Ctrl+C stops it",
-        description="Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground.",
+        description=(
+            f"Start {MODEL_EXAMPLE} in the foreground with language-only mode "
+            "and a 32K context."
+            if simple_start
+            else "Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            server_examples
+            f"Defaults: --model {MODEL_EXAMPLE} --language-only --max-context 32K.\n"
+            "Override --model or --max-context as needed.\n\n"
+            "After Ready, use the browser and API URLs printed below. Keep this terminal open; Ctrl+C stops Splash."
+            if simple_start
+            else server_examples
             + "After Ready, open http://127.0.0.1:8000 or connect an installed agent.\n"
             "The startup summary and /status report the effective context limit.\n"
             "A client may impose a smaller limit. Keep this terminal open; Ctrl+C stops serving."
@@ -480,7 +497,7 @@ def parse_args(argv=None):
     server.add_argument(
         "--model",
         type=model_artifacts.parse_model_id,
-        required=True,
+        required=not simple_start,
         metavar="OWNER/REPO",
         help="upstream Hugging Face model ID",
     )
@@ -567,9 +584,18 @@ def parse_args(argv=None):
         help="API key (default: SPLASH_API_KEY environment variable)",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    if simple_start:
+        server.set_defaults(
+            model=MODEL_EXAMPLE,
+            language_only=True,
+            max_context=_parse_max_context("32K"),
+        )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
+    args.simple_start = simple_start
+    if simple_start:
+        args.command = "serve"
     if (
         args.command == "serve"
         and args.default_reasoning_effort is not None

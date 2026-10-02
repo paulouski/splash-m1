@@ -48,7 +48,7 @@ else:
     import models
 
 GGUF_VISION = "vision/mmproj.gguf"
-TARGET_FORMATS = ("mlx-affine", "gguf")
+TARGET_FORMATS = ("mlx-affine", "mlx-prism", "gguf")
 VISION_FORMATS = ("none", "safetensors", "gguf")
 RECORD_KEYS = {
     "version",

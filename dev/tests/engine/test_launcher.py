@@ -66,7 +66,11 @@ class LauncherTests(unittest.TestCase):
                     mock.patch.object(launcher.paths, "PACKAGED", True),
                 ):
                     importlib.reload(launcher)
-                    for arguments in (["--help"], ["serve", "--help"]):
+                    for arguments in (
+                        ["--help"],
+                        ["serve", "--help"],
+                        ["start", "--help"],
+                    ):
                         with (
                             mock.patch("sys.stdout", io.StringIO()) as output,
                             self.assertRaises(SystemExit) as help_exit,
@@ -84,6 +88,10 @@ class LauncherTests(unittest.TestCase):
         )
         self.assertIn(example, outputs[0])
         self.assertIn(example, outputs[1])
+        self.assertIn("Defaults: --model mlx-community/Qwen3.8-27B-4bit", outputs[2])
+        self.assertIn("--language-only --max-context 32K", outputs[2])
+        self.assertIn("Override --model or --max-context", outputs[2])
+        self.assertIn("Ctrl+C stops Splash", outputs[2])
         self.assertNotIn("GGUF", "\n".join(outputs))
 
     def test_prefill_mode_defaults_to_bounded_commands(self):
@@ -119,9 +127,27 @@ class LauncherTests(unittest.TestCase):
                 launcher.parse_args(["serve", "--model", model]).model, model
             )
 
-    def test_only_serve_and_clients_are_public(self):
+    def test_start_defaults_and_overrides_preserve_serve_defaults(self):
+        args = launcher.parse_args(["start"])
+        self.assertEqual(args.command, "serve")
+        self.assertTrue(args.simple_start)
+        self.assertEqual(args.model, "mlx-community/Qwen3.8-27B-4bit")
+        self.assertTrue(args.language_only)
+        self.assertEqual(args.max_context, 32_768)
+
+        args = launcher.parse_args(
+            ["start", "--model", MODEL_ID, "--max-context", "64K"]
+        )
+        self.assertEqual(args.model, MODEL_ID)
+        self.assertEqual(args.max_context, 65_536)
+
+        args = launcher.parse_args(["serve", "--model", MODEL_ID])
+        self.assertFalse(args.simple_start)
+        self.assertFalse(args.language_only)
+        self.assertIsNone(args.max_context)
+
+    def test_unknown_commands_are_rejected(self):
         for command in (
-            "start",
             "stop",
             "status",
             "logs",

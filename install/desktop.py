@@ -18,15 +18,16 @@ import urllib.request
 from pathlib import Path
 
 if __package__:
-    from . import launcher, paths
+    from . import desktop_models, launcher, paths
 else:
+    import desktop_models
     import launcher
     import paths
 
 ROOT = paths.ROOT
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 PORT = 8000
-MIN_MEMORY_BYTES = 32 * 1024**3
+MIN_MEMORY_BYTES = 16 * 1024**3
 RUNTIME_DIR = paths.RUNTIME
 DATA_DIR = paths.DATA
 PYTHON = paths.PYTHON
@@ -81,7 +82,7 @@ def _check_cancel(control):
         raise DesktopCancelled
     control.poll()
     while control.pending:
-        action = control.pending.pop(0)
+        action, _selected_model = control.pending.pop(0)
         if action in ("stop", "quit"):
             control.cancelled = action
             raise DesktopCancelled
@@ -144,7 +145,7 @@ def _preflight(output, control):
         raise DesktopError("Splash M1 requires macOS 15 or newer.")
     if _memory_bytes() < MIN_MEMORY_BYTES:
         raise DesktopError(
-            "The current Splash M1 app configuration requires 32 GB of memory."
+            "The current Splash M1 app configuration requires 16 GB of memory."
         )
     _check_cancel(control)
 
@@ -172,20 +173,56 @@ def _preflight(output, control):
         )
 
 
-def _launcher_command():
+def _launcher_command(model=MODEL):
     return [
         str(PYTHON),
         "-u",
-        str(ROOT / "install/launcher.py"),
+        str(ROOT / "install/desktop_models.py"),
         "serve",
         "--model",
-        MODEL,
-        "--language-only",
-        "--max-context",
-        "32K",
-        "--port",
-        str(PORT),
+        model,
     ]
+
+
+def _model_check_command(model):
+    return [
+        str(PYTHON),
+        "-u",
+        str(ROOT / "install/desktop_models.py"),
+        "check",
+        "--model",
+        model,
+    ]
+
+
+def _emit_models(output):
+    try:
+        installed = desktop_models.installed_models()
+    except (OSError, desktop_models.models.ModelError):
+        installed = []
+    _event(output, "models", models=installed)
+
+
+def _delete_action(output, action, model, *, busy=False):
+    try:
+        if busy:
+            raise desktop_models.models.ModelError(
+                "Stop Splash before deleting a model."
+            )
+        model = desktop_models.normalize_model_id(model)
+        if action == "delete_plan":
+            _event(
+                output,
+                "delete_plan",
+                model=model,
+                bytes=desktop_models.delete_plan(model)["bytes"],
+            )
+            return
+        desktop_models.delete(model)
+        _event(output, "deleted", model=model)
+        _emit_models(output)
+    except (desktop_models.models.ModelError, OSError) as error:
+        _event(output, "error", message=str(error))
 
 
 class _Control:
@@ -218,14 +255,18 @@ class _Control:
                 except (UnicodeDecodeError, ValueError):
                     continue
                 if isinstance(command, dict) and command.get("action") in (
+                    "models",
+                    "delete_plan",
+                    "delete",
+                    "check",
                     "start",
                     "stop",
                     "quit",
                 ):
-                    self.pending.append(command["action"])
+                    self.pending.append((command["action"], command.get("model")))
 
 
-def _owns_serve_lock(pid):
+def _owns_serve_lock(pid, model=MODEL):
     lock_path = RUNTIME_DIR / f"serve-{PORT}.lock"
     try:
         with lock_path.open("r") as lock:
@@ -240,7 +281,7 @@ def _owns_serve_lock(pid):
                 return (
                     isinstance(owner, dict)
                     and owner.get("pid") == pid
-                    and owner.get("model") == MODEL
+                    and owner.get("model") == model
                     and owner.get("port") == PORT
                 )
             else:
@@ -318,20 +359,25 @@ def _terminate_child(process, output):
     _event(output, "stopped")
 
 
-def _monitor(process, control, output):
+def _monitor(process, control, output, model=MODEL, *, checking=False):
     fd = process.stdout.fileno()
     os.set_blocking(fd, False)
     buffer = bytearray()
     saw_ready_line = False
     ready_sent = False
     stop_requested = None
+    error_message = None
     while True:
         if _signal_received:
             stop_requested = "quit"
         control.poll()
         while control.pending:
-            action = control.pending.pop(0)
-            if action in ("stop", "quit"):
+            action, _selected_model = control.pending.pop(0)
+            if action == "models":
+                _emit_models(output)
+            elif action in ("delete_plan", "delete"):
+                _delete_action(output, action, _selected_model, busy=True)
+            elif action in ("stop", "quit"):
                 stop_requested = action
         if control.eof:
             stop_requested = "quit"
@@ -353,29 +399,54 @@ def _monitor(process, control, output):
             buffer.extend(chunk)
             for line in _lines(buffer):
                 _event(output, "log", message=line)
+                if line.startswith("error: "):
+                    error_message = line.removeprefix("error: ")
                 if "Ready · " in line:
                     saw_ready_line = True
 
         if (
             not ready_sent
             and saw_ready_line
-            and _owns_serve_lock(process.pid)
+            and _owns_serve_lock(process.pid, model)
             and _ready_endpoint()
         ):
             ready_sent = True
-            _event(output, "ready", url=f"http://127.0.0.1:{PORT}")
+            _event(
+                output,
+                "ready",
+                url=f"http://127.0.0.1:{PORT}",
+                model=model,
+            )
+            _emit_models(output)
 
         if process.poll() is not None:
             for line in _lines(buffer):
                 _event(output, "log", message=line)
+                if line.startswith("error: "):
+                    error_message = line.removeprefix("error: ")
             _stop_group(process)
-            if ready_sent:
+            if checking and process.returncode == 0:
+                _event(
+                    output,
+                    "model_checked",
+                    model=model,
+                    message=desktop_models.COMPATIBILITY_MESSAGE,
+                )
+            elif checking:
+                _event(
+                    output,
+                    "error",
+                    message=error_message
+                    or f"Model check failed (code {process.returncode}).",
+                )
+            elif ready_sent:
                 _event(output, "stopped")
             else:
                 _event(
                     output,
                     "error",
-                    message=f"Splash exited during setup (code {process.returncode}).",
+                    message=error_message
+                    or f"Splash exited during setup (code {process.returncode}).",
                 )
             return None
 
@@ -398,19 +469,77 @@ def supervise(
         if not control.pending:
             select.select([input_fd], [], [], 0.25)
             continue
-        action = control.pending.pop(0)
+        action, selected_model = control.pending.pop(0)
         if action == "quit":
             return
+        if action == "models":
+            try:
+                _emit_models(output)
+            except BrokenPipeError:
+                return
+            continue
+        if action in ("delete_plan", "delete"):
+            try:
+                _delete_action(output, action, selected_model)
+            except BrokenPipeError:
+                return
+            continue
+        if action == "check":
+            process = None
+            try:
+                model = desktop_models.normalize_model_id(
+                    MODEL if selected_model is None else selected_model
+                )
+                _status(output, "checking", "Checking model metadata…")
+                environment = dict(
+                    os.environ,
+                    PYTHONUNBUFFERED="1",
+                    TRANSFORMERS_VERBOSITY="error",
+                )
+                process = process_factory(
+                    _model_check_command(model),
+                    cwd=ROOT,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=0,
+                    env=environment,
+                    start_new_session=True,
+                )
+                if _monitor(process, control, output, model, checking=True) == "quit":
+                    return
+            except BrokenPipeError:
+                return
+            except (
+                DesktopError,
+                desktop_models.models.ModelError,
+                OSError,
+                subprocess.SubprocessError,
+            ) as error:
+                try:
+                    _event(output, "error", message=str(error))
+                except BrokenPipeError:
+                    return
+            finally:
+                if process is not None:
+                    if process.poll() is None or _group_exists(process.pid):
+                        _stop_group(process)
+                    if process.stdout is not None and not process.stdout.closed:
+                        process.stdout.close()
+            continue
         if action != "start":
             continue
         process = None
         try:
+            model = desktop_models.normalize_model_id(
+                MODEL if selected_model is None else selected_model
+            )
             _preflight_with_cancel(preflight, output, control)
             _event(
                 output,
                 "status",
-                stage="download",
-                message="Preparing the recommended model. Open Details to view installer output.",
+                stage="checking",
+                message="Checking model compatibility before download…",
             )
             _check_cancel(control)
             environment = dict(
@@ -419,7 +548,7 @@ def supervise(
                 TRANSFORMERS_VERBOSITY="error",
             )
             process = process_factory(
-                command_factory(),
+                command_factory(model),
                 cwd=ROOT,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -429,7 +558,7 @@ def supervise(
                 start_new_session=True,
             )
             _status(output, "starting", "Starting Splash…")
-            if _monitor(process, control, output) == "quit":
+            if _monitor(process, control, output, model) == "quit":
                 return
         except BrokenPipeError:
             return
@@ -440,7 +569,12 @@ def supervise(
                 return
             if control.cancelled == "quit" or control.eof or _signal_received:
                 return
-        except (DesktopError, OSError, subprocess.SubprocessError) as error:
+        except (
+            DesktopError,
+            desktop_models.models.ModelError,
+            OSError,
+            subprocess.SubprocessError,
+        ) as error:
             try:
                 _event(output, "error", message=str(error))
             except BrokenPipeError:
@@ -465,6 +599,7 @@ def _check_package():
         PYTHON,
         BINARY,
         ROOT / "install/desktop.py",
+        ROOT / "install/desktop_models.py",
         ROOT / "install/launcher.py",
         ROOT / "engine/splash.metallib",
     )

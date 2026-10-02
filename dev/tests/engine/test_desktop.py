@@ -71,8 +71,11 @@ class SupervisorHarness:
         )
         self.thread.start()
 
-    def send(self, action):
-        os.write(self.write_fd, (json.dumps({"action": action}) + "\n").encode())
+    def send(self, action, model=None):
+        command = {"action": action}
+        if model is not None:
+            command["model"] = model
+        os.write(self.write_fd, (json.dumps(command) + "\n").encode())
 
     def close(self):
         try:
@@ -98,7 +101,7 @@ class DesktopTests(unittest.TestCase):
         checks = []
         harness = SupervisorHarness(
             preflight=lambda output, control: checks.append("preflight"),
-            command_factory=lambda: self.fail("launcher must not start"),
+            command_factory=lambda _model: self.fail("launcher must not start"),
         )
         try:
             time.sleep(0.15)
@@ -109,6 +112,34 @@ class DesktopTests(unittest.TestCase):
             self.assertEqual(checks, [])
         finally:
             harness.close()
+
+    def test_delete_runs_when_idle_and_is_refused_while_running(self):
+        harness = SupervisorHarness(
+            preflight=lambda output, control: None,
+            command_factory=lambda _model: self.fail("launcher must not start"),
+        )
+        try:
+            with (
+                mock.patch.object(
+                    desktop.desktop_models, "delete_plan", return_value={"bytes": 5}
+                ),
+                mock.patch.object(desktop.desktop_models, "delete") as delete,
+            ):
+                harness.send("delete_plan", "team/model")
+                event, _seen = harness.output.wait_for("delete_plan")
+                self.assertEqual((event["model"], event["bytes"]), ("team/model", 5))
+                delete.assert_not_called()
+                harness.send("delete", "team/model")
+                harness.output.wait_for("deleted")
+                delete.assert_called_once_with("team/model")
+        finally:
+            harness.close()
+        output = EventOutput()
+        desktop._delete_action(output, "delete", "team/model", busy=True)
+        self.assertEqual(
+            output.drain(),
+            [{"type": "error", "message": "Stop Splash before deleting a model."}],
+        )
 
     def test_packaged_check_only_reads_bundle_files(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -122,6 +153,7 @@ class DesktopTests(unittest.TestCase):
             (root / "release.json").write_text("{}")
             (root / "install/launcher.py").write_text("")
             (root / "install/desktop.py").write_text("")
+            (root / "install/desktop_models.py").write_text("")
             python.touch()
             binary.touch()
             python.chmod(0o755)
@@ -161,7 +193,7 @@ class DesktopTests(unittest.TestCase):
                 launched = mock.Mock()
                 harness = SupervisorHarness(
                     preflight=desktop._preflight,
-                    command_factory=lambda: [sys.executable, "-c", "pass"],
+                    command_factory=lambda _model: [sys.executable, "-c", "pass"],
                     process_factory=launched,
                 )
                 try:
@@ -198,7 +230,7 @@ class DesktopTests(unittest.TestCase):
             ):
                 harness = SupervisorHarness(
                     preflight=lambda _output, _control: None,
-                    command_factory=lambda: [sys.executable, str(script)],
+                    command_factory=lambda _model: [sys.executable, str(script)],
                 )
                 try:
                     harness.send("start")
@@ -232,7 +264,7 @@ class DesktopTests(unittest.TestCase):
             with mock.patch.object(desktop, "RUNTIME_DIR", root / "runtime"):
                 harness = SupervisorHarness(
                     preflight=lambda _output, _control: None,
-                    command_factory=lambda: [sys.executable, str(script)],
+                    command_factory=lambda _model: [sys.executable, str(script)],
                 )
                 try:
                     harness.send("start")
@@ -265,7 +297,7 @@ class DesktopTests(unittest.TestCase):
             with mock.patch.object(desktop, "RUNTIME_DIR", root / "runtime"):
                 harness = SupervisorHarness(
                     preflight=lambda _output, _control: None,
-                    command_factory=lambda: [sys.executable, str(script)],
+                    command_factory=lambda _model: [sys.executable, str(script)],
                 )
                 try:
                     harness.send("start")
@@ -311,7 +343,7 @@ class DesktopTests(unittest.TestCase):
             with mock.patch.object(desktop, "RUNTIME_DIR", root / "runtime"):
                 harness = SupervisorHarness(
                     preflight=lambda _output, _control: None,
-                    command_factory=lambda: [sys.executable, str(script)],
+                    command_factory=lambda _model: [sys.executable, str(script)],
                     process_factory=launch,
                     output=BrokenOutput(),
                 )
@@ -341,6 +373,7 @@ class DesktopTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            model = "team/Qwen3.8-desktop-test"
             server = ThreadingHTTPServer(("127.0.0.1", 0), ReadyHandler)
             server_thread = threading.Thread(target=server.serve_forever, daemon=True)
             server_thread.start()
@@ -352,16 +385,18 @@ class DesktopTests(unittest.TestCase):
                 f"lock = open({str(lock_path)!r}, 'a+')\n"
                 "fcntl.flock(lock, fcntl.LOCK_EX)\n"
                 "lock.seek(0); lock.truncate()\n"
-                f"json.dump({{'pid': os.getpid(), 'model': {desktop.MODEL!r}, 'port': {server.server_port}}}, lock)\n"
+                f"json.dump({{'pid': os.getpid(), 'model': {model!r}, 'port': {server.server_port}}}, lock)\n"
                 "lock.flush()\n"
                 "print('Ready · fake', flush=True)\n"
                 "time.sleep(120)\n"
             )
             attempts = 0
+            received_models = []
 
-            def command():
+            def command(selected_model):
                 nonlocal attempts
                 attempts += 1
+                received_models.append(selected_model)
                 if attempts == 1:
                     return [sys.executable, "-c", "raise SystemExit(7)"]
                 return [sys.executable, str(script)]
@@ -375,14 +410,16 @@ class DesktopTests(unittest.TestCase):
                     command_factory=command,
                 )
                 try:
-                    harness.send("start")
+                    harness.send("start", model)
                     first, _ = harness.output.wait_for("error")
                     self.assertIn("code 7", first["message"])
-                    harness.send("start")
+                    harness.send("start", model)
                     ready, _ = harness.output.wait_for("ready")
                     self.assertEqual(
                         ready["url"], f"http://127.0.0.1:{server.server_port}"
                     )
+                    self.assertEqual(ready["model"], model)
+                    self.assertEqual(received_models, [model, model])
                     harness.send("stop")
                     harness.output.wait_for("stopped")
                     self.assertEqual(attempts, 2)
@@ -391,6 +428,51 @@ class DesktopTests(unittest.TestCase):
                     server.shutdown()
                     server.server_close()
                     server_thread.join(timeout=2)
+
+    def test_stop_cancels_model_check_process_tree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pid_file = root / "descendant.pid"
+            script = root / "slow_model_check.py"
+            script.write_text(
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+                f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+                "print('checking metadata', flush=True)\n"
+                "time.sleep(120)\n"
+            )
+            with mock.patch.object(
+                desktop,
+                "_model_check_command",
+                side_effect=lambda _model: [sys.executable, str(script)],
+            ):
+                harness = SupervisorHarness(
+                    preflight=lambda _output, _control: None,
+                    command_factory=lambda _model: self.fail(
+                        "check must not start the model"
+                    ),
+                )
+                try:
+                    harness.send("check", "team/Qwen3.8-desktop-test")
+                    deadline = time.monotonic() + 5
+                    while not pid_file.exists() and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(pid_file.exists())
+                    child_pid = int(pid_file.read_text())
+                    harness.send("stop")
+                    harness.output.wait_for("stopped")
+                    harness.send("quit")
+                    harness.thread.join(timeout=2)
+                    self.assertFalse(harness.thread.is_alive())
+                    self.assert_process_gone(child_pid)
+                    self.assertFalse(
+                        any(
+                            event.get("type") == "model_checked"
+                            for event in harness.output.drain()
+                        )
+                    )
+                finally:
+                    harness.close()
 
     @staticmethod
     def assert_process_gone(pid):

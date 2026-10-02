@@ -4,7 +4,10 @@ import Darwin
 
 final class DesktopApp: NSObject, NSApplicationDelegate {
     private let setupKey = "successfulSetup"
+    private let selectedModelKey = "selectedModel"
+    private let recommendedModel = "mlx-community/Qwen3.8-27B-4bit"
     private let chatURL = URL(string: "http://127.0.0.1:8000")!
+    private let apiURL = "http://127.0.0.1:8000/v1"
 
     private var window: NSWindow!
     private var statusLabel: NSTextField!
@@ -13,8 +16,16 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
     private var startButton: NSButton!
     private var openButton: NSButton!
     private var stopButton: NSButton!
+    private var modelInputField: NSTextField!
+    private var checkModelButton: NSButton!
+    private var installedModelsPicker: NSPopUpButton!
+    private var refreshModelsButton: NSButton!
+    private var deleteModelButton: NSButton!
     private var detailsButton: NSButton!
     private var copyButton: NSButton!
+    private var copyPiButton: NSButton!
+    private var copyOpenCodeButton: NSButton!
+    private var copyAPIButton: NSButton!
     private var logScroll: NSScrollView!
     private var logView: NSTextView!
     private var logLines: [String] = []
@@ -23,14 +34,18 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
     private var inputPipe: Pipe?
     private var successfulSetup = false
     private var ready = false
+    private var isStarting = false
+    private var isCheckingModel = false
+    private var isStopping = false
     private var terminating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installQuitMenu()
         successfulSetup = UserDefaults.standard.bool(forKey: setupKey)
         makeWindow()
-        if successfulSetup {
-            startSplash()
+        let helperStarted = startSupervisor()
+        if helperStarted {
+            sendAction("models")
         }
     }
 
@@ -56,7 +71,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
 
     private func makeWindow() {
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 590, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 590, height: 630),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -69,11 +84,51 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
 
         let intro = NSTextField(
             wrappingLabelWithString:
-                "First setup downloads the recommended Qwen3.8 model from Hugging Face. "
-                + "Model weights are stored separately from the app, and cached files are reused. "
-                + "Choose Download & Start to begin setup. Later launches may start automatically."
+                "Choose an installed model or enter a Hugging Face repo ID or URL. "
+                + "Model files are stored separately from the app, and cached files are reused. "
+                + "Later launches may start the last model automatically."
         )
         intro.maximumNumberOfLines = 4
+
+        modelInputField = NSTextField(string: selectedModel())
+        modelInputField.placeholderString = "Hugging Face repo ID or URL"
+        modelInputField.target = self
+        modelInputField.action = #selector(modelInputChanged)
+        modelInputField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        modelInputField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        checkModelButton = NSButton(
+            title: "Check Model",
+            target: self,
+            action: #selector(checkModel)
+        )
+        let modelEntryRow = NSStackView(views: [modelInputField, checkModelButton])
+        modelEntryRow.orientation = .horizontal
+        modelEntryRow.alignment = .centerY
+        modelEntryRow.spacing = 8
+
+        installedModelsPicker = NSPopUpButton()
+        installedModelsPicker.addItem(withTitle: "Installed models")
+        installedModelsPicker.lastItem?.isEnabled = false
+        installedModelsPicker.target = self
+        installedModelsPicker.action = #selector(selectInstalledModel)
+        installedModelsPicker.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        installedModelsPicker.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        refreshModelsButton = NSButton(
+            title: "Refresh",
+            target: self,
+            action: #selector(refreshInstalledModels)
+        )
+        deleteModelButton = NSButton(
+            title: "Delete…",
+            target: self,
+            action: #selector(deleteInstalledModel)
+        )
+        let installedModelsRow = NSStackView(
+            views: [installedModelsPicker, refreshModelsButton, deleteModelButton]
+        )
+        installedModelsRow.orientation = .horizontal
+        installedModelsRow.alignment = .centerY
+        installedModelsRow.spacing = 8
 
         spinner = NSProgressIndicator()
         spinner.style = .spinning
@@ -123,12 +178,54 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         detailsHeader.orientation = .horizontal
         detailsHeader.spacing = 8
 
-        logView = NSTextView()
+        let connectionInstructions = NSTextField(
+            wrappingLabelWithString:
+                "Keep Splash M1 running. Install Pi or OpenCode, then paste its command into Terminal "
+                + "opened in your project folder. The commands connect the client to the running model. "
+                + "Pi adds a Splash provider; OpenCode settings apply to that launch."
+        )
+        connectionInstructions.maximumNumberOfLines = 3
+        let connectionTitle = NSTextField(labelWithString: "Connect a coding client")
+        connectionTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        copyPiButton = NSButton(
+            title: "Copy Pi Command",
+            target: self,
+            action: #selector(copyPiCommand)
+        )
+        copyOpenCodeButton = NSButton(
+            title: "Copy OpenCode Command",
+            target: self,
+            action: #selector(copyOpenCodeCommand)
+        )
+        copyAPIButton = NSButton(
+            title: "Copy API URL",
+            target: self,
+            action: #selector(copyAPIURL)
+        )
+        let connectionButtons = NSStackView(views: [copyPiButton, copyOpenCodeButton, copyAPIButton])
+        connectionButtons.orientation = .horizontal
+        connectionButtons.alignment = .centerY
+        connectionButtons.spacing = 8
+
+        logScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 542, height: 180))
+        logView = NSTextView(frame: NSRect(origin: .zero, size: logScroll.contentSize))
         logView.isEditable = false
         logView.isSelectable = true
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         logView.textContainerInset = NSSize(width: 8, height: 8)
-        logScroll = NSScrollView()
+        logView.minSize = NSSize(width: 0, height: 0)
+        logView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        logView.isVerticallyResizable = true
+        logView.isHorizontallyResizable = false
+        logView.autoresizingMask = [.width]
+        logView.textContainer?.containerSize = NSSize(
+            width: logScroll.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        logView.textContainer?.widthTracksTextView = true
         logScroll.documentView = logView
         logScroll.hasVerticalScroller = true
         logScroll.borderType = .bezelBorder
@@ -136,7 +233,20 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         logScroll.isHidden = true
         logScroll.heightAnchor.constraint(equalToConstant: 180).isActive = true
 
-        let stack = NSStackView(views: [title, intro, statusRow, diskLabel, buttons, detailsHeader, logScroll])
+        let stack = NSStackView(views: [
+            title,
+            intro,
+            modelEntryRow,
+            installedModelsRow,
+            statusRow,
+            diskLabel,
+            buttons,
+            connectionTitle,
+            connectionInstructions,
+            connectionButtons,
+            detailsHeader,
+            logScroll,
+        ])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.distribution = .fill
@@ -153,10 +263,15 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
             logScroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
             statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 360),
             intro.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            modelEntryRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            installedModelsRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            connectionInstructions.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         window.contentView = content
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        updateModelControls()
+        updateConnectionControls()
     }
 
     private func installQuitMenu() {
@@ -176,15 +291,21 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func startSplash() {
-        if let supervisor, supervisor.isRunning {
-            setStarting()
-            sendAction("start")
+        let model = modelInputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            statusLabel.stringValue = "Enter a Hugging Face model ID or URL."
             return
         }
+        guard startSupervisor() else { return }
+        setStarting()
+        sendAction("start", model: model)
+    }
 
+    private func startSupervisor() -> Bool {
+        if let supervisor, supervisor.isRunning { return true }
         guard let resources = Bundle.main.resourceURL else {
             showError("The app bundle has no Resources folder.")
-            return
+            return false
         }
         let runtime = resources.appendingPathComponent("runtime", isDirectory: true)
         let python = runtime.appendingPathComponent("python/bin/python3")
@@ -192,7 +313,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: helper.path) else {
             showError("The bundled Splash runtime is incomplete. Reinstall the app and retry.")
-            return
+            return false
         }
 
         let process = Process()
@@ -216,7 +337,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
             try process.run()
         } catch {
             showError("Could not start Splash: \(error.localizedDescription)")
-            return
+            return false
         }
         supervisor = process
         inputPipe = input
@@ -232,14 +353,75 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
                 self.receive(data)
             }
         }
-        setStarting()
-        sendAction("start")
+        return true
+    }
+
+    @objc private func checkModel() {
+        let model = modelInputField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            statusLabel.stringValue = "Enter a Hugging Face model ID or URL."
+            return
+        }
+        guard startSupervisor() else { return }
+        ready = false
+        isStarting = false
+        isCheckingModel = true
+        isStopping = false
+        spinner.startAnimation(nil)
+        statusLabel.stringValue = "Checking model metadata…"
+        startButton.isEnabled = false
+        openButton.isEnabled = false
+        stopButton.isEnabled = true
+        updateModelControls()
+        updateConnectionControls()
+        sendAction("check", model: model)
+    }
+
+    @objc private func refreshInstalledModels() {
+        guard startSupervisor() else { return }
+        sendAction("models")
+    }
+
+    @objc private func deleteInstalledModel() {
+        guard let model = installedModelsPicker.selectedItem?.representedObject as? String,
+              startSupervisor() else { return }
+        sendAction("delete_plan", model: model)
+    }
+
+    private func confirmDelete(_ model: String, bytes: Int64) {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        let alert = NSAlert()
+        alert.messageText = "Delete \(model)?"
+        alert.informativeText =
+            "Frees about \(formatter.string(fromByteCount: bytes)). The DFlash draft is kept."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            sendAction("delete", model: model)
+        }
+    }
+
+    @objc private func modelInputChanged() {
+        updateModelControls()
+    }
+
+    @objc private func selectInstalledModel() {
+        guard let model = installedModelsPicker.selectedItem?.representedObject as? String else {
+            return
+        }
+        modelInputField.stringValue = model
+        updateModelControls()
     }
 
     @objc private func stopSplash() {
         guard supervisor?.isRunning == true else { return }
+        isStopping = true
         statusLabel.stringValue = "Stopping Splash…"
         stopButton.isEnabled = false
+        updateModelControls()
+        updateConnectionControls()
         sendAction("stop")
     }
 
@@ -248,8 +430,14 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleDetails() {
-        logScroll.isHidden.toggle()
+        let showingDetails = logScroll.isHidden
+        logScroll.isHidden = !showingDetails
         detailsButton.title = logScroll.isHidden ? "Show Details" : "Hide Details"
+        var frame = window.frame
+        let heightChange: CGFloat = showingDetails ? 180 : -180
+        frame.size.height += heightChange
+        frame.origin.y -= heightChange / 2
+        window.setFrame(frame, display: true, animate: true)
         window.contentView?.layoutSubtreeIfNeeded()
     }
 
@@ -258,14 +446,96 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         NSPasteboard.general.setString(logView.string, forType: .string)
     }
 
+    @objc private func copyPiCommand() {
+        copyClientCommand("pi")
+    }
+
+    @objc private func copyOpenCodeCommand() {
+        copyClientCommand("opencode")
+    }
+
+    @objc private func copyAPIURL() {
+        guard ready, !isStopping else { return }
+        copyToPasteboard(apiURL)
+    }
+
+    private func copyClientCommand(_ client: String) {
+        guard ready, !isStopping,
+              let resources = Bundle.main.resourceURL else { return }
+        let launcher = resources
+            .appendingPathComponent("runtime", isDirectory: true)
+            .appendingPathComponent("splash-m1")
+            .path
+        copyToPasteboard("\(shellQuote(launcher)) \(client)")
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func selectedModel() -> String {
+        UserDefaults.standard.string(forKey: selectedModelKey) ?? recommendedModel
+    }
+
+    private func updateModelControls() {
+        guard modelInputField != nil else { return }
+        let enabled = !ready && !isStarting && !isCheckingModel && !isStopping
+        modelInputField.isEnabled = enabled
+        checkModelButton.isEnabled = enabled
+        refreshModelsButton.isEnabled = enabled
+        deleteModelButton.isEnabled =
+            enabled && installedModelsPicker.selectedItem?.representedObject is String
+        installedModelsPicker.isEnabled = enabled && installedModelsPicker.numberOfItems > 1
+    }
+
+    private func updateConnectionControls() {
+        let enabled = ready && !isStopping
+        copyPiButton?.isEnabled = enabled
+        copyOpenCodeButton?.isEnabled = enabled
+        copyAPIButton?.isEnabled = enabled
+    }
+
+    private func updateInstalledModels(_ values: [[String: Any]]) {
+        installedModelsPicker.removeAllItems()
+        let models = values.compactMap { value -> (String, String)? in
+            guard let model = value["model"] as? String, !model.isEmpty else { return nil }
+            let name = (value["name"] as? String ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = name.isEmpty ? model : name
+            return (model, displayName)
+        }
+        if models.isEmpty {
+            installedModelsPicker.addItem(withTitle: "No installed models")
+            installedModelsPicker.lastItem?.isEnabled = false
+        } else {
+            installedModelsPicker.addItem(withTitle: "Installed models")
+            installedModelsPicker.lastItem?.isEnabled = false
+            for (model, name) in models {
+                installedModelsPicker.addItem(withTitle: name)
+                installedModelsPicker.lastItem?.representedObject = model
+            }
+        }
+        updateModelControls()
+    }
+
     private func setStarting() {
         ready = false
+        isStarting = true
+        isCheckingModel = false
+        isStopping = false
         spinner.startAnimation(nil)
         statusLabel.stringValue = "Starting Splash…"
         startButton.isEnabled = false
         startButton.title = successfulSetup ? "Start Splash" : "Download & Start"
         openButton.isEnabled = false
         stopButton.isEnabled = true
+        updateModelControls()
+        updateConnectionControls()
     }
 
     private func receive(_ data: Data) {
@@ -298,32 +568,87 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
             let message = event["message"] as? String ?? ""
             appendLog(message)
             updateProgressFromLog(message)
+        case "models":
+            updateInstalledModels(event["models"] as? [[String: Any]] ?? [])
+        case "delete_plan":
+            if let model = event["model"] as? String {
+                confirmDelete(model, bytes: (event["bytes"] as? NSNumber)?.int64Value ?? 0)
+            }
+        case "deleted":
+            let model = event["model"] as? String
+            if model == selectedModel() {
+                UserDefaults.standard.set(recommendedModel, forKey: selectedModelKey)
+            }
+            if model == modelInputField.stringValue {
+                modelInputField.stringValue = recommendedModel
+            }
+            let remaining = (0..<installedModelsPicker.numberOfItems).filter {
+                let item = installedModelsPicker.item(at: $0)
+                return item?.representedObject is String && item?.representedObject as? String != model
+            }
+            if remaining.isEmpty {
+                successfulSetup = false
+                UserDefaults.standard.set(false, forKey: setupKey)
+                startButton.title = "Download & Start"
+            }
+            statusLabel.stringValue = "Deleted \(model ?? "model")."
+        case "model_checked":
+            isCheckingModel = false
+            spinner.stopAnimation(nil)
+            if let model = event["model"] as? String {
+                modelInputField.stringValue = model
+            }
+            statusLabel.stringValue = event["message"] as? String
+                ?? "Model metadata is compatible; native tensor validation occurs during startup."
+            startButton.title = successfulSetup ? "Start Splash" : "Download & Start"
+            startButton.isEnabled = true
+            openButton.isEnabled = false
+            stopButton.isEnabled = false
+            updateModelControls()
+            updateConnectionControls()
         case "ready":
             ready = true
+            isStarting = false
+            isCheckingModel = false
+            isStopping = false
             successfulSetup = true
             UserDefaults.standard.set(true, forKey: setupKey)
+            let model = event["model"] as? String ?? modelInputField.stringValue
+            modelInputField.stringValue = model
+            UserDefaults.standard.set(model, forKey: selectedModelKey)
             spinner.stopAnimation(nil)
-            statusLabel.stringValue = "Splash is ready. Opening chat…"
+            statusLabel.stringValue = "Splash is ready."
             startButton.isEnabled = false
             openButton.isEnabled = true
             stopButton.isEnabled = true
-            NSWorkspace.shared.open(chatURL)
+            updateModelControls()
+            updateConnectionControls()
         case "error":
             ready = false
+            isStarting = false
+            isCheckingModel = false
+            isStopping = false
             spinner.stopAnimation(nil)
             statusLabel.stringValue = event["message"] as? String ?? "Splash could not start."
             startButton.title = successfulSetup ? "Retry" : "Retry Setup"
             startButton.isEnabled = true
             openButton.isEnabled = false
             stopButton.isEnabled = false
+            updateModelControls()
+            updateConnectionControls()
         case "stopped":
             ready = false
+            isStarting = false
+            isCheckingModel = false
+            isStopping = false
             spinner.stopAnimation(nil)
             statusLabel.stringValue = "Splash is stopped."
             startButton.title = successfulSetup ? "Start Splash" : "Download & Start"
             startButton.isEnabled = true
             openButton.isEnabled = false
             stopButton.isEnabled = false
+            updateModelControls()
+            updateConnectionControls()
         default:
             appendLog(line)
         }
@@ -361,10 +686,12 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func sendAction(_ action: String) {
+    private func sendAction(_ action: String, model: String? = nil) {
         guard let inputPipe else { return }
         do {
-            var data = try JSONSerialization.data(withJSONObject: ["action": action])
+            var command: [String: String] = ["action": action]
+            if let model { command["model"] = model }
+            var data = try JSONSerialization.data(withJSONObject: command)
             data.append(0x0A)
             try inputPipe.fileHandleForWriting.write(contentsOf: data)
         } catch {
@@ -373,11 +700,17 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
     }
 
     private func showError(_ message: String) {
+        ready = false
+        isStarting = false
+        isCheckingModel = false
+        isStopping = false
         spinner?.stopAnimation(nil)
         statusLabel?.stringValue = message
         startButton?.isEnabled = true
         openButton?.isEnabled = false
         stopButton?.isEnabled = false
+        updateModelControls()
+        updateConnectionControls()
     }
 
     private func supervisorExited(_ child: Process) {
@@ -390,6 +723,9 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         inputPipe = nil
         let wasReady = ready
         ready = false
+        isStarting = false
+        isCheckingModel = false
+        isStopping = false
         spinner.stopAnimation(nil)
         statusLabel.stringValue = wasReady
             ? "Splash stopped unexpectedly. Retry to start it again."
@@ -398,6 +734,8 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         startButton.isEnabled = true
         openButton.isEnabled = false
         stopButton.isEnabled = false
+        updateModelControls()
+        updateConnectionControls()
     }
 
     static func checkBundle() -> Int32 {
@@ -413,6 +751,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         let requiredPaths = [
             runtime.appendingPathComponent("release.json"),
             runtime.appendingPathComponent("install/desktop.py"),
+            runtime.appendingPathComponent("install/desktop_models.py"),
             runtime.appendingPathComponent("install/launcher.py"),
             runtime.appendingPathComponent("engine/splash.metallib"),
         ] + executablePaths

@@ -25,6 +25,7 @@ INSTALL_FILES = (
     "paths.py",
     "models.py",
     "desktop.py",
+    "desktop_models.py",
     "hub.py",
     "families.py",
     "assembly.py",

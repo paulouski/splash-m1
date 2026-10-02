@@ -9,10 +9,14 @@ The desktop app is being prepared for release. No public download has been publi
 Once a desktop release is available:
 
 1. Download the **Mac app** ZIP, unzip it, and drag **Splash M1.app** to Applications.
-2. Open Splash M1 and click **Download & Start**. It downloads the recommended Qwen3.8-27B model and its matching draft from Hugging Face, then prepares them for your Mac.
+2. Open Splash M1. Use the recommended model, or paste a Hugging Face model link or repository ID and click **Check Model**. Unsupported configurations are refused before model weights are downloaded. Click **Download & Start** to download the selected model and its matching draft, then prepare them for your Mac.
 3. The app opens your browser when the chat is ready. Keep Splash M1 running while you chat; use **Stop** or quit the app to release the model.
 
-Python, Xcode, and Terminal are not required for the packaged app. The first setup needs internet access and additional disk space for model weights; download and preparation status appears in the app. Later launches reuse cached weights and settings. The default desktop configuration uses a 32K context and requires 32 GB of memory.
+The **Installed models** menu lists compatible models already installed through Splash. Select one and start it to reuse its files; stop the running model before choosing another. **Show Details** displays installation and server output. The compatibility check inspects model metadata; the engine validates the actual tensors during startup.
+
+For [Pi](https://pi.dev/) or [OpenCode](https://opencode.ai/docs/), install the client first, start Splash, and wait until it is ready. Click **Copy Pi Command** or **Copy OpenCode Command**, then paste the command into Terminal in your project folder. The launcher connects the client to the currently loaded model and context. Pi's launcher adds a Splash provider to its model configuration; OpenCode receives settings for that launch. Keep Splash M1 running while the client uses it. **Copy API URL** provides the OpenAI-compatible endpoint for other clients.
+
+Python, Xcode, and Terminal are not required for the packaged app. The first setup needs internet access and additional disk space for model weights; download and preparation status appears in the app. Later launches reuse cached weights and settings. The default desktop configuration uses a 32K context and requires 32 GB of memory. Macs with 16 GB can run only the 2-bit Prism checkpoint (Ternary Bonsai 2), with a context sized automatically to the available memory; this 16 GB configuration has not been tested on 16 GB hardware.
 
 Local review builds are not Developer ID signed or notarized. A public desktop release still needs signing and a check of the complete first-run flow.
 
@@ -62,10 +66,12 @@ The command-line package is also implemented but has not been published yet. Aft
 
 ~~~sh
 curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | sh
-splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit --language-only --max-context 32K
+splash-m1 start
 ~~~
 
-Follow any PATH instruction printed by the installer. When the server reports Ready, open http://127.0.0.1:8000. Press Ctrl+C to stop it. No Homebrew tap is available.
+Follow any PATH instruction printed by the installer. `start` uses the recommended Qwen3.8-27B Q4 model, text-only mode, and a 32K context. The server stays in the terminal and prints its address and logs; when it reports Ready, open http://127.0.0.1:8000. Press Ctrl+C to stop it. The desktop app is optional.
+
+To connect an installed coding client, open a second terminal in your project folder and run `splash-m1 pi` or `splash-m1 opencode`. Keep the server terminal open. For another checkpoint or server settings, use `splash-m1 start --model OWNER/REPO --max-context 32K` or `splash-m1 serve --help`. No Homebrew tap is available.
 
 ## Build from source
 

@@ -30,6 +30,10 @@ else:
     import legacy
     import models
 
+PRISM_FORMAT = "mlx-prism"
+PRISM_DRAFT_REPO = "naklitechie/Qwen3.8-27B-DFlash2-ternary-bonsai2"
+PRISM_MODEL_TYPE = "prism_hadamard_qwen35"
+
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
     "tokenizer.json",
@@ -46,7 +50,7 @@ TOKENIZER_FILES = (
 class Target:
     """What the target repository supplies, known before any weight download."""
 
-    # The record's target_format: "mlx-affine" or "gguf".
+    # The record's target_format: "mlx-affine", "mlx-prism" or "gguf".
     format: str
     # The record's vision_format: "none", "safetensors" or "gguf".
     vision_format: str
@@ -190,23 +194,38 @@ def _mlx_target(repo, language_only):
             f"repository{hint}."
         )
     config = models.read_json(repo.file("config.json"))
-    # MLX states its quantization under "quantization"; a transformers
-    # quantization_config alone describes another method (GPTQ, AWQ, ...).
-    quant = config.get("quantization")
-    if (
-        not isinstance(quant, dict)
-        or quant.get("mode", "affine") != "affine"
-        or quant.get("bits") != 4
-        or quant.get("group_size") != 64
-    ):
-        raise models.ModelError(
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
-        )
+    prism = config.get("model_type") == PRISM_MODEL_TYPE
+    if prism:
+        # The checkpoint holds its vision tower in the one file; text only.
+        if not language_only:
+            raise models.ModelError(
+                "a Prism Hadamard checkpoint serves text only; use --language-only"
+            )
+        require_prism_config(config)
+        if "hadamard.json" not in repo.files:
+            raise models.ModelError(
+                f"target repository {repo.name} is missing: hadamard.json"
+            )
+    else:
+        # MLX states its quantization under "quantization"; a transformers
+        # quantization_config alone describes another method (GPTQ, AWQ, ...).
+        quant = config.get("quantization")
+        if (
+            not isinstance(quant, dict)
+            or quant.get("mode", "affine") != "affine"
+            or quant.get("bits") != 4
+            or quant.get("group_size") != 64
+        ):
+            raise models.ModelError(
+                "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
+            )
     files = {
         path: "config.json"
         for path in ("config.json", "target/config.json", "tokenizer/config.json")
     }
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
+    if prism:
+        files["target/hadamard.json"] = "hadamard.json"
     if not language_only:
         _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
         shards = _weight_files(repo, "vision_tower.")
@@ -218,8 +237,28 @@ def _mlx_target(repo, language_only):
         files |= {"vision/" + n: n for n in shards}
     files |= {"target/" + n: n for n in _weight_files(repo)}
     return Target(
-        "mlx-affine", "none" if language_only else "safetensors", config, files
+        PRISM_FORMAT if prism else "mlx-affine",
+        "none" if language_only else "safetensors",
+        config,
+        files,
     )
+
+
+def require_prism_config(config):
+    """Raise unless config states the one Prism Hadamard layout the native
+    loader reads: schema 2, affine 2-bit/group-128 quantization."""
+    quant = config.get("quantization")
+    if (
+        config.get("schema_version") != 2
+        or not isinstance(quant, dict)
+        or quant.get("mode", "affine") != "affine"
+        or quant.get("bits") != 2
+        or quant.get("group_size") != 128
+    ):
+        raise models.ModelError(
+            "a Prism Hadamard checkpoint requires schema 2 and MLX affine "
+            "2-bit/group-128 quantization"
+        )
 
 
 def _weight_files(repo, prefix=""):
@@ -342,7 +381,9 @@ def _start_installed(selection, target, installed):
         )
     recorded = installed["sources"]["target"]
     family = families.named(installed["family"])
-    draft = family and _resolve_draft(family, selection, installed, target)
+    draft = family and _resolve_draft(
+        family, selection, installed, target, installed["target_format"]
+    )
     if draft and draft.unreachable_reason:
         print(
             f"Could not reach the Hub ({draft.unreachable_reason}); "
@@ -432,7 +473,9 @@ def _install(selection, repo, installed, draft=None):
         target = inspect_target(repo, selection.variant, selection.language_only)
         family = families.family_for(target.config)
         if draft is None:
-            draft = _resolve_draft(family, selection, installed, repo)
+            draft = _resolve_draft(
+                family, selection, installed, repo, target.format
+            )
         draft, files = _draft(family, installed, draft)
         print(
             f"Installing {selection.model} as {family.name} ({target.format}); "
@@ -500,14 +543,18 @@ def _changes(installed, family, draft):
     return changes
 
 
-def _resolve_draft(family, selection, installed, target):
+def default_draft(family, target_format):
+    return PRISM_DRAFT_REPO if target_format == PRISM_FORMAT else family.draft.repo
+
+
+def _resolve_draft(family, selection, installed, target, target_format):
     """The draft's repository, --draft-model or else the family's DFlash2
     release, at the commit its default branch names now: one Hub request, as
     for the target, made only when the Hub answered for the target. Else the
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
     the reason, when the draft cannot be resolved."""
-    name = selection.draft_model or family.draft.repo
+    name = selection.draft_model or default_draft(family, target_format)
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
