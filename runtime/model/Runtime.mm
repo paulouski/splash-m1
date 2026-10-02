@@ -681,16 +681,17 @@ struct Runtime::Impl {
     }
   }
 
-  // A draft-less single-row cycle must never accept a stale proposal. An
-  // enormous q makes row 0 always reject and the residual fall back to a plain
-  // target sample.
+  // A draft-less cycle must never accept a stale proposal. An out-of-vocabulary
+  // id with an enormous q makes row 0 always reject, and since no target id
+  // matches it the residual is the plain target distribution.
   void stageRejectedProposal(uint32_t lane, uint32_t *lookupTokens) {
-    lookupTokens[0] = 0;
+    constexpr uint32_t kNoToken = std::numeric_limits<uint32_t>::max();
+    lookupTokens[0] = kNoToken;
     auto *ids = contents<uint32_t>(
         decodeArena->get(lane, DecodeTensor::Candidates), "reject q ids");
     auto *probs = contents<float>(
         decodeArena->get(lane, DecodeTensor::ProposalProbs), "reject q probs");
-    std::fill(ids, ids + 16, 0U);
+    std::fill(ids, ids + 16, kNoToken);
     std::fill(probs, probs + 16, std::numeric_limits<float>::max());
   }
 
@@ -2486,7 +2487,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // The AR ladder mode reuses the same graph: the draft is skipped
     // (draftComputed=false) and maximumRetained is forced to 1, so only row 0
     // of the 8-row verify batch (the causally-isolated anchor continuation)
-    // is ever committed -- bit-identical to a real single-token target step.
+    // is ever committed -- bit-identical to a real single-token target step
+    // when greedy; sampled AR lanes reject a staged out-of-vocabulary proposal.
     // Rows 1..7 embed whatever proposedTokens buffer is stale from a prior
     // cycle; they cannot affect row 0 and are rejected by the acceptance cap
     // exactly like a low-acceptance speculative cycle. The draft's context
@@ -2515,11 +2517,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     }
     // A prompt-lookup miss decodes row 0 alone: no draft, one token retained.
     laneResult.singleRow = impl_->decodeSingleRow && items.size() == 1 && !laneResult.lookup;
-    if (laneResult.singleRow) {
+    if (laneResult.singleRow)
       laneResult.maximumRetained = 1;
-      if (Impl::samplingEnabled(entry))
-        impl_->stageRejectedProposal(lane, lookupTokens);
-    }
+    if ((laneResult.singleRow || arLane) && Impl::samplingEnabled(entry))
+      impl_->stageRejectedProposal(lane, lookupTokens);
     laneResult.draftComputed = !arLane && !laneResult.lookup && !laneResult.singleRow;
     laneResult.verify = true;
   }
