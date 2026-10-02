@@ -177,7 +177,7 @@ void QwenTarget::requireSingleRowDecode() const {
     if (projection.layout() != ops::WeightLayout::Block32)
       throw std::invalid_argument("single-row decode needs a PQ2_0 GGUF target, not an affine one");
     for (const ops::QuantizedSegment &s : projection.blocks().segments)
-      if (!s.isFloat() && s.formatId != GGUF_FMT_PQ20)
+      if (!s.isFloat() && !gguf_gemv_format(s.formatId))
         throw std::invalid_argument(std::string("single-row decode needs a PQ2_0 GGUF target, found ") + s.name());
   };
   const auto *const *dense = std::get_if<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *>(&weights_);

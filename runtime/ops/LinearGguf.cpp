@@ -41,6 +41,26 @@ std::string prefillKernel(const char *format, char epilogue, bool mma) {
   return std::string(mma ? "gguf_prefill_mma_" : "gguf_prefill_") + format + "_" + epilogue;
 }
 
+// The kernel that runs one segment on `route` (not the GEMV): `rows` are the storage rows of a staged tile and the
+// lanes of the register tile. A prefill kernel has no fp32 instance.
+std::string tensorKernel(GgufRoute route, const QuantizedSegment &s, uint32_t rows, char epilogue, bool mma,
+                         FloatOutput destination) {
+  if (route == GgufRoute::Prefill) return prefillKernel(s.name(), epilogue, mma);
+  if (route == GgufRoute::Register)
+    return kernelInstance(std::string("gguf_decode_sg_") + s.name() + "_l" + std::to_string(rows) + "_" + epilogue,
+                          destination);
+  return kernelInstance(decodeKernel(route == GgufRoute::StagedHalfInput ? "pq20rb" : s.name(), rows, epilogue, mma),
+                        destination);
+}
+// The kernel of a fused dispatch; `pq20`: every segment is PQ2_0. Fused kernels have no fp32 instance.
+std::string fusedKernel(GgufRoute route, uint32_t rows, bool mma, bool pq20) {
+  if (route == GgufRoute::Register) return "gguf_decode_sg_fused_l" + std::to_string(rows);
+  return std::string(!mma                                  ? "gguf_decode_fused_m"
+                     : route == GgufRoute::StagedHalfInput ? "gguf_decode_mma_fused_pq20rb_m"
+                     : pq20                                ? "gguf_decode_mma_fused_pq20_m"
+                                                           : "gguf_decode_mma_fused_m") + std::to_string(rows);
+}
+
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
 // partitions while the grid holds fewer than `threadgroups` threadgroups per
 // core and each partition would still keep `inputs` inputs; the split count
@@ -227,7 +247,7 @@ bool gemvEligible(const LinearWorkload &w, FloatOutput destination, const std::v
   if (destination == FloatOutput::Float32 && w.epilogue != LinearEpilogue::None) return false;
   if (gate && gate->blocks().segments.size() != 1) return false;
   const auto fits = [&](const QuantizedSegment &s) {
-    return s.formatId == GGUF_FMT_PQ20 && s.outputSize % kGemvRows == 0 && gemvSplits(s.outputSize, s.inputSize) &&
+    return gguf_gemv_format(s.formatId) && s.outputSize % kGemvRows == 0 && gemvSplits(s.outputSize, s.inputSize) &&
            gemvStageBytes(s.inputSize) <= scratch.gemvStaged.sizeBytes() &&
            gemvPartialBytes(s.outputSize, s.inputSize, gate != nullptr) <= scratch.gemvPartials.sizeBytes();
   };
@@ -238,7 +258,7 @@ bool gemvEligible(const LinearWorkload &w, FloatOutput destination, const std::v
 // (accumulate_pq20_rb), which reads whole 128-input units of K per split.
 bool registerAEligible(uint32_t appleGpuFamily, const LinearConfig &config, uint32_t k,
                        const std::vector<QuantizedSegment> &segments, const Projection *gate) {
-  const auto pq20 = [](const QuantizedSegment &s) { return s.formatId == GGUF_FMT_PQ20; };
+  const auto pq20 = [](const QuantizedSegment &s) { return gguf_register_a_format(s.formatId); };
   return mmaTiles(appleGpuFamily) && config.tile == LinearTile::GgufStaged && config.simdgroups == LinearSimdgroups::Two &&
          (k / 32 / config.splits) % 4 == 0 && std::all_of(segments.begin(), segments.end(), pq20) &&
          (!gate || std::all_of(gate->blocks().segments.begin(), gate->blocks().segments.end(), pq20));
@@ -365,7 +385,12 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     }
     return;
   }
-  const bool gemv = gemvEligible(w, plan.destination(), segments, gate, b.scratch);
+  const GgufRoute route = gemvEligible(w, plan.destination(), segments, gate, b.scratch) ? GgufRoute::Gemv
+                        : config.tile == LinearTile::GgufRegister              ? GgufRoute::Register
+                        : config.simdgroups != LinearSimdgroups::Two           ? GgufRoute::Prefill
+                        : b.halfInput                                          ? GgufRoute::StagedHalfInput
+                                                                               : GgufRoute::Staged;
+  const bool gemv = route == GgufRoute::Gemv;
   if (p.rotation) {
     // Weights stored for rotated inputs (InputRotation): the quantized
     // segments, and a gate/up pair's gate too, read H (D x) from the scratch,
@@ -387,12 +412,12 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     addGguf(graph, rotated, plain, plan, gate, stats);
     return;
   }
-  if (gemv) {
+  if (route == GgufRoute::Gemv) {
     addGgufGemv(graph, b, p, plan, gate);
-  } else if (config.tile == LinearTile::GgufRegister) {
+  } else if (route == GgufRoute::Register) {
     addGgufRegister(graph, b, p, plan, gate);
-  } else if (config.simdgroups == LinearSimdgroups::Two) {
-    addGgufStaged(graph, b, p, plan, gate);
+  } else if (route != GgufRoute::Prefill) {
+    addGgufStaged(graph, b, p, plan, gate, route);
   } else {
     // Prefill chunks of more than kMaximumDecodeTileRows rows: one dispatch
     // per segment over 128-row tiles; rows past w.rows stay inside the
@@ -404,7 +429,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     for (const QuantizedSegment &s : segments) {
       std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
       if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
-      graph.add(prefillKernel(s.name(), epilogue, mma), std::move(bindings),
+      graph.add(tensorKernel(route, s, 0, epilogue, mma, plan.destination()), std::move(bindings),
                 GgufPrefillParams{s.outputSize, k, w.rows, n, s.columnOffset},
                 {plan.storageRows() / tileRows, s.outputSize / GGUF_TILE_COLUMNS, 1},
                 {mma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS, 1, 1});
@@ -421,19 +446,19 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
 // chunks run one dispatch per segment.
 void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
-                             const Projection *gate) const {
+                             const Projection *gate, GgufRoute route) const {
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  const bool mma = mmaTiles(appleGpuFamily_);
   const uint32_t rows = plan.storageRows(), splits = config.splits;
   // One partition never touches the partials and counters: the output stands in.
   const metal::MetalBuffer partials = splits > 1 ? b.scratch.partials : b.output;
   const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(b.halfInput ? "pq20rb" : s.name(), rows, epilogue, mmaTiles(appleGpuFamily_)),
-                             plan.destination()),
+    graph.add(tensorKernel(route, s, rows, epilogue, mma, plan.destination()),
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
               {GGUF_STAGED_THREADS, 1, 1});
@@ -463,10 +488,7 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   bindings.insert(bindings.end(), {b.output, partials, counters});
   const bool pq20 = std::all_of(order.begin(), order.end(),
                                 [](const QuantizedSegment *s) { return s->formatId == GGUF_FMT_PQ20; });
-  graph.add(std::string(!mmaTiles(appleGpuFamily_) ? "gguf_decode_fused_m"
-                        : b.halfInput             ? "gguf_decode_mma_fused_pq20rb_m"
-                        : pq20                    ? "gguf_decode_mma_fused_pq20_m"
-                                                  : "gguf_decode_mma_fused_m") + std::to_string(rows), std::move(bindings), params,
+  graph.add(fusedKernel(route, rows, mma, pq20), std::move(bindings), params,
             {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
 }
 
@@ -514,19 +536,19 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
-  const std::string suffix = "_l" + std::to_string(lanes);
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, b.scratch.partials, b.scratch.counters});
-    graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
+    graph.add(fusedKernel(GgufRoute::Register, lanes, false, false), std::move(bindings), params, grid,
+              {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
+    graph.add(tensorKernel(GgufRoute::Register, s, lanes, epilogue, false, plan.destination()),
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, b.scratch.partials,
                b.scratch.counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset}, grid, {GGUF_REGISTER_THREADS, 1, 1});

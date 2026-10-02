@@ -91,6 +91,11 @@ inline constexpr bool gguf_embedding_format(uint32_t format) {
          format == GGUF_FMT_PQ20;
 }
 
+// The formats whose decode has a dedicated path: the PQ2_0 register-A MMA tile (accumulate_pq20_rb, which reads
+// half input rows) and the one-row GEMV (kernels/decode/linear_gguf_gemv.metal).
+inline constexpr bool gguf_register_a_format(uint32_t format) { return format == GGUF_FMT_PQ20; }
+inline constexpr bool gguf_gemv_format(uint32_t format) { return format == GGUF_FMT_PQ20; }
+
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard
 // transform of every block of GGUF_ROTATION_BLOCK inputs and D their int8

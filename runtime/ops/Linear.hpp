@@ -238,6 +238,11 @@ struct LinearBuffers final {
   bool halfInput = false;
 };
 
+// How Linear::addGguf runs the quantized segments of one projection (LinearGguf.cpp): the one-row GEMV, the Apple9
+// register tile, the staged decode tile (on half input rows when a rotation feeds PQ2_0's register-A tile), or the
+// 128-row prefill tile.
+enum class GgufRoute : uint8_t { Gemv, Register, Staged, StagedHalfInput, Prefill };
+
 struct LinearDispatchStats final {
   uint64_t fusedSourceOperations = 0;
   uint64_t m16Dispatches = 0;
@@ -351,7 +356,7 @@ private:
                const Projection *gate, LinearDispatchStats *stats) const;
   void addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &buffers,
                      const Projection &projection, const LinearPlan &plan,
-                     const Projection *gate) const;
+                     const Projection *gate, GgufRoute route) const;
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;

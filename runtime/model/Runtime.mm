@@ -299,7 +299,10 @@ struct Runtime::Impl {
   const engine::DecodePolicyConfig decodeLadderConfig =
       engine::decodePolicyConfigFromEnvironment();
   // SPLASH_DECODE_M1: prompt-lookup misses decode row 0 alone; the GEMV scratch exists only then.
-  const bool decodeSingleRow = engine::decodeSingleRowFromEnvironment();
+  const bool decodeSingleRow = [] {
+    const char *raw = std::getenv("SPLASH_DECODE_M1");
+    return raw && std::string_view(raw) == "1";
+  }();
   MetalBuffer gemvStaged;
   MetalBuffer gemvPartials;
   explicit Impl(RuntimeContext value)

@@ -217,12 +217,6 @@ inline double envDouble(const char *name, double defaultValue) {
 }
 } // namespace decode_policy_detail
 
-// SPLASH_DECODE_M1=1: single-row decode of prompt-lookup misses through the PQ2_0 GEMV (default off). Read once per
-// model runtime construction.
-inline bool decodeSingleRowFromEnvironment() {
-  return decode_policy_detail::envFlag("SPLASH_DECODE_M1", false);
-}
-
 // Reads SPLASH_DECODE_LADDER (default off) and its tuning overrides. Called
 // once per model runtime construction; the CLI --decode-ladder flag sets the
 // same environment variable before the model is built (runtime/main.mm).
