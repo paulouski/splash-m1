@@ -40,6 +40,22 @@ make check-source check-native-cpu check-python-engine
 
 This requires the development dependencies and a Mac with the Xcode Metal tools. It does not download model weights or run a model on the GPU. Model-backed runtime checks require a separate model and GPU run.
 
+## Environment variables
+
+Runtime tuning variables are experimental and unsupported as a user interface. Unset means the default shown.
+
+| Variable | Effect | Default | Read |
+| --- | --- | --- | --- |
+| `SPLASH_DECODE_M1` | `1` decodes prompt-lookup misses as one row through the PQ2_0 GEMV (Bonsai only; allocates its scratch) | off | once per model runtime |
+| `SPLASH_DECODE_LADDER` | `1` enables the adaptive autoregressive/speculative decode policy; `--decode-ladder` sets it | off | once per model runtime |
+| `SPLASH_DECODE_LADDER_WINDOW`, `_ELIGIBLE`, `_PROBE`, `_MIN_EVIDENCE`, `_MAX_PERIOD` | Policy cycle counts: rolling window, cycles between probes, probe length, probe evidence, longest probe period | 8, 8, 8, 8, 64 | once per model runtime |
+| `SPLASH_DECODE_LADDER_GATE`, `_BACKOFF_LOSS` | Probe speed ratio that switches mode; loss fraction that doubles the probe period | 1.05, 0.20 | once per model runtime |
+| `SPLASH_LOOKUP_MIN` | Shortest earlier match (tokens) that prompt-lookup drafting uses; `0` turns it off | 16 | once per process |
+| `SPLASH_DRAFT_TEMP_SCALE` | Factor on the sampling temperature of the draft | 0.8 | once per process |
+| `SPLASH_ACCEPT_LOG` | Path; appends one tab-separated line per verify cycle (analysis only) | unset | at process start |
+| `SPLASH_WEIGHT_CACHE` | Directory of prepared model weights | `~/Library/Caches/Splash/weights` | at each preparation |
+| `SPLASH_VERSION`, `SPLASH_REPO`, `SPLASH_BASE_URL`, `SPLASH_TOKEN`, `SPLASH_APP_DIR`, `SPLASH_BIN_DIR` | `dev/tools/install.sh`: release version, GitHub repository, asset base URL, its bearer token, app and command directories | latest release | per install |
+
 ## Package for review
 
 The macOS 15 package is implemented but is not a published release. To build the review artifact locally:
