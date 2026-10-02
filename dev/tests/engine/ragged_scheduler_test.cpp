@@ -139,6 +139,39 @@ void testWarmupTimingSeedsFirstContendedCommand() {
   }
 }
 
+// A runtime with fewer lanes than the compiled maximum never plans or commits a wider command.
+void testRuntimeLaneCapNarrowsCommands() {
+  engine::Scheduler scheduler;
+  scheduler.maximumLanes(1);
+  scheduler.submit(request(1, 17));
+  scheduler.submit(request(2, 17));
+  scheduler.resourcesReady(1, 0);
+  scheduler.resourcesReady(2, 0);
+  BatchPlan prefill = *scheduler.next();
+  require(prefill.kind == WorkKind::Prefill && prefill.items.size() == 1,
+          "a one-lane prefill plan took more than one request");
+  BatchPlan wide = prefill;
+  wide.items.push_back(prefill.items.front());
+  bool rejected = false;
+  try {
+    scheduler.commit(wide);
+  } catch (const std::logic_error &) {
+    rejected = true;
+  }
+  require(rejected, "a one-lane scheduler committed a two-lane command");
+  completePrefill(scheduler, prefill);
+  while (scheduler.phase(2) == engine::Phase::Prefill) {
+    const BatchPlan plan = *scheduler.next();
+    require(plan.items.size() == 1, "a one-lane plan took more than one request");
+    if (plan.kind == WorkKind::Prefill) completePrefill(scheduler, plan);
+    else completeDecode(scheduler);
+  }
+  while (scheduler.phase(1) == engine::Phase::Prefill) completePrefill(scheduler, *scheduler.next());
+  const BatchPlan decode = *scheduler.next();
+  require(decode.kind == WorkKind::Decode && decode.items.size() == 1,
+          "a one-lane decode plan took more than one request");
+}
+
 void testShortestRemainingFirstUsesActualRows() {
   engine::Scheduler scheduler;
   scheduler.submit(request(1, 17));
@@ -965,6 +998,7 @@ int main() {
     testAdmissionRespectsContendedBudgetAndDecodePriority();
     testQueuedPrefillCannotBeOvertakenIndefinitely();
     testWarmupTimingSeedsFirstContendedCommand();
+    testRuntimeLaneCapNarrowsCommands();
     testShortestRemainingFirstUsesActualRows();
     testPerRequestBoundary();
     testEqualPromptsFinishInArrivalOrder();

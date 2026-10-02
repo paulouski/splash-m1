@@ -191,7 +191,7 @@ void NativeRuntime::announceReady() {
   if (config_.engine.maxImagePatches)
     features |= protocol::FeatureVision;
   if (!send(protocol::ReadyEvent{config_.engineInstanceId,
-                                 model::ExecutionLimits::maximumBatchWidth,
+                                 config_.engine.maximumLanes,
                                  config_.engine.maxContext, features})) {
     throw std::runtime_error("failed to serialize ready event");
   }

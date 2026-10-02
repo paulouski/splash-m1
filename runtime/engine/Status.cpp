@@ -170,7 +170,7 @@ std::string runtimeStatusJson(
       << ",\"resident_bytes\":" << executorTelemetry.stateResidentBytes
       << ",\"active_cells\":" << resources.activeRequests
       << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
-      << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth
+      << ",\"cell_ceiling\":" << plan.breakdown().maximumBatchWidth
       << ",\"hits\":" << state.hits << ",\"misses\":" << state.misses
       << ",\"publications\":" << state.publications
       << ",\"deduplicated_publications\":" << state.deduplicatedPublications

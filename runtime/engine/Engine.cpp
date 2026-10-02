@@ -42,6 +42,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument("invalid decode lane cap");
   scheduler_.boundIsolatedPrefill(config_.boundPrefillCommands);
   scheduler_.maximumPrefillRows(config_.prefillRows);
+  scheduler_.maximumLanes(config_.maximumLanes);
 }
 
 void Engine::submit(EngineRequest value) {

@@ -16,7 +16,7 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
-EngineMemoryPlan plan() {
+EngineMemoryPlan plan(uint32_t decodeLanes = model::ExecutionLimits::maximumBatchWidth) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -29,8 +29,9 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
   device.supportsPlacementSparse = true;
-  return requireEngineMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+  ModelMemoryProfile profile = test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
+  profile.footprint.decodeLanes = decodeLanes;
+  return requireEngineMemoryPlan(device, profile);
 }
 
 MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
@@ -495,6 +496,17 @@ void testResourceWaitDiagnostics() {
   require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
 }
 
+// The state cell ceiling is the runtime's lane cap, not the compiled maximum.
+void testCellCeilingFollowsTheLaneCap() {
+  for (const uint32_t lanes : {model::ExecutionLimits::maximumBatchWidth, 1u}) {
+    const auto memoryPlan = plan(lanes);
+    const std::string json =
+        runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true);
+    require(json.find("\"cell_ceiling\":" + std::to_string(lanes) + ",") != std::string::npos,
+            "the status cell ceiling is not the runtime lane cap");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -504,6 +516,7 @@ int main() {
     testWarmupStatesPreserveReadinessAndMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
+    testCellCeilingFollowsTheLaneCap();
     std::cout << "runtime status tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

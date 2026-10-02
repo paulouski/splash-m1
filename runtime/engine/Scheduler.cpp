@@ -293,7 +293,7 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   uint32_t budget = prefillBudget(ready.front(), ready);
   for (const PrefillRequestView &view : ready) {
     if (!budget || view.request->spec.priority != selectedPriority ||
-        plan.width() == model::ExecutionLimits::maximumBatchWidth)
+        plan.width() == maximumLanes_)
       break;
     const uint32_t rows = std::min(dispatchRemaining(view), budget);
     plan.items.push_back(
@@ -370,7 +370,7 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
   const uint32_t maximumWidth =
       decodeStage == DecodeStage::ApplyInitialMask
           ? 1
-          : model::ExecutionLimits::maximumBatchWidth;
+          : maximumLanes_;
   for (const Request *request : ready) {
     if (request->spec.priority != selectedPriority ||
         (request->spec.cohort == BatchCohort::Constrained) !=
@@ -388,7 +388,7 @@ std::optional<BatchPlan> Scheduler::nextDecode() const {
 
 void Scheduler::commit(const BatchPlan &plan) {
   if (active_ || plan.empty() ||
-      plan.width() > model::ExecutionLimits::maximumBatchWidth) {
+      plan.width() > maximumLanes_) {
     throw std::logic_error("invalid scheduler commit");
   }
   for (const BatchItem &item : plan.items) {

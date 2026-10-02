@@ -825,9 +825,9 @@ void testInvalidPromptTokensStayRequestScoped() {
           "invalid tokens reached admission or prevented subsequent completion");
 }
 
-// The feature bits Ready announces for an engine admitting images of up to
-// `maxImagePatches` patches.
-uint64_t announcedFeatures(uint32_t maxImagePatches) {
+// The Ready event of an engine admitting images of up to `maxImagePatches`
+// patches on `lanes` decode lanes.
+protocol::ReadyEvent announcedReady(uint32_t maxImagePatches, uint32_t lanes) {
   Backing backing(32);
   KvPool pool(backing);
   engine::Cache resources(pool, CacheNamespace{});
@@ -836,6 +836,7 @@ uint64_t announcedFeatures(uint32_t maxImagePatches) {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.engine.maxImagePatches = maxImagePatches;
+  config.engine.maximumLanes = lanes;
   engine::NativeRuntime loop(
       config, resources, executor,
       [&](std::span<const uint8_t> bytes) {
@@ -849,7 +850,10 @@ uint64_t announcedFeatures(uint32_t maxImagePatches) {
                           ? std::get_if<protocol::ReadyEvent>(&announced.front())
                           : nullptr;
   require(ready, "announceReady did not send exactly one Ready event");
-  return ready->featureBits;
+  return *ready;
+}
+uint64_t announcedFeatures(uint32_t maxImagePatches) {
+  return announcedReady(maxImagePatches, model::ExecutionLimits::maximumBatchWidth).featureBits;
 }
 
 void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
@@ -858,6 +862,13 @@ void testReadyAnnouncesVisionWhenImagesAreAdmitted() {
           "Ready did not announce vision for an engine that admits images");
   require(announcedFeatures(0) == protocol::kNativeFeatureBits,
           "Ready announced vision for an engine serving without it");
+}
+
+// Ready reports the runtime's lane cap, not the compiled maximum.
+void testReadyReportsTheLaneCap() {
+  for (const uint32_t lanes : {model::ExecutionLimits::maximumBatchWidth, 1u})
+    require(announcedReady(0, lanes).maxConcurrentRequests == lanes,
+            "Ready did not report the runtime lane cap");
 }
 
 // Without vision an image request fails by itself and the engine keeps
@@ -1288,6 +1299,7 @@ int main() {
     testEngineFailureNamesItsReason();
     testInvalidPromptTokensStayRequestScoped();
     testReadyAnnouncesVisionWhenImagesAreAdmitted();
+    testReadyReportsTheLaneCap();
     testImageRequestWithoutVisionStaysRequestScoped();
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();

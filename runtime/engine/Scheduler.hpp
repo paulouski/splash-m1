@@ -70,6 +70,8 @@ public:
     boundIsolatedPrefill_ = bounded;
   }
   void maximumPrefillRows(uint32_t rows) noexcept { maximumPrefillRows_ = rows; }
+  // Lanes of the runtime (at most ExecutionLimits::maximumBatchWidth): the widest command a plan may take.
+  void maximumLanes(uint32_t lanes) noexcept { maximumLanes_ = lanes; }
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -144,6 +146,7 @@ private:
   double prefillMillisecondsPerToken_ = 0.0;
   bool boundIsolatedPrefill_ = true;
   uint32_t maximumPrefillRows_ = model::ExecutionLimits::prefillTokenBudget;
+  uint32_t maximumLanes_ = model::ExecutionLimits::maximumBatchWidth;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
 };
