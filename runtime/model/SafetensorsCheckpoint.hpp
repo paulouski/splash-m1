@@ -16,7 +16,7 @@ namespace splash::model {
 class SafetensorsCheckpoint final {
 public:
   explicit SafetensorsCheckpoint(const std::filesystem::path &directory,
-                        const PreparationCheck &check = {});
+                        const PreparationCheck &check);
   ~SafetensorsCheckpoint();
   [[nodiscard]] const SourceTensor *find(std::string_view name) const noexcept;
   [[nodiscard]] const SourceTensor &require(std::string_view name) const;
@@ -28,7 +28,9 @@ public:
   // later bound (AffinePlan.hpp's bind), this only plans the storage.
   [[nodiscard]] uint32_t quantizationBits(std::string_view projection) const;
   void requireConfigNumber(std::string_view key, double expected) const;
-  void requireConfigString(std::string_view key, std::string_view expected) const;
+  // `legacyKey`, when given, names the field in configurations that predate `key`.
+  void requireConfigString(std::string_view key, std::string_view expected,
+                           std::string_view legacyKey = {}) const;
   void requireLayerTypes(uint32_t layers, uint32_t fullAttentionPeriod) const;
   void checkUnchanged() const;
 private:

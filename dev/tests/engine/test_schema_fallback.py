@@ -36,6 +36,12 @@ class SchemaFallbackTests(unittest.TestCase):
         )[1]
 
     @staticmethod
+    def framed_value(schema):
+        """The `value` parameter's schema as a request frames it."""
+        budget = [tool_schema.MAX_FRAMED_SCHEMA_BYTES]
+        return tool_schema.tool_argument_schema(schema, budget)["properties"]["value"]
+
+    @staticmethod
     def call(value):
         return (
             "<tool_call>\n<function=test>\n<parameter=value>\n"
@@ -105,10 +111,24 @@ class SchemaFallbackTests(unittest.TestCase):
                 "required": ["value"],
             }
             with self.subTest(kind=kind):
-                self.assertIsNone(
-                    raw_string_schema(schema["properties"]["value"], schema)
-                )
+                self.assertIsNone(raw_string_schema(self.framed_value(schema)))
                 self.verify(schema, '"red"', ['"blue"', "red", "7"], "red")
+
+    def test_local_reference_and_sibling_constraints_are_both_retained(self):
+        schema = {
+            "type": "object",
+            "$defs": {"Choice": {"type": "string", "enum": ["1", "2"]}},
+            "properties": {"value": {"$ref": "#/$defs/Choice", "const": "1"}},
+            "required": ["value"],
+        }
+        self.assertIsNone(raw_string_schema(self.framed_value(schema)))
+        self.verify(schema, '"1"', ['"2"', "1", "7"], "1")
+        plain = {
+            "type": "object",
+            "properties": {"value": {"type": "string", "const": "1"}},
+            "required": ["value"],
+        }
+        self.verify(plain, "1", ['"1"', "2"], "1")
 
     def test_compilable_patterns_constrain_generation(self):
         order = {"type": "string", "pattern": "^ORD-[0-9]{4}$"}
@@ -119,8 +139,8 @@ class SchemaFallbackTests(unittest.TestCase):
             ['{"id":"ORD-2024-8892"}', '{"id":"ord-1234"}'],
             {"id": "ORD-1234"},
         )
-        # Unanchored patterns keep search semantics; unsupported look-around
-        # remains enforced when the completed output is validated.
+        # An unanchored pattern keeps its search semantics; look-around cannot
+        # compile and stays with validation of the complete output.
         schema = {
             "type": "object",
             "properties": {
@@ -156,22 +176,6 @@ class SchemaFallbackTests(unittest.TestCase):
                 validator,
             )
         self.assertEqual(caught.exception.code, "invalid_model_output")
-
-    def test_local_reference_and_sibling_constraints_are_both_retained(self):
-        schema = {
-            "type": "object",
-            "$defs": {"Choice": {"type": "string", "enum": ["1", "2"]}},
-            "properties": {"value": {"$ref": "#/$defs/Choice", "const": "1"}},
-            "required": ["value"],
-        }
-        self.assertIsNone(raw_string_schema(schema["properties"]["value"], schema))
-        self.verify(schema, '"1"', ['"2"', "1", "7"], "1")
-        plain = {
-            "type": "object",
-            "properties": {"value": {"type": "string", "const": "1"}},
-            "required": ["value"],
-        }
-        self.verify(plain, "1", ['"1"', "2"], "1")
 
     def test_reference_with_array_constraint_keeps_json_type(self):
         schema = {
@@ -310,7 +314,7 @@ class SchemaFallbackTests(unittest.TestCase):
         guidance = self.guidance
 
         class CompilingFactory(FakeConstraintFactory):
-            def create(self, grammar, *, timeout=None):
+            def create(self, grammar, *, timeout=None, prefixes=None):
                 error = LLMatcher.validate_grammar(grammar, guidance)
                 if error:
                     raise AssertionError(error)

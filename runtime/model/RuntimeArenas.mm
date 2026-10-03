@@ -1,5 +1,6 @@
 #include "model/RuntimeArenas.hpp"
 
+#include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
@@ -88,7 +89,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::TargetInverseFrequencies,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,
-      bytesFor<float>(geometry.draftState.headDimension / 2));
+      bytesFor<float>(geometry.draftRotaryPairs()));
   put(PrefillTensor::RopeCos,
       bytesFor<float>(uint64_t{rows} * geometry.target.rotaryPairs));
   put(PrefillTensor::RopeSin,
@@ -97,14 +98,15 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,
       bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
-  put(PrefillTensor::ContextQkv,
-      bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.qkvSize));
+  put(PrefillTensor::ContextKv,
+      bytesFor<uint16_t>(uint64_t{rows} *
+                         geometry.draft.contextKvSize()));
   put(PrefillTensor::DraftRopeCos,
       bytesFor<float>(uint64_t{rows} *
-                      (geometry.draftState.headDimension / 2)));
+                      geometry.draftRotaryPairs()));
   put(PrefillTensor::DraftRopeSin,
       bytesFor<float>(uint64_t{rows} *
-                      (geometry.draftState.headDimension / 2)));
+                      geometry.draftRotaryPairs()));
   put(PrefillTensor::ChunkKeys,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          packedAttentionRows(rows) *
@@ -113,13 +115,13 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          packedAttentionRows(rows) *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters of the largest prefill plan.
+  // The split partials and counters and the rotated rows of the largest
+  // prefill plan.
   for (const auto &projection : geometry.target.prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
-    // A chunk's plans store at most the chunk's row cap (whole 128-row tiles).
-    if (projection.rotated) put(PrefillTensor::LinearRotated, ops::rotatedBytes(projection.inputSize, rows));
+    put(PrefillTensor::LinearRotated, linear.rotated);
   }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {
     const ops::MoeWorkspace workspace =
@@ -133,38 +135,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
 
 uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                             const ops::ExecutionPlans &operators, uint32_t rows) {
-  return prefillArenaLayout(prefillTensorBytes(geometry, operators, rows)).bytes;
-}
-
-PrefillArenaLayout prefillArenaLayout(
-    const std::array<uint64_t, prefillTensorCount> &sizes) {
-  PrefillArenaLayout result;
-  uint64_t cursor = 0;
-  for (uint32_t index = 0; index < sizes.size(); ++index) {
-    const PrefillTensor tensor = static_cast<PrefillTensor>(index);
-    if (tensor == PrefillTensor::GdnPacked ||
-        tensor == PrefillTensor::GdnOutput) {
-      const PrefillTensor other = tensor == PrefillTensor::GdnPacked
-                                      ? PrefillTensor::FullPacked
-                                      : PrefillTensor::AttentionOutput;
-      const uint32_t first = static_cast<uint32_t>(tensor);
-      const uint32_t second = static_cast<uint32_t>(other);
-      result.offsets[first] = cursor;
-      result.offsets[second] = cursor;
-      cursor = checkedAdd(cursor,
-                          alignArena(std::max(sizes[first], sizes[second])),
-                          "prefill arena");
-      continue;
-    }
-    if (tensor == PrefillTensor::FullPacked ||
-        tensor == PrefillTensor::AttentionOutput) {
-      continue;
-    }
-    result.offsets[index] = cursor;
-    cursor = checkedAdd(cursor, alignArena(sizes[index]), "prefill arena");
+  uint64_t bytes = 0;
+  for (uint64_t value : prefillTensorBytes(geometry, operators, rows)) {
+    bytes = checkedAdd(bytes, alignUp(value), "prefill arena");
   }
-  result.bytes = cursor;
-  return result;
+  return bytes;
 }
 
 static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
@@ -183,9 +158,9 @@ static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
                             geometry.target.gdnValueHeads);
 }
-uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
+static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
-                            kTileRows *
+                            kv::kVerifyChunkStride *
                             geometry.target.attentionHeadDimension);
 }
 
@@ -196,7 +171,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   const auto draftWorkspace =
       operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
-  const auto selectorWorkspace = ops::Sampling::draftWorkspace(kDraftProposalTokens);
+  const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
     auto &size = result[static_cast<uint32_t>(tensor)];
     size = std::max(size, bytes);
@@ -209,8 +184,6 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::InputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::Normalized,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
-  put(DecodeTensor::Recurrent,
-      bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::GdnHidden,
       bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::GdnOutput,
@@ -221,7 +194,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(r * geometry.target.packedFullWidth));
   put(DecodeTensor::FullQueries,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kTileRows * geometry.target.attentionHeadDimension));
+                         kv::kVerifyChunkStride *
+                         geometry.target.attentionHeadDimension));
   const ops::AttentionWorkspace attentionWorkspace =
       operators.verifyAttentionWorkspacePerLane(
           geometry.target.attentionQueryHeads, geometry.target.kvLayout);
@@ -229,7 +203,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AttentionStatistics, attentionWorkspace.statisticsBytes);
   put(DecodeTensor::FullAttention,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionQueryHeads} *
-                         kTileRows * geometry.target.attentionHeadDimension));
+                         kv::kVerifyChunkStride *
+                         geometry.target.attentionHeadDimension));
   put(DecodeTensor::AttentionHidden,
       bytesFor<uint16_t>(r * geometry.target.attentionWidth));
   put(DecodeTensor::AttentionOutput,
@@ -240,14 +215,12 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<float>(r * geometry.target.rotaryPairs));
   put(DecodeTensor::RopeSin,
       bytesFor<float>(r * geometry.target.rotaryPairs));
-  put(DecodeTensor::Arrived, sizeof(uint32_t));
-  put(DecodeTensor::Generation, sizeof(uint32_t));
   put(DecodeTensor::ContextProjected,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
   put(DecodeTensor::ContextHidden,
       bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
-  put(DecodeTensor::ContextQkv,
-      bytesFor<uint16_t>(r * geometry.draft.qkvSize));
+  put(DecodeTensor::ContextKv,
+      bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
   put(DecodeTensor::CapturedTargetHidden,
       bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
@@ -255,26 +228,27 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   // Proposal attention and accepted target-hidden injection use the same
   // eight absolute positions, so one RoPE table per lane is sufficient.
   put(DecodeTensor::DraftRopeCos,
-      bytesFor<float>(r * (geometry.draftState.headDimension / 2)));
+      bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::DraftRopeSin,
-      bytesFor<float>(r * (geometry.draftState.headDimension / 2)));
+      bytesFor<float>(r * geometry.draftRotaryPairs()));
   put(DecodeTensor::FinalHidden,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Logits,
       bytesFor<float>(r * geometry.target.vocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
-  put(DecodeTensor::TargetTopPartialIds, samplingWorkspace.partialIdsBytes);
-  put(DecodeTensor::TargetTopPartialValues, samplingWorkspace.partialValuesBytes);
-  put(DecodeTensor::TargetTopIds, samplingWorkspace.topIdsBytes);
-  put(DecodeTensor::TargetTopProbs, samplingWorkspace.topProbabilitiesBytes);
+  put(DecodeTensor::TargetPartialMasses, samplingWorkspace.partialMassesBytes);
+  put(DecodeTensor::TargetVocabularyRows, samplingWorkspace.vocabularyRowsBytes);
+  put(DecodeTensor::TargetVocabularyRanges,
+      samplingWorkspace.vocabularyRangesBytes);
+  put(DecodeTensor::TargetVocabularyArrivals,
+      samplingWorkspace.vocabularyArrivalsBytes);
   put(DecodeTensor::SamplingUniforms, bytesFor<float>(kSamplingUniformCount));
   put(DecodeTensor::ConstraintMasks,
       bytesFor<uint32_t>(uint64_t{ExecutionLimits::maximumStepTokens} *
                          geometry.maskWords()));
   put(DecodeTensor::OutputTokens, bytesFor<uint32_t>(r));
   put(DecodeTensor::RetainedCount, sizeof(uint32_t));
-  put(DecodeTensor::NextAnchor, sizeof(uint32_t));
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(r));
   for (uint32_t index = 0; index < 2; ++index) {
@@ -305,7 +279,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::TopPartialValues, selectorWorkspace.partialValuesBytes);
   put(DecodeTensor::ProposalProbs, selectorWorkspace.proposalProbabilitiesBytes);
   put(DecodeTensor::ProposedTokens, bytesFor<uint32_t>(kDraftProposalTokens));
-  put(DecodeTensor::PageTable, bytesFor<uint32_t>(kMaximumPageTableEntries));
+  put(DecodeTensor::PageTable, bytesFor<SplashKvPage>(kMaximumPageTableEntries));
+  put(DecodeTensor::PenaltyState,
+      bytesFor<uint32_t>(geometry.target.vocabularySize));
   put(DecodeTensor::VerifyPackedBase,
       uint64_t{geometry.target.stateLayout.layers} *
           gdnPackedStride(geometry));
@@ -356,39 +332,25 @@ uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
   uint64_t bytes = 0;
   for (uint64_t value : decodeTensorBytes(geometry, operators)) {
     bytes = checkedAdd(
-        bytes, alignArena(checkedMultiply(value, laneCount, "decode tensor")),
+        bytes, alignUp(checkedMultiply(value, laneCount, "decode tensor")),
         "decode arena");
   }
   return bytes;
 }
 
 ops::LinearScratchSize DecodeArena::linearScratchSize(
-    const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
-    uint32_t laneCount) {
-  const auto &t = geometry.target;
+    const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
-  const auto include = [&](ops::LinearMatrix matrix, ops::WeightLayout weightLayout) {
-    if (!matrix.outputSize || !matrix.inputSize) return;
-    for (uint32_t lanes = 1; lanes <= laneCount; ++lanes) {
-      for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
-                            ops::LinearEpilogue::GateUp}) {
-        result.include(operators.linear().decodeScratchSize(
-            {matrix, lanes * kDecodeRows, ops::LinearPhase::Decode, epilogue, weightLayout}));
-      }
-    }
-  };
-  // Includes the vocabulary head shared with the draft. Decode plans store at
-  // most every lane's rows.
-  for (const auto &p : t.decodeProjections) {
-    include({p.outputSize, p.inputSize}, p.layout);
-    if (p.rotated) result.rotated = std::max(result.rotated, ops::rotatedBytes(p.inputSize, laneCount * kDecodeRows));
-  }
-  for (auto matrix : {ops::LinearMatrix{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
+  // Includes the vocabulary head shared with the draft, whose own
+  // projections are affine.
+  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
+       {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+       {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
-    include(matrix, ops::WeightLayout::Affine64);
+    result.include(operators.linear().decodeScratchSize(shape));
   return result;
 }
 
@@ -398,7 +360,7 @@ uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
   const uint32_t lanes = decodeArenaLanes(geometry, operators, activeLanes);
   return checkedAdd(decodeArenaBaseBytes(geometry, operators, lanes),
                     checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
-                               DecodeArena::linearScratchSize(geometry, operators, lanes).bytes(),
+                               DecodeArena::linearScratchSize(geometry, operators).bytes(),
                                "Q4 decode scratch"),
                     "planned gate scratch");
 }

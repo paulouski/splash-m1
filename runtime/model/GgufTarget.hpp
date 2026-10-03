@@ -6,7 +6,6 @@
 #include <filesystem>
 #include <optional>
 #include <span>
-#include <vector>
 
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
@@ -23,16 +22,16 @@ class GgufTargetLoader final {
 public:
   // Plans every image from the GGUF's metadata once.
   GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
-                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {});
+                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion);
   // The same target read from a Prism ML Hadamard MLX checkpoint, presented as its rotated PQ2_0 GGUF.
   GgufTargetLoader(metal::MetalBackend &backend, const PrismMlxDirectory &directory,
-                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion = {});
+                   const gguf::TargetGeometry &geometry, PreparationCheck admitConversion);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
   // Every image's cache identity and size, layers first, for the model's
   // disk check before the first image is written.
-  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return weights_; }
+  [[nodiscard]] std::span<const PreparedWeight> weights() const noexcept { return images_.weights(); }
   // Writes every missing image and maps none.
   void prepare();
 
@@ -46,15 +45,11 @@ public:
 private:
   // Plans every image of file; a Prism MLX source keys them by its identity.
   void plan(const GgufFile &file, const gguf::TargetGeometry &geometry, std::string_view prismIdentity);
-  [[nodiscard]] WeightWriter writer(size_t index);
-  [[nodiscard]] WeightFile open(size_t index);
 
   metal::MetalBackend &backend_;
   WeightSource source_;
-  std::vector<gguf::Image> images_; // layers, head, embedding
   std::optional<GgufRotation> rotation_;
-  std::vector<PreparedWeight> weights_;
-  PreparedFiles files_;
+  PreparedImages<gguf::Image> images_; // layers, head, embedding
 };
 
 // The GGUF geometry of a Qwen layout with its family's dense or sparse MoE

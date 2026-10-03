@@ -67,12 +67,12 @@ __attribute__((always_inline)) inline void decode(device const Input *table, dev
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
                    device const half *sc1, device const half *bi1,
-                   constant Q4Params &p, uint2 tg, uint tid, uint sg, uint lane,
+                   constant Q4PersistentParams &p, uint2 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
   constexpr uint tileN = gateUp ? 32 : 64;
   const uint N = p.output_size, K = p.input_size, groups = K / 64;
-  const uint splits = p.persistent_groups;
+  const uint splits = p.groups;
   const uint first = tg.y * (groups / splits);
   const uint end = tg.y + 1 == splits ? groups : first + groups / splits;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
@@ -246,7 +246,7 @@ __attribute__((always_inline)) inline void decode(device const Input *table, dev
 // plain projection also writes fp32 (_f32: the logits); the input table
 // stands in for the residual it does not read.
 #define Q4_SGF_AFFINE(Name, L, Out) \
-kernel void Name(Q4_SGF_INPUTS(Out), constant Q4Params &p [[buffer(8)]], Q4_SGF_THREADS) { \
+kernel void Name(Q4_SGF_INPUTS(Out), constant Q4PersistentParams &p [[buffer(8)]], Q4_SGF_THREADS) { \
   threadgroup uint arrival; \
   q4sgf::decode<q4sgf::Epilogue::Affine, L, Out>(table, weights, scales, biases, output, sums, \
       partials, counters, table, weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
@@ -255,7 +255,7 @@ kernel void Name(Q4_SGF_INPUTS(Out), constant Q4Params &p [[buffer(8)]], Q4_SGF_
 Q4_SGF_AFFINE(decode_linear_q4_sgf##SUFFIX, L, bfloat) \
 Q4_SGF_AFFINE(decode_linear_q4_sgf##SUFFIX##_f32, L, float) \
 [[max_total_threads_per_threadgroup(128)]] kernel void decode_linear_q4_sgf_residual##SUFFIX(Q4_SGF_INPUTS(bfloat), \
-    device const bfloat *residual [[buffer(8)]], constant Q4Params &p [[buffer(9)]], \
+    device const bfloat *residual [[buffer(8)]], constant Q4PersistentParams &p [[buffer(9)]], \
     Q4_SGF_THREADS) { \
   threadgroup uint arrival; \
   q4sgf::decode<q4sgf::Epilogue::Residual, L, bfloat>(table, weights, scales, biases, output, sums, \
@@ -263,7 +263,7 @@ Q4_SGF_AFFINE(decode_linear_q4_sgf##SUFFIX##_f32, L, float) \
 } \
 kernel void decode_linear_q4_sgf_gate_up##SUFFIX(Q4_SGF_INPUTS(bfloat), \
     device const uchar *up [[buffer(8)]], device const half *upScales [[buffer(9)]], \
-    device const half *upBiases [[buffer(10)]], constant Q4Params &p [[buffer(11)]], \
+    device const half *upBiases [[buffer(10)]], constant Q4PersistentParams &p [[buffer(11)]], \
     Q4_SGF_THREADS) { \
   threadgroup uint arrival; \
   q4sgf::decode<q4sgf::Epilogue::GateUp, L, bfloat>(table, weights, scales, biases, output, sums, \
@@ -274,7 +274,7 @@ Q4_SGF_KERNELS(_m16, 2)
 Q4_SGF_KERNELS(_m24, 3)
 Q4_SGF_KERNELS(_m32, 4)
 #define Q4_SGF_TYPED_AFFINE(Name, Out, Table) \
-kernel void Name(Q4_SGF_TYPED_INPUTS(Out, Table), constant Q4Params &p [[buffer(8)]], Q4_SGF_THREADS) { \
+kernel void Name(Q4_SGF_TYPED_INPUTS(Out, Table), constant Q4PersistentParams &p [[buffer(8)]], Q4_SGF_THREADS) { \
   threadgroup uint arrival; \
   q4sgf::decode<q4sgf::Epilogue::Affine, 1, Out, Table>(table, weights, scales, biases, output, sums, \
       partials, counters, reinterpret_cast<device const bfloat *>(table), weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
@@ -285,7 +285,7 @@ Q4_SGF_TYPED_AFFINE(decode_linear_q4_sgf_halftable_f32, float, half)
 kernel void decode_linear_q4_sgf_halftable_gate_up(
     Q4_SGF_TYPED_INPUTS(bfloat, half), device const uchar *up [[buffer(8)]],
     device const half *upScales [[buffer(9)]], device const half *upBiases [[buffer(10)]],
-    constant Q4Params &p [[buffer(11)]], Q4_SGF_THREADS) {
+    constant Q4PersistentParams &p [[buffer(11)]], Q4_SGF_THREADS) {
   threadgroup uint arrival;
   q4sgf::decode<q4sgf::Epilogue::GateUp, 1, bfloat, half>(table, weights, scales, biases, output, sums,
       partials, counters, output, up, upScales, upBiases, p, tg, tid, sg, lane, &arrival);

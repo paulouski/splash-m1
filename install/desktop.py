@@ -17,13 +17,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-if __package__:
-    from . import desktop_models, launcher, paths, uninstall
-else:
-    import desktop_models
-    import launcher
-    import paths
-    import uninstall
+if __name__ == "__main__" and not __package__:
+    # Run as a script by the app: import siblings as the install package.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "install"
+
+from . import desktop_models, launcher, paths, uninstall
 
 ROOT = paths.ROOT
 MODEL = "mlx-community/Qwen3.8-27B-4bit"

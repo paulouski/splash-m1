@@ -12,16 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 
-if __package__:
-    from . import assembly, desktop_models, hub, launcher, models, paths, upstream
-else:
-    import assembly
-    import desktop_models
-    import hub
-    import launcher
-    import models
-    import paths
-    import upstream
+from . import assembly, desktop_models, hub, launcher, models, paths, upstream
 
 BUNDLE_ID = "io.github.paulouski.splash-m1"
 WRAPPER_MARKER = "Splash M1/app/current"

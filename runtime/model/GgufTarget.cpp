@@ -1,5 +1,4 @@
 #include "model/GgufTarget.hpp"
-#include "model/GgufImageLayout.hpp"
 #include "model/GgufPreparation.hpp"
 
 namespace splash::model {
@@ -19,8 +18,13 @@ std::filesystem::path findTargetGguf(const std::filesystem::path &directory) {
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::filesystem::path &path,
                                    const gguf::TargetGeometry &geometry, PreparationCheck admitConversion)
     : backend_(backend), source_(path, [&backend] { backend.checkOperation(); }),
-      files_([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-             [this] { source_.checkUnchanged(); }) {
+      images_(PreparedFiles([&backend] { backend.checkOperation(); }, std::move(admitConversion),
+                            [this] { source_.checkUnchanged(); }),
+              [this](const gguf::Image &image) {
+                return WeightWriter([this, &image](int destination, const PreparationCheck &admit) {
+                  writeGgufImage(backend_, source_, destination, image, admit);
+                });
+              }) {
   const GgufFile file(source_);
   source_.checkUnchanged();
   // Validates the whole source before its tensor data is hashed.
@@ -30,8 +34,13 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::file
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const PrismMlxDirectory &directory,
                                    const gguf::TargetGeometry &geometry, PreparationCheck admitConversion)
     : backend_(backend), source_(prismMlxFile(directory.path), [&backend] { backend.checkOperation(); }),
-      files_([&backend] { backend.checkOperation(); }, std::move(admitConversion),
-             [this] { source_.checkUnchanged(); }) {
+      images_(PreparedFiles([&backend] { backend.checkOperation(); }, std::move(admitConversion),
+                            [this] { source_.checkUnchanged(); }),
+              [this](const gguf::Image &image) {
+                return WeightWriter([this, &image](int destination, const PreparationCheck &admit) {
+                  writeGgufImage(backend_, source_, destination, image, admit);
+                });
+              }) {
   PrismMlxView view = bindPrismMlx(source_, directory.path, geometry);
   const GgufFile file(source_, std::move(view.header));
   source_.checkUnchanged();
@@ -40,37 +49,24 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const PrismMlxD
 
 void GgufTargetLoader::plan(const GgufFile &file, const gguf::TargetGeometry &geometry,
                             std::string_view prismIdentity) {
-  images_ = gguf::planImages(file, geometry);
   rotation_ = file.rotation();
-  for (const gguf::Image &image : images_) {
+  for (gguf::Image &image : gguf::planImages(file, geometry)) {
     backend_.checkOperation();
-    weights_.push_back(ggufImageWeight(source_, image));
-    if (!prismIdentity.empty()) weights_.back().key = prismMlxKey(weights_.back().key, prismIdentity);
+    PreparedWeight weight = ggufImageWeight(source_, image);
+    if (!prismIdentity.empty()) weight.key = prismMlxKey(weight.key, prismIdentity);
+    images_.add(std::move(image), std::move(weight));
   }
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {
   if (index >= images_.size() - 2) throw GgufError("target layer is out of range");
-  return open(index);
+  return images_.open(backend_, index);
 }
 
-WeightFile GgufTargetLoader::head() { return open(images_.size() - 2); }
+WeightFile GgufTargetLoader::head() { return images_.open(backend_, images_.size() - 2); }
 
-WeightFile GgufTargetLoader::embedding() { return open(images_.size() - 1); }
+WeightFile GgufTargetLoader::embedding() { return images_.open(backend_, images_.size() - 1); }
 
-void GgufTargetLoader::prepare() {
-  for (size_t index = 0; index < images_.size(); ++index) static_cast<void>(files_.prepare(weights_[index], writer(index)));
-}
-
-WeightWriter GgufTargetLoader::writer(size_t index) {
-  return [this, index](int destination, const PreparationCheck &admit) {
-    writeGgufImage(backend_, source_, destination, images_[index], admit);
-  };
-}
-
-WeightFile GgufTargetLoader::open(size_t index) {
-  const gguf::Image &image = images_[index];
-  return files_.open(backend_, weights_[index], writer(index), kGgufImageMagic, image.layer, image.type);
-}
+void GgufTargetLoader::prepare() { images_.prepare(); }
 
 } // namespace splash::model

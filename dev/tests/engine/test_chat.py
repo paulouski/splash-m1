@@ -57,7 +57,7 @@ function createChat(storage = new Map(), writable = true, models = null,
                    'preset-precise', 'preset-balance', 'preset-creative', 'preset-reset',
                    's-temperature', 's-temperature-n', 's-top_p', 's-top_p-n', 's-top_k', 's-top_k-n',
                    's-max_tokens-n', 's-seed-n']) elements[id] = new Element();
-  elements.effort.options = ['xhigh', 'medium', 'low', 'none'].map(value => ({value}));
+  elements.effort.options = ['', 'xhigh', 'medium', 'low', 'none'].map(value => ({value}));
   class FileReader {
     readAsDataURL(file) {
       this.result = `data:image/png;base64,${file.name}`;
@@ -299,6 +299,26 @@ for (const writable of [true, false]) {
 }
 """)
 
+    def test_default_effort_omits_reasoning_effort(self):
+        # The server's --default-reasoning-effort, or the template's default,
+        # applies until the user picks an effort.
+        self.run_chat(r"""
+(async () => {
+  const chat = createChat();
+  assert.equal(chat.elements.effort.value, '');
+  setText(chat, 'hello');
+  submit(chat);
+  assert.ok(!('reasoning_effort' in chat.requests[0].body));
+  succeed(chat.requests[0]);
+  await flush();
+  chat.elements.effort.value = 'low';
+  chat.elements.effort.handlers.change();
+  setText(chat, 'again');
+  submit(chat);
+  assert.equal(chat.requests[1].body.reasoning_effort, 'low');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
     def test_saves_chats_without_crypto_random_uuid(self):
         # Browsers omit crypto.randomUUID outside secure contexts, such as a
         # LAN address over plain HTTP (#142).
@@ -466,6 +486,28 @@ for (const [name, overrides, shouldSend] of [
       }
     }
   }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+""")
+
+    def test_chunks_without_text_neither_render_nor_scroll(self):
+        self.run_chat(r"""
+(async () => {
+  const scrolls = [];
+  for (const count of [0, 3]) {
+    const chat = createChat();
+    const {elements, requests} = chat;
+    elements.input.value = 'prompt';
+    submit(chat);
+    const empty = Array(count).fill({choices: [{delta: {}}]});
+    respond(requests[0], [{choices: [{delta: {role: 'assistant', content: ''}}]},
+      ...empty, {choices: [{delta: {content: 'answer'}}]}, ...empty]);
+    await flush();
+    scrolls.push(chat.scrolls.length);
+    elements.input.value = 'next';
+    submit(chat);
+    assert.equal(requests[1].body.messages[1].content, 'answer');
+  }
+  assert.equal(scrolls[1], scrolls[0], 'chunks without text must not scroll the page');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """)
 

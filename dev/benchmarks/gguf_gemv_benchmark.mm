@@ -35,13 +35,13 @@ constexpr uint64_t kRingBytes = 384ull << 20;
 constexpr uint32_t kMaxSplits = 16;
 
 MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
-  MetalBuffer buffer = backend.allocateBuffer(bytes.size());
+  MetalBuffer buffer = backend.allocateBuffer(bytes.size(), metal::BufferStorage::Shared, "gemv-bench");
   std::memcpy(buffer.contents(), bytes.data(), bytes.size());
   return buffer;
 }
 MetalBuffer zeros(MetalBackend &backend, uint64_t n) {
   if (!n) return MetalBuffer{};
-  MetalBuffer b = backend.allocateBuffer(n);
+  MetalBuffer b = backend.allocateBuffer(n, metal::BufferStorage::Shared, "gemv-bench");
   std::memset(b.contents(), 0, n);
   return b;
 }

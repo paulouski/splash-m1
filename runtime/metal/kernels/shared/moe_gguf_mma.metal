@@ -31,7 +31,7 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
                        thread_index, GGUF_STAGED_THREADS, simd_lane, 0, p.input_size / kStep, acc);
     elements(acc, sgmatrix::lane_map(simd_lane), [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;
-      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+      if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
       output[o] = bfloat(v);
     });
   };

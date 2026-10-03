@@ -45,14 +45,14 @@ public:
   // A buffer of its own.
   MetalBuffer own(const std::string &label, uint64_t bytes) {
     if (!bytes) return {};
-    MetalBuffer buffer = backend_.allocateBuffer(bytes);
+    MetalBuffer buffer = backend_.allocateBuffer(bytes, metal::BufferStorage::Shared, label);
     entries_.push_back({label, buffer, 0});
     return buffer;
   }
   // A view of the case's weights arena.
   MetalBuffer weights(const std::string &label, uint64_t bytes) {
     if (!bytes) return {};
-    if (!arena_) arena_ = backend_.allocateBuffer(kArenaBytes);
+    if (!arena_) arena_ = backend_.allocateBuffer(kArenaBytes, metal::BufferStorage::Shared, "weights-arena");
     const uint64_t offset = used_;
     used_ += (bytes + 255) / 256 * 256;
     if (used_ > kArenaBytes) throw Unlabeled("weights arena is full");
@@ -142,10 +142,8 @@ void header(std::ostream &out, const std::string &name, uint32_t family, uint32_
   out << "== " << name << " family=" << family << " cores=" << cores << '\n';
 }
 
-void footer(std::ostream &out, const LinearDispatchStats &stats, const PreparedInput &prepared, const Labels &labels) {
-  out << " stats fused=" << stats.fusedSourceOperations << " m16=" << stats.m16Dispatches
-      << " m24=" << stats.m24Dispatches << " m32=" << stats.m32Dispatches << " prepared="
-      << static_cast<int>(prepared.layout) << ' ' << labels.name(prepared.source) << '\n';
+void footer(std::ostream &out, const PreparedInput &prepared, const Labels &labels) {
+  out << " prepared=" << static_cast<int>(prepared.layout) << ' ' << labels.name(prepared.source) << '\n';
 }
 
 void describe(std::ostream &out, const LinearPlan &plan) {
@@ -214,10 +212,9 @@ void runBlock(std::ostream &out, MetalBackend &backend, const Block &c) {
     }
     if (c.table16) b.prepared = {b.input, LinearInput::Table16};
     CommandGraph graph;
-    LinearDispatchStats stats;
-    const PreparedInput prepared = linear.add(graph, b, projection, plan, gate ? &*gate : nullptr, &stats);
+    const PreparedInput prepared = linear.add(graph, b, projection, plan, gate ? &*gate : nullptr);
     dumpGraph(out, graph, labels);
-    footer(out, stats, prepared, labels);
+    footer(out, prepared, labels);
   } catch (const Unlabeled &) {
     throw;
   } catch (const std::exception &error) {
@@ -263,12 +260,11 @@ void runAffine(std::ostream &out, MetalBackend &backend, const Affine &c) {
     b.scratch.partials = labels.own("s.part", size.partials);
     b.scratch.counters = labels.own("s.cnt", size.counters);
     CommandGraph graph;
-    LinearDispatchStats stats;
-    PreparedInput prepared = linear.add(graph, b, projection, plan, gate ? &*gate : nullptr, &stats);
+    PreparedInput prepared = linear.add(graph, b, projection, plan, gate ? &*gate : nullptr);
     if (c.phase == LinearPhase::Prefill && c.epilogue == LinearEpilogue::None)
       linear.addPrefillSums(graph, b.input, b.sums, projection, c.rows);
     dumpGraph(out, graph, labels);
-    footer(out, stats, prepared, labels);
+    footer(out, prepared, labels);
   } catch (const Unlabeled &) {
     throw;
   } catch (const std::exception &error) {
@@ -489,7 +485,7 @@ void blockCases(std::ostream &out, MetalBackend &backend) {
         c.segments = {{pq20, 5120}};
         c.k = k;
         c.rotated = true;
-        c.forced = LinearConfig{LinearTile::GgufStaged, 5120 / 64, LinearSimdgroups::Two, splits};
+        c.forced = LinearConfig{.tile = LinearTile::GgufStaged, .splits = splits};
         runBlock(out, backend, c);
       }
     {
@@ -525,7 +521,7 @@ void blockCases(std::ostream &out, MetalBackend &backend) {
           c.segments = {{format, 5120}};
           c.k = 5120;
           c.epilogue = e;
-          c.forced = LinearConfig{LinearTile::GgufStaged, 5120 / 64, LinearSimdgroups::Two, splits};
+          c.forced = LinearConfig{.tile = LinearTile::GgufStaged, .splits = splits};
           runBlock(out, backend, c);
         }
     for (const bool prepared : {false, true})
@@ -534,13 +530,13 @@ void blockCases(std::ostream &out, MetalBackend &backend) {
         c.segments = {{pq20, 5120}};
         c.rows = lanes * kLane;
         c.table16 = prepared;
-        c.forced = LinearConfig{LinearTile::GgufRegister, 5120 / 64, LinearSimdgroups::Four, 2};
+        c.forced = LinearConfig{.tile = LinearTile::GgufRegister, .splits = 2};
         runBlock(out, backend, c);
         c = base(name("register-forced-fused", f, lanes, prepared));
         c.segments = {{pq20, 10240}, {q4k, 6144}};
         c.rows = lanes * kLane;
         c.table16 = prepared;
-        c.forced = LinearConfig{LinearTile::GgufRegister, 16384 / 64, LinearSimdgroups::Four, 2};
+        c.forced = LinearConfig{.tile = LinearTile::GgufRegister, .splits = 2};
         runBlock(out, backend, c);
       }
   }

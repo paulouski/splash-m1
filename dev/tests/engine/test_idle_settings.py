@@ -46,7 +46,7 @@ def wait_for(condition, timeout=3.0):
 class IdleUnloadBackendTests(unittest.TestCase):
     def backend(self, idle_unload=0.0):
         runtime = IdleRuntime()
-        backend = NativeBackend(runtime, None, idle_unload=idle_unload)
+        backend = NativeBackend(runtime, None, lambda _record: None, idle_unload=idle_unload)
         self.addCleanup(backend.close)
         return runtime, backend
 
@@ -88,7 +88,9 @@ class SettingsEndpointTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.path = Path(self.directory.name) / "Splash" / "settings.json"
         self.runtime = IdleRuntime()
-        self.backend = NativeBackend(self.runtime, None, idle_unload=300.0)
+        self.backend = NativeBackend(
+            self.runtime, None, lambda _record: None, idle_unload=300.0
+        )
         self.addCleanup(self.backend.close)
         self.server = api.FrontendServer(
             ("127.0.0.1", 0),

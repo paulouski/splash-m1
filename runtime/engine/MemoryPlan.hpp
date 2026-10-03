@@ -20,6 +20,20 @@ deviceStatusJson(const DeviceCapabilities &device);
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
+// The pages of the KV runway in extents of extentPages pages: the whole
+// extents that hold the pages startup warmup runs on, which the KV pool
+// allocates when it is built.
+[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
+  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
+         extentPages * extentPages;
+}
+
+// What one request needs at the least: the fixed bytes, one lane's state and
+// the KV runway in the layout's smallest extents; nullopt on overflow.
+[[nodiscard]] std::optional<uint64_t>
+minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
+                     const kv::Layout &layout) noexcept;
+
 // Inputs that the memory planner needs from a loaded model. Model tensor and
 // KV geometry stay with their owners; the planner receives only identity,
 // capacity, and measured allocation sizes.
@@ -27,18 +41,14 @@ struct ModelMemoryFootprint final {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  uint64_t activeStateCellBytes = 0;
-  uint64_t sharedPrefillBytes = 0;
-  uint64_t sharedDecodeBytes = 0;
-  uint64_t pipelineReserveBytes = 0;
-  uint64_t runtimeOverheadReserveBytes = 0;
-  // Rows of the packed prefill chunk sharedPrefillBytes was sized for.
+  model::ModelMemoryPlan runtime;
+  // The buffer a state's write to the disk tier stages through, set aside
+  // when the tier's state file opened (a quota that holds one state); zero
+  // otherwise.
+  uint64_t stateStagingBytes = 0;
+  // Rows of the packed prefill chunk runtime.sharedPrefillPlannedAllocatedBytes
+  // was sized for, and the concurrent decode lanes of its decode arena.
   uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
-  // Metal staging of the disk tier's KV transfers, set aside whenever
-  // --max-cache-disk is set, even if the tier then fails to start; zero
-  // without the flag.
-  uint64_t kvStagingBytes = 0;
-  // Concurrent decode lanes sharedDecodeBytes was sized for.
   uint32_t decodeLanes = model::ExecutionLimits::maximumBatchWidth;
   // One cached composite state (prefix-cache snapshot), zero when unknown.
   uint64_t cachedStateBytes = 0;
@@ -47,26 +57,15 @@ struct ModelMemoryFootprint final {
 struct ModelMemoryProfile final {
   std::string name;
   uint32_t maximumContextTokens = 0;
-  // The operator's --max-context request, zero when unset. Without placement
-  // sparse the whole virtual KV pool is committed physically up front, so
-  // sizing it past this leaves no headroom for prefix-cache state snapshots;
-  // sparse devices grow backing on demand and stay unaffected. Zero keeps the
-  // prior fill-the-budget sizing.
-  uint32_t requestedContextTokens = 0;
   kv::Layout targetKvLayout;
   ModelMemoryFootprint footprint;
-  // Non-sparse pools in whole pages instead of sparse-mapping batches; set by
-  // the adaptive low-memory profile only.
-  bool exactKvPages = false;
-  // Dynamic bytes kept out of the KV pool for prefix-cache snapshots; set by
-  // the adaptive low-memory profile only.
+  // Dynamic bytes kept out of one request's KV capacity for a prefix-cache
+  // state snapshot; set by the adaptive low-memory profile only.
   uint64_t snapshotReserveBytes = 0;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
 };
-
-[[nodiscard]] std::string modelStatusJson(const ModelMemoryProfile &model);
 
 struct EngineMemoryPolicy {
   // recommendedMaxWorkingSetSize already describes Metal's performance-safe
@@ -87,7 +86,7 @@ struct EngineMemoryPolicy {
 
   [[nodiscard]] static constexpr uint64_t
   hardBudgetBytes(uint64_t recommendedWorkingSetBytes,
-                  uint64_t maximumMemoryBytes = 0) noexcept {
+                  uint64_t maximumMemoryBytes) noexcept {
     const uint64_t margin = workingSetMarginBytes(recommendedWorkingSetBytes);
     const uint64_t automatic = recommendedWorkingSetBytes > margin
                                    ? recommendedWorkingSetBytes - margin
@@ -121,40 +120,41 @@ struct EngineMemoryBreakdown {
   // Optional user ceiling. Zero means the automatic safe working-set
   // ceiling. A higher value never overrides the OS-safe ceiling.
   uint64_t configuredMemoryLimitBytes = 0;
-  uint64_t headroomBytes = 0;
+  uint64_t workingSetMarginBytes = 0;
   uint64_t hardBudgetBytes = 0;
 
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
   uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
-  uint64_t activeStateCellBytes = 0;
+  // Rows of the packed prefill chunk sharedPrefillBytes was sized for.
+  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
+  uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
   uint64_t pipelineReserveBytes = 0;
   uint64_t runtimeOverheadReserveBytes = 0;
-  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
-  uint64_t kvStagingBytes = 0;
+  uint64_t stateStagingBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
-  // All active state cells, cached composite states, and physical KV
-  // extents grow from this one governor-controlled byte budget. None is
-  // preallocated merely because the address space exists.
+  // All lanes' state, cached composite states, and KV extents grow from this
+  // one governor-controlled byte budget; none is preallocated.
   uint64_t dynamicBudgetBytes = 0;
 
   uint32_t kvPageTokens = 0;
   uint64_t kvPageBytes = 0;
-  // Number of logical Page32 blocks mapped in one Metal sparse-buffer
-  // operation. This is allocation alignment, never the cache block size.
-  uint32_t kvSparseMappingBatchPages = 0;
+  // The pool grows and shrinks in extents of kvExtentPages pages, a size
+  // chosen for this pool (kv::Layout::extentPagesFor). This is allocation
+  // geometry, never the cache block size.
   uint32_t kvExtentPages = 0;
   uint64_t kvExtentBytes = 0;
-  // Derived from the device's maximum Metal buffer length. Request context
-  // and four-lane execution are independent policy limits.
-  uint32_t maximumKvPages = 0;
-  uint32_t kvVirtualPages = 0;
-  uint64_t kvVirtualBytes = 0;
-  uint64_t kvVirtualTokens = 0;
+  // One request's KV capacity: the whole extents of the budget's pages left
+  // after one lane's state. The pool's page ids cover more (RuntimeResources
+  // sizes them by the hard budget). Request context and four-lane execution
+  // are independent policy limits.
+  uint32_t kvCapacityPages = 0;
+  uint64_t kvCapacityBytes = 0;
+  uint64_t kvCapacityTokens = 0;
 
   uint64_t minimumDynamicBytes = 0;
   uint64_t minimumRequiredBytes = 0;
@@ -181,9 +181,9 @@ public:
   [[nodiscard]] const EngineMemoryBreakdown &breakdown() const noexcept {
     return breakdown_;
   }
-  // Stable per-request ceiling advertised by the runtime. The physical KV
-  // pool is shared dynamically, but one admitted request is never promised
-  // more than either the model supports or the complete pool can hold.
+  // Stable per-request ceiling advertised by the runtime: never more than the
+  // model supports or one request's KV capacity holds (less the speculative
+  // scratch); requests share the budget dynamically.
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // The ceiling this plan would advertise with at most memoryBytes, within
   // its configured limit; zero when one request cannot fit there.
@@ -214,33 +214,27 @@ struct EngineMemoryPlanResult {
 [[nodiscard]] EngineMemoryPlanResult
 evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
-                         uint64_t maximumMemoryBytes = 0);
+                         uint64_t maximumMemoryBytes);
 
 // Smaller packed-prefill chunks the planner falls back to, largest first.
 inline constexpr std::array<uint32_t, 4> kReducedPrefillRows{1024, 512, 256, 128};
 
-// Context the low-memory profile keeps shrinking prefill chunks for when no
-// --max-context is requested.
+// Context the low-memory profile keeps shrinking prefill chunks for.
 inline constexpr uint32_t kAdaptiveContextGoalTokens = 16384;
 
 // evaluateEngineMemoryPlan with the model's own prefill chunk; only when that
-// leaves no room for one state cell and one KV extent does it retry with
+// leaves no room for one lane's state and the KV runway does it retry with
 // smaller chunks, sizing each rung's arena with prefillBytesForRows. Each
 // chunk size is tried with all decode lanes, then, when decodeBytesForLanes is
 // given, with one lane: a single desktop user keeps the faster prefill chunk
 // and only gives up concurrency (requests queue). It stops at the first rung
-// whose context reaches the request (or 16K), else keeps the last rung that
-// fits. Each rung first keeps one prefix-cache snapshot out of the KV pool
+// whose context reaches 16K, else keeps the last rung that fits. Each rung
+// first keeps one prefix-cache snapshot out of one request's KV capacity
 // (multi-turn reuse beats raw context); only if none fits does it drop that.
 [[nodiscard]] EngineMemoryPlanResult evaluateAdaptiveMemoryPlan(
     const DeviceCapabilities &device, ModelMemoryProfile model,
     uint64_t maximumMemoryBytes,
     const std::function<uint64_t(uint32_t)> &prefillBytesForRows,
     const std::function<uint64_t(uint32_t)> &decodeBytesForLanes = {});
-
-[[nodiscard]] EngineMemoryPlan
-requireEngineMemoryPlan(const DeviceCapabilities &device,
-                        const ModelMemoryProfile &model,
-                        uint64_t maximumMemoryBytes = 0);
 
 } // namespace splash::engine

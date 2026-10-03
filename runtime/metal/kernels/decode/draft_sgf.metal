@@ -235,6 +235,7 @@ kernel void draft_attention_bf16_split_sgf(
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = 4096;
   constexpr ulong HeadDim = 128;
+  constexpr ulong Window = SPLASH_DRAFT_SLIDING_WINDOW;
   constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
   uint batch = group.y;
   if (batch >= params.lanes)
@@ -248,16 +249,16 @@ kernel void draft_attention_bf16_split_sgf(
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
-      ((batch * KVHeads + group.x) * params.splits + group.z) * PartialFloats;
+      ((batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS + group.z) * PartialFloats;
   threadgroup float stage_k[draft_sgf::kChunk * draft_sgf::kD];
   threadgroup float stage_v[draft_sgf::kChunk * draft_sgf::kD];
   draft_sgf::split_phase(
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
-      keys + group.x * params.cache_stride * HeadDim,
-      values + group.x * params.cache_stride * HeadDim,
+      keys + group.x * Window * HeadDim,
+      values + group.x * Window * HeadDim,
       query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
       query_values + batch * KVHeads * HeadDim * Rows +
           group.x * Rows * HeadDim,
-      partials, params.cache_stride, params.cache_length[batch], group.z,
-      params.splits, stage_k, stage_v, thread_index, lane, simd_group);
+      partials, params.value_stride, params.cache_length[batch], group.z,
+      SPLASH_DRAFT_ATTENTION_SPLITS, stage_k, stage_v, thread_index, lane, simd_group);
 }

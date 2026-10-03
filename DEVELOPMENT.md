@@ -30,6 +30,31 @@ The model configuration currently supported by this build is text-only. Image an
 
 The source launcher accepts a Hugging Face owner/repository ID through --model for the supported model configuration. Use --revision to select a target branch, tag, or commit; --language-only for the text-only macOS 15 path; and --draft-model only for a compatible DFlash draft repository or local folder. For a local target and draft, the direct server entry point accepts separate paths; the target directory also supplies tokenizer files. See [RUN.md](RUN.md) for an example.
 
+## Server configuration
+
+The default listener is `127.0.0.1:8000`; use `--port` or `SPLASH_PORT` for another port. `splash-m1 serve --help` (`./splash serve --help` from a checkout) lists every option. Options that apply to this build:
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--host` | `127.0.0.1` | HTTP bind address; `0.0.0.0` accepts LAN connections (set `--api-key` too). |
+| `--allowed-host NAME` | none | Additional HTTP Host name, e.g. `mymac.local`; repeatable. Does not change the bind address. |
+| `--allowed-origin ORIGIN` | none | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any (set `--api-key` too); repeatable. |
+| `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
+| `--max-memory` / `--max-context` | auto | Metal allocation ceiling (e.g. `28G`) and context limit (up to `256K`). |
+| `--max-cache-disk` | `0` (off) | SSD cache for KV pages and states, e.g. `16G`. |
+| `--served-model-name NAME` | none | Additional API model ID; repeatable. With `--announce-served-name`, responses report the first alias. |
+| `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or model template | Fallback for Chat `reasoning_effort` and Responses `reasoning.effort`. |
+| `--request-timeout` | none | Seconds a request may take from its arrival. |
+| `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503. |
+| `--max-request-size` | `128M` | Maximum HTTP request body size. |
+| `--idle-unload` | `0` (off) | Unload the model after this many idle seconds; the next request reloads it. |
+| `--prefill-mode` | `bounded` | `bounded` keeps each prefill GPU command short so macOS does not abort long-context prefill; `full` sends whole 2048-token chunks. |
+| `--no-webui` | off | Disable the chat page. |
+
+`--kv-format bf16` and `--max-image-pixels` are accepted by the parsers but unsupported on the macOS 15 build (INT8 KV, no vision). `--decode-share` (decode time owed per unit of prefill time) is a scheduler option whose support follows the runtime.
+
+A Chat request's `chat_template_kwargs` are passed to the chat template and outrank the effort, so `{"enable_thinking": false}` turns reasoning off. A failed engine restarts at once; after three failures within 60 s of starting each, Splash stops restarting it and requests get 500 `engine_failed` until the server is restarted.
+
 ## Development checks
 
 Run the model-free source, native CPU, and Python checks with:

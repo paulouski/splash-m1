@@ -5,6 +5,7 @@
 <title>Splash</title>
 <link rel="stylesheet" href="/static/katex/katex.min.css">
 <script defer src="/static/katex/katex.min.js"></script>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
 <style>
   * { box-sizing: border-box }
   :root {
@@ -46,7 +47,7 @@
   aside { position: fixed; inset: 0 auto 0 0; z-index: 20; display: flex; flex-direction: column; overflow: hidden auto; width: var(--sidebar); padding: 12px 8px; background: var(--side); border-right: 1px solid var(--border) }
   aside > * { flex: none }
   .brand { display: flex; align-items: center; gap: 9px; height: 38px; padding: 0 10px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
-  .brand svg { width: 19px; height: 19px }
+  .brand img { width: 19px; height: 19px }
   #new-chat { display: flex; align-items: center; gap: 10px; width: 100%; margin-top: 9px; padding: 9px 10px; border-radius: 9px; text-align: left }
   #new-chat:hover { background: var(--hover) }
   #new-chat svg { width: 18px; height: 18px }
@@ -208,7 +209,7 @@
 
 <aside id="sidebar">
   <div class="brand">
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13.5 2 5 13h6l-.5 9L19 11h-6z"/></svg>
+    <img src="/favicon.ico" alt="">
     Splash
   </div>
   <button id="new-chat" type="button">
@@ -260,6 +261,7 @@
     <button id="web" type="button" class="web-toggle" aria-pressed="false" title="Search the web (DuckDuckGo): the model can search and read one page">&#127760;<span> Web</span></button>
     <label class="effort"><span>Thinking</span>
       <select id="effort" aria-label="Thinking effort">
+        <option value="">Default</option>
         <option value="xhigh">XHigh</option>
         <option value="medium">Medium</option>
         <option value="low">Low</option>
@@ -394,7 +396,7 @@
   const maxRounds = 5;
 
   const savedEffort = storageGet(effortKey);
-  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : 'xhigh';
+  effort.value = allowedEfforts.has(savedEffort) ? savedEffort : '';
 
   function authorization() {
     return apiKey.value ? {Authorization: `Bearer ${apiKey.value}`} : {};
@@ -669,7 +671,7 @@
   }
 
   function requestBody(tools = web) {
-    const body = {messages: requestMessages(), stream: true, stream_options: {include_usage: true}, reasoning_effort: effort.value};
+    const body = {messages: requestMessages(), stream: true, stream_options: {include_usage: true}, ...(effort.value ? {reasoning_effort: effort.value} : {})};
     if (tools) body.tools = webTools;
     for (const key of Object.keys(serverDefaults)) if (sampling[key] !== serverDefaults[key]) body[key] = sampling[key];
     if (sampling.max_tokens !== null) body.max_tokens = sampling.max_tokens;
@@ -1387,11 +1389,10 @@
     if (chunk.metrics) state.latency = chunk.metrics.request_latency;
     if (chunk.choices?.[0]?.finish_reason) state.finish = chunk.choices[0].finish_reason;
     const delta = chunk.choices?.[0]?.delta;
-    if (!delta) return false;
-    if (delta.reasoning_content || delta.content || delta.tool_calls) {
-      state.first ||= Date.now();
-      if (modelState !== 'loaded') showModel('loaded');
-    }
+    // A chunk without text or a call has nothing to show or scroll to.
+    if (!delta?.reasoning_content && !delta?.content && !delta?.tool_calls) return false;
+    state.first ||= Date.now();
+    if (modelState !== 'loaded') showModel('loaded');
     // Thinking time runs from the first reasoning delta to the first answer delta.
     if (delta.reasoning_content) state.reasonStart ||= Date.now();
     if (delta.content && state.reasonStart) state.reasonEnd ||= Date.now();

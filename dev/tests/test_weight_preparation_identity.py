@@ -14,6 +14,7 @@ GENERATED = {"WeightPreparationIdentity.hpp"}
 # byte. Keys record every value these declarations carry into a plan;
 # golden hashes of prepared fixtures cover the shared I/O.
 REVIEWED = {
+    "runtime/Checked.hpp": "overflow-checked size arithmetic",
     "runtime/model/PreparedWeights.hpp": "the store, staging bound and bounded I/O",
     "runtime/model/GgufFile.hpp": "keys record each tensor's bytes and type",
     "runtime/model/GgufImage.hpp": "the GGUF plan, which keys record whole",
@@ -26,6 +27,7 @@ REVIEWED = {
     "runtime/metal/MetalBackend.hpp": "the backend the repack is dispatched through",
     "runtime/metal/DeviceCapabilities.hpp": "device queries of the backend",
     "runtime/metal/CommandGraph.hpp": "dispatch recording of the backend",
+    "runtime/metal/abi/ExecutionGeometry.h": "the batch and prefill geometry",
     "runtime/ops/Weights.hpp": "inference weight views",
     "runtime/ops/Linear.hpp": "inference projections",
     "runtime/ops/Normalization.hpp": "inference norms",

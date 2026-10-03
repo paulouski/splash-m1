@@ -49,7 +49,7 @@ public:
   WeightFile &operator=(WeightFile &&) noexcept;
 
   [[nodiscard]] metal::MetalBuffer section(uint64_t bytes,
-                                            std::string_view label = {});
+                                            std::string_view label);
   // One section of the parts' total bytes, as a view of each part in order.
   [[nodiscard]] std::vector<metal::MetalBuffer> split(std::initializer_list<uint64_t> parts,
                                                       std::string_view label);
@@ -59,6 +59,7 @@ public:
   // the order AffinePreparation.cpp's writer built the table. Throws once
   // every entry is read.
   [[nodiscard]] uint32_t nextAffineProjectionBits();
+  // Requires the sections read to cover the whole file.
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
 
@@ -67,8 +68,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-[[nodiscard]] uint64_t checkedWeightMultiply(uint64_t left, uint64_t right,
-                                             std::string_view description);
 [[nodiscard]] uint64_t q4PackedBytes(uint32_t outputSize,
                                      uint32_t inputSize);
 void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);

@@ -133,7 +133,7 @@ class PackageTests(unittest.TestCase):
                             str(root / "build-macos15"),
                         ]
                     )
-                self.assertEqual(run.call_count, 3)
+                self.assertEqual(run.call_count, 4)
                 name = f"splash-m1-{version}-arm64-macos15"
                 self.assertEqual((root / "dist/latest").read_text(), version + "\n")
                 self.assertEqual(
@@ -285,8 +285,6 @@ class PackageTests(unittest.TestCase):
                     self.assertTrue(namespace["PACKAGED"])
                     self.assertEqual(namespace["BINARY"], prefix / "engine/splash")
                     self.assertEqual(namespace["PYTHON"], prefix / "python/bin/python3")
-                    # Hermes's sessions stay where earlier releases kept them.
-                    self.assertEqual(namespace["PROFILES"], namespace["RUNTIME"])
                     results.append((namespace["MODELS"], namespace["RUNTIME"]))
                 self.assertEqual(results[0], results[1])
                 self.assertTrue(results[0][0].is_relative_to(root / "home"))

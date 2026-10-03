@@ -197,7 +197,7 @@ kernel void prefill_linear_q4_mma64(
     device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
     device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]],
-    constant Q4PrefillParams &p [[buffer(6)]], Q4MM_THREADS) {
+    constant Q4Params &p [[buffer(6)]], Q4MM_THREADS) {
   q4mm::project<32, q4mm::Epilogue::Affine>(input, weights, scales, biases, output, output,
                                         sums, p.output_size, p.input_size, tg, sg, lane);
 }
@@ -206,7 +206,7 @@ kernel void prefill_linear_q4_mma64_residual(
     device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
     device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
     device const bfloat *residual [[buffer(4)]], device bfloat *output [[buffer(5)]],
-    device const float *sums [[buffer(6)]], constant Q4PrefillParams &p [[buffer(7)]],
+    device const float *sums [[buffer(6)]], constant Q4Params &p [[buffer(7)]],
     Q4MM_THREADS) {
   q4mm::project<32, q4mm::Epilogue::Residual>(input, weights, scales, biases, output, residual,
                                           sums, p.output_size, p.input_size, tg, sg, lane);
@@ -217,7 +217,7 @@ kernel void prefill_linear_q4_mma64_up_silu_sums(
     device const half *scales [[buffer(2)]], device const half *biases [[buffer(3)]],
     device const bfloat *gate [[buffer(4)]], device bfloat *output [[buffer(5)]],
     device const float *sums [[buffer(6)]], device float *outputSums [[buffer(7)]],
-    constant Q4PrefillParams &p [[buffer(8)]], Q4MM_THREADS) {
+    constant Q4Params &p [[buffer(8)]], Q4MM_THREADS) {
   q4mm::project<32, q4mm::Epilogue::UpWithGate>(input, weights, scales, biases, output, gate,
                                             sums, p.output_size, p.input_size, tg, sg, lane);
   q4mm::write_output_sums<32>(output, outputSums, p.output_size, tg, sg, lane);

@@ -10,16 +10,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-if __package__:
-    from . import assembly, families, hub, launcher, models, paths, upstream
-else:
-    import assembly
-    import families
-    import hub
-    import launcher
-    import models
-    import paths
-    import upstream
+from . import assembly, families, hub, launcher, models, paths, upstream
 
 COMPATIBILITY_MESSAGE = (
     "Metadata is compatible; tensor validation follows during startup."

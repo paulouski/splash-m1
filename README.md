@@ -113,6 +113,20 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for source build details and [RUN.md](RUN.md) for local checkpoint examples.
 
+## Settings
+
+Memory and context are sized automatically. To set your own limits, add these to `splash-m1 serve` (or `./splash serve`):
+
+| Option | Purpose |
+| --- | --- |
+| `--max-memory 28G` | Cap Metal memory use. |
+| `--max-context 100K` | Set the context limit. |
+| `--language-only` | Skip vision preparation; serve text only. |
+| `--max-cache-disk 16G` | Offload KV cache and states to SSD as needed. Off by default. |
+| `--allowed-origin ORIGIN` | Let a browser app on another origin call the API (repeatable). |
+
+The server listens on localhost without authentication by default. For LAN access, authentication and other options, see [server configuration](DEVELOPMENT.md#server-configuration) or `splash-m1 serve --help`.
+
 ## Contributing
 
 Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow.

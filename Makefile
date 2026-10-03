@@ -45,27 +45,21 @@ PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/shared/*.metal))
 # MACOS15=1 selects a macOS-15 (Apple7/8-only) build variant, compiled at
 # -std=metal3.2 into its own metallib: MetalPerformancePrimitives
-# (mpp::tensor_ops) is empty below Metal 4.0, so every kernel whose baseline
-# dispatch is MPP-only (never chosen for appleGpuFamily < 9 by
+# (mpp::tensor_ops) is empty below Metal 4.0, so every kernel file whose
+# baseline dispatch is MPP-only (never chosen for appleGpuFamily < 9 by
 # ExecutionPlans.cpp/Linear.cpp/PagedAttention.cpp) is dropped here rather
-# than guarded. Confirmed by compiling every kernel at metal3.2 (see build
-# report): GGUF (Block32 weight layout), vision and BF16-KV attention are
-# unreached by the affine Qwen3.8 text serve path on Apple7/8. decode/draft.metal
-# (DFlash speculative decoding, --draft-model) keeps its non-MPP kernels
-# unguarded and guards its MPP-only draft_attention_bf16_split behind
-# __METAL_VERSION__ >= 400; DraftAttention.cpp dispatches the register
-# alternative draft_attention_bf16_split_sgf (decode/draft_sgf.metal) on
-# Apple7/8 instead.
-# shared/gguf_float.metal likewise keeps its simdgroup kernels and guards the
+# than guarded; the shared headers and paged_attention*.metal/draft.metal
+# guard their MPP parts at __METAL_VERSION__ >= 400 so their non-MPP reduce
+# kernels stay. The register-matrix replacements (attention_q8_sgf,
+# draft_sgf, *_mma, linear_gguf_gemv) carry the Apple7/8 paths.
+# shared/gguf_float.metal keeps its simdgroup kernels and guards the
 # MPP-only gguf_float_na_* kernels.
 MACOS15 ?= 1
 MACOS15_EXCLUDED_KERNELS := \
-	runtime/metal/kernels/prefill/attention_q8.metal \
 	runtime/metal/kernels/prefill/linear_q4.metal \
 	runtime/metal/kernels/prefill/moe.metal \
-	runtime/metal/kernels/decode/attention_q8.metal \
 	runtime/metal/kernels/decode/linear_q4.metal \
-	runtime/metal/kernels/decode/linear_q4_split.metal \
+	runtime/metal/kernels/decode/linear_q4_grid_split.metal \
 	runtime/metal/kernels/shared/gguf_linear.metal \
 	runtime/metal/kernels/shared/moe.metal \
 	runtime/metal/kernels/shared/moe_gguf.metal \
@@ -79,10 +73,10 @@ PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h))
-# Placement-sparse support became queryable in macOS 26.4
-# (MTLDevice.supportsPlacementSparse). The engine refuses older systems at
-# startup; every binary and metallib records the same floor. MACOS15=1 lowers
-# both floors together (see DeviceCapabilities.hpp kRequiresPlacementSparse).
+# macOS 26.4 is the tested floor: the engine refuses older systems at
+# startup, and every binary and metallib records it. The MPP kernels need
+# macOS 26.2 or newer, and MPP chooses its code path by this target.
+# MACOS15=1 lowers the floor to 15.0 (see DeviceCapabilities.hpp).
 ifeq ($(MACOS15),1)
 MACOS_MIN_VERSION := 15.0
 PROD_METALFLAGS := -std=metal3.2 -O3 -Wall -Wextra -Werror -Wno-c++17-extensions \
@@ -93,7 +87,7 @@ PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 	-mmacosx-version-min=$(MACOS_MIN_VERSION)
 endif
 MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-# Read by DeviceCapabilities.hpp to lower its macOS/placement-sparse gate.
+# Read by DeviceCapabilities.hpp to lower its macOS/Apple-family gate.
 MACOS15_DEFINE := $(if $(filter 1,$(MACOS15)),-DSPLASH_MACOS15_BUILD)
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -I$(BUILD)/engine \
 	$(MACOS_TARGET_FLAG) $(MACOS15_DEFINE)
@@ -264,18 +258,23 @@ BUILD_ID_CONSTANT_ARGS = \
 	--constant 'production_metalflags=$(PROD_METALFLAGS)'
 ENGINE_MAIN_OBJECT := $(ENGINE_BUILD)/main.o
 ENGINE_METAL_RUNTIME_OBJECT := $(ENGINE_BUILD)/metal/MetalBackend.o
+# MetalBackend with the test seam metal/BackendInstrumentation.hpp declares.
+# Only tests and benchmarks link it, ahead of the engine library, whose own
+# MetalBackend object the linker then never pulls.
+ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/DraftAttention.cpp \
+	runtime/ops/DraftSelector.cpp \
 	runtime/ops/Embedding.cpp \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
-	runtime/ops/KvCopy.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/RoPE.cpp \
+	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
 	runtime/engine/MemoryPlan.cpp \
@@ -283,8 +282,10 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/Cache.cpp \
 	runtime/engine/Engine.cpp \
 	runtime/engine/MemoryGovernor.cpp \
+	runtime/engine/MemoryControl.cpp \
 	runtime/engine/KvPool.cpp \
 	runtime/engine/KvCache.cpp \
+	runtime/engine/KvPageTier.cpp \
 	runtime/engine/StateCache.cpp \
 	runtime/model/DraftContextPlan.cpp \
 	runtime/engine/Protocol.cpp \
@@ -311,7 +312,6 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/SlotFile.cpp \
-	runtime/model/KvPageTier.cpp \
 	runtime/model/QwenState.cpp
 ENGINE_MM_SOURCES := \
 	runtime/model/SafetensorsCheckpoint.mm \
@@ -328,8 +328,10 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
-ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(PRODUCTION_AIRS) \
+	$(LIB) $(TARGET)
+ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -375,6 +377,11 @@ $(ENGINE_METAL_RUNTIME_OBJECT): runtime/metal/MetalBackend.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
 
+$(ENGINE_INSTRUMENTED_METAL_OBJECT): runtime/metal/MetalBackend.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
+		-DSPLASH_BACKEND_INSTRUMENTATION=1 -c $< -o $@
+
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
@@ -411,7 +418,7 @@ KERNEL_SOURCE_NAMES_DIGEST := $(shell printf '%s\0' $(sort $(PRODUCTION_KERNEL_S
 PRODUCTION_AIR_CONFIG := $(CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
 PRODUCTION_LIB_CONFIG := $(PRODUCTION_AIR_CONFIG)-$(KERNEL_SOURCE_NAMES_DIGEST)
 TEST_KERNEL_CONFIG := $(TEST_CONFIG_DIGEST)-$(KERNEL_HEADER_NAMES_DIGEST)
-TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) \
+TEST_KERNEL_CONFIG_TARGETS := $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) \
 	$(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_DEQUANT_LIB)
 PRODUCTION_CONFIG_TARGETS := $(filter-out $(PRODUCTION_AIRS) $(LIB),$(PRODUCTION_CONFIG_TARGETS))
 TEST_CONFIG_TARGETS := $(filter-out $(TEST_KERNEL_CONFIG_TARGETS),$(TEST_CONFIG_TARGETS))

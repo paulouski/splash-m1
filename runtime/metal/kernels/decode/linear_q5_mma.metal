@@ -48,12 +48,12 @@ __attribute__((always_inline)) inline void decodeTile(device const bfloat *table
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1, device const uchar *hi1,
                    device const half *sc1, device const half *bi1,
-                   constant Q4Params &p, uint2 tg, uint tid, uint sg, uint lane,
+                   constant Q4PersistentParams &p, uint2 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
   constexpr uint tileN = gateUp ? 32 : 64;
   const uint N = p.output_size, K = p.input_size, groups = K / 64;
-  const uint splits = p.persistent_groups;
+  const uint splits = p.groups;
   const uint first = tg.y * (groups / splits);
   const uint end = tg.y + 1 == splits ? groups : first + groups / splits;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
@@ -197,7 +197,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1, device const uchar *hi1,
                    device const half *sc1, device const half *bi1,
-                   constant Q4Params &p, uint2 tg, uint tid, uint sg, uint lane,
+                   constant Q4PersistentParams &p, uint2 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
   const uint tile = (tg.x * (gateUp ? 32 : 64) + sg * (gateUp ? 8 : 16)) / 256;
@@ -221,7 +221,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 
 #define Q5_SGF_AFFINE(Name, L, Out) \
-kernel void Name(Q5_SGF_INPUTS(Out), constant Q4Params &p [[buffer(9)]], Q5_SGF_THREADS) { \
+kernel void Name(Q5_SGF_INPUTS(Out), constant Q4PersistentParams &p [[buffer(9)]], Q5_SGF_THREADS) { \
   threadgroup uint arrival; \
   q5sgf::decode<q5sgf::Epilogue::Affine, L, Out>(table, weights, hi, scales, biases, output, sums, \
       partials, counters, table, weights, hi, scales, biases, p, tg, tid, sg, lane, &arrival); \
@@ -230,7 +230,7 @@ kernel void Name(Q5_SGF_INPUTS(Out), constant Q4Params &p [[buffer(9)]], Q5_SGF_
 Q5_SGF_AFFINE(decode_linear_q5_sgf##SUFFIX, L, bfloat) \
 Q5_SGF_AFFINE(decode_linear_q5_sgf##SUFFIX##_f32, L, float) \
 kernel void decode_linear_q5_sgf_residual##SUFFIX(Q5_SGF_INPUTS(bfloat), \
-    device const bfloat *residual [[buffer(9)]], constant Q4Params &p [[buffer(10)]], \
+    device const bfloat *residual [[buffer(9)]], constant Q4PersistentParams &p [[buffer(10)]], \
     Q5_SGF_THREADS) { \
   threadgroup uint arrival; \
   q5sgf::decode<q5sgf::Epilogue::Residual, L, bfloat>(table, weights, hi, scales, biases, output, sums, \
@@ -239,7 +239,7 @@ kernel void decode_linear_q5_sgf_residual##SUFFIX(Q5_SGF_INPUTS(bfloat), \
 kernel void decode_linear_q5_sgf_gate_up##SUFFIX(Q5_SGF_INPUTS(bfloat), \
     device const uchar *up [[buffer(9)]], device const uchar *upHi [[buffer(10)]], \
     device const half *upScales [[buffer(11)]], device const half *upBiases [[buffer(12)]], \
-    constant Q4Params &p [[buffer(13)]], Q5_SGF_THREADS) { \
+    constant Q4PersistentParams &p [[buffer(13)]], Q5_SGF_THREADS) { \
   threadgroup uint arrival; \
   q5sgf::decode<q5sgf::Epilogue::GateUp, L, bfloat>(table, weights, hi, scales, biases, output, sums, \
       partials, counters, output, up, upHi, upScales, upBiases, p, tg, tid, sg, lane, &arrival); \

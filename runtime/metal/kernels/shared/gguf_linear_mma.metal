@@ -32,7 +32,7 @@ kernel void gguf_decode_mma(device bfloat *input [[buffer(0)]], device uchar *w0
                    [&](uint row, uint column, float v) {
                      const ulong o = ulong(row) * p.out_stride + column0 + column;
                      if constexpr (Ep == EpResidual) v += float(aux[o]);
-                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
                      output[o] = Out(v);
                    });
 }
@@ -78,7 +78,7 @@ kernel void gguf_decode_mma_pq20rb(device half *input [[buffer(0)]], device ucha
                    [&](uint row, uint column, float v) {
                      const ulong o = ulong(row) * p.out_stride + column0 + column;
                      if constexpr (Ep == EpResidual) v += float(aux[o]);
-                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
                      output[o] = Out(v);
                    });
 }
@@ -182,7 +182,7 @@ inline void gguf_prefill_mma(device bfloat *input, device uchar *w0, device ucha
                              device bfloat *output, device bfloat *aux, constant GgufPrefillParams &p, uint2 group,
                              uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, kPrefillThreads);
-  const uint stride = p.out_stride ? p.out_stride : p.output_size;
+  const uint stride = p.out_stride;
   const uint first = group.x * kPrefillRows, rows = p.rows > first ? p.rows - first : 0;
   const uint origin = group.y * GGUF_TILE_COLUMNS;
   prefill_tile<F>(input + ulong(first) * p.input_size, w0, w1, meta, p.input_size, origin, rows, stage, tl, simd_lane,

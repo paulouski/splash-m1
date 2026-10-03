@@ -21,15 +21,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-if __package__:
-    from . import assembly, families, gguf, hub, legacy, models
-else:
-    import assembly
-    import families
-    import gguf
-    import hub
-    import legacy
-    import models
+from . import assembly, families, gguf, hub, legacy, models
 
 PRISM_FORMAT = "mlx-prism"
 PRISM_DRAFT_REPO = "naklitechie/Qwen3.8-27B-DFlash2-ternary-bonsai2"
@@ -598,7 +590,12 @@ def require_disk_space(model, target_format, target_repo, target_names, draft_re
     if not draft_repo.files:
         return
     target = _weight_bytes(target_repo, target_names)
-    draft = _weight_bytes(draft_repo, _weight_files(draft_repo))
+    try:
+        draft = _weight_bytes(draft_repo, _weight_files(draft_repo))
+    except models.ModelError:
+        # An unusable draft is reported, or replaced by the installed one, when
+        # it is fetched.
+        return
     if target is None or draft is None:
         return
     prepared = PRISM_PREPARED_BYTES if target_format == PRISM_FORMAT else target[0]

@@ -67,17 +67,15 @@ inline uint block_dimension(uint k, uint t) {
 // tokens, and rows past active_rows repeat the last active row's mask.
 template <uint KVHeads, uint QueryHeadsPerKVHead>
 __attribute__((always_inline)) inline void tile(
-    device const bfloat *tile_queries, device const int8_t *cache_keys,
-    device const float *key_scales, device const int8_t *cache_values,
-    device const float *value_scales, device const uint *page_table,
-    uint kv_head, uint committed_tokens, uint active_rows, uint splits,
+    device const bfloat *tile_queries, device const SplashKvPage *page_table,
+    SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     uint sg, uint lane, threadgroup uint *query_words) {
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
-  constexpr uint N = SplashQ8PageTokens;
-  constexpr uint D = SplashQ8HeadDimension;
+  constexpr uint N = SplashKvPageTokens;
+  constexpr uint D = SplashKvHeadDimension;
   static_assert(N == 32 && D == 256, "fragment maps assume Page32 and D = 256");
   static_assert(SPLASH_TARGET_VERIFY_ROWS == Rows &&
                     SPLASH_PREFILL_ATTENTION_TILE_ROWS == Rows,
@@ -121,19 +119,18 @@ __attribute__((always_inline)) inline void tile(
   float2 row_max(-INFINITY), row_sum(0.0f);
   // The four tokens of this lane's score rows: base + {0, 1, 4, 5}.
   const uint scale_base = page_token(fm, 0);
+  const SplashKvAddressing<KVHeads, int8_t> addressing(kv, kv_head);
 
   for (uint page = page_begin; page < page_end; ++page) {
-    const uint physical = page_table[page];
-    device const int8_t *keys =
-        cache_keys + splash_q8_key_index<KVHeads>(physical, kv_head, 0, 0);
-    device const int8_t *values =
-        cache_values + splash_q8_value_index<KVHeads>(physical, kv_head, 0, 0);
-    const ulong scale_index =
-        splash_q8_scale_index<KVHeads>(physical, kv_head, 0) + scale_base;
-    const float2 k01 = *reinterpret_cast<device const float2 *>(key_scales + scale_index);
-    const float2 k45 = *reinterpret_cast<device const float2 *>(key_scales + scale_index + 4);
-    const float2 v01 = *reinterpret_cast<device const float2 *>(value_scales + scale_index);
-    const float2 v45 = *reinterpret_cast<device const float2 *>(value_scales + scale_index + 4);
+    const SplashKvPageTensors<int8_t> tensors = addressing.page(page_table[page]);
+    device const int8_t *keys = tensors.keys;
+    device const int8_t *values = tensors.values;
+    device const float *key_scales = tensors.key_scales + scale_base;
+    device const float *value_scales = tensors.value_scales + scale_base;
+    const float2 k01 = *reinterpret_cast<device const float2 *>(key_scales);
+    const float2 k45 = *reinterpret_cast<device const float2 *>(key_scales + 4);
+    const float2 v01 = *reinterpret_cast<device const float2 *>(value_scales);
+    const float2 v45 = *reinterpret_cast<device const float2 *>(value_scales + 4);
     const float key_scale[4] = {k01.x, k01.y, k45.x, k45.y};
     const float value_scale[4] = {v01.x, v01.y, v45.x, v45.y};
 

@@ -356,7 +356,7 @@ PrismMlxView bindPrismMlx(WeightSource &source, const std::filesystem::path &dir
     NSDictionary *hadamard = parseObject(hadamardBytes, "hadamard.json");
     const auto signs = readSigns(hadamard);
 
-    auto checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
+    auto checkpoint = std::make_unique<SafetensorsCheckpoint>(directory, PreparationCheck{});
     checkpoint->requireLayerTypes(g.layers, g.fullAttentionPeriod);
     const std::string language = "language_model.";
     Binder binder(*checkpoint, source.path(), signs);

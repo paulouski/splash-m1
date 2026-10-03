@@ -58,7 +58,11 @@ class StaticTests(unittest.TestCase):
                     "/static/link.js",
                     f"/static/{root.parent}/secret.js",
                 ):
-                    self.assertEqual(self.get(path)[0].status, 404, path)
+                    # A path that leaves the root is routed as what it names,
+                    # which needs the key; the rest are not found.
+                    response, body = self.get(path)
+                    self.assertIn(response.status, (401, 404), path)
+                    self.assertNotIn(b"secret", body, path)
 
     def test_rejects_traversal_and_unknown(self):
         for path in (
@@ -74,7 +78,7 @@ class StaticTests(unittest.TestCase):
             "/static/katex",
             "/static/katex/%00.js",
         ):
-            self.assertEqual(self.get(path)[0].status, 404, path)
+            self.assertIn(self.get(path)[0].status, (401, 404), path)
 
 
 if __name__ == "__main__":

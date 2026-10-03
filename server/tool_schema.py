@@ -11,19 +11,14 @@ from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
-from referencing import Registry
 
-if __package__:
-    from .errors import APIError
-    from .schema_validation import build_validator, json_objects
-else:  # ``python server/server.py`` from the repo root.
-    from errors import APIError
-    from schema_validation import build_validator, json_objects
+from .errors import APIError
+from .schema_validation import build_validator, json_objects, subschemas
 
 MAX_JSON_NESTING = 256
 
-# The chat template's tool-call framing. The projector, the parser and the
-# grammars must agree byte for byte, so every piece is spelled here once.
+# The chat template's tool-call framing. The projector that parses output and
+# the grammars must agree byte for byte, so every piece is spelled here once.
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
 FUNCTION_OPEN = "\n<function="
@@ -33,7 +28,11 @@ PARAMETER_CLOSE = "\n</parameter>\n"
 THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
 
 
-LOCAL_REGISTRY = Registry()
+def function_opening(name):
+    """What follows TOOL_CALL_OPEN in a call of tool `name`, up to its
+    arguments."""
+    return f"{FUNCTION_OPEN}{name}>\n"
+
 
 # Framing projects each tool's fields through schema composition and copies
 # the root schema into every field that refers to it. Pathological schemas
@@ -82,64 +81,8 @@ def json_value(value):
         return value
 
 
-# JSON Schema keywords whose values are schemas: maps from names to schemas,
-# then single schemas or lists of schemas. ``dependencies`` holds a schema or
-# a list of property names per entry and is told apart by shape. Draft 3's
-# ``type`` and ``disallow`` lists may hold schemas beside type names.
-SCHEMA_MAP_KEYWORDS = {
-    "properties",
-    "patternProperties",
-    "$defs",
-    "definitions",
-    "dependentSchemas",
-}
-SUBSCHEMA_KEYWORDS = {
-    "items",
-    "prefixItems",
-    "additionalItems",
-    "contains",
-    "additionalProperties",
-    "unevaluatedItems",
-    "unevaluatedProperties",
-    "propertyNames",
-    "allOf",
-    "anyOf",
-    "oneOf",
-    "not",
-    "if",
-    "then",
-    "else",
-    "contentSchema",
-    "extends",
-}
-
-
-def _schemas(schema):
-    """Yield ``schema`` and, depth first, every schema nested under it.
-
-    Only schema positions are visited, so property names and literal const,
-    enum, default and examples data are never mistaken for schemas.
-    """
-    yield schema
-    if not isinstance(schema, dict):
-        return
-    for key, item in schema.items():
-        if key in SCHEMA_MAP_KEYWORDS and isinstance(item, dict):
-            children = item.values()
-        elif key == "dependencies" and isinstance(item, dict):
-            children = (child for child in item.values() if not isinstance(child, list))
-        elif key in SUBSCHEMA_KEYWORDS:
-            children = item if isinstance(item, list) else (item,)
-        elif key in ("type", "disallow") and isinstance(item, list):
-            children = (child for child in item if isinstance(child, dict))
-        else:
-            continue
-        for child in children:
-            yield from _schemas(child)
-
-
 def _remote_ref(schema):
-    for node in _schemas(schema):
+    for node in subschemas(schema):
         if isinstance(node, dict):
             if "$schema" in node and not isinstance(node["$schema"], str):
                 raise APIError(400, "$schema must be a string")
@@ -191,21 +134,27 @@ STRING_SCHEMA_POST_VALIDATION_KEYWORDS = {
 GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
 MAX_GRAMMAR_BOUND = 64
 
+# Checking a pattern compiles a grammar, and a client sends the same tools and
+# output schema on every turn, so the answers for this many patterns are kept.
+PATTERN_CHECK_CACHE_SIZE = 1024
+
 # The whitespace a model chooses between the tokens of constrained output, in
-# JSON and around tool calls, is bounded. Whitespace inside strings is content
-# and remains unbounded.
+# JSON and around tool calls, is bounded: a model that prefers whitespace to
+# every token the grammar allows next would otherwise write it until
+# max_tokens, as Qwen models do, most of all under speculative decoding (vLLM
+# #38696, #50989). llama.cpp and Outlines bound it more tightly; 64 characters
+# still take pretty printing 15 levels deep at four spaces. Whitespace inside
+# strings is content and unbounded.
 MAX_WHITESPACE = 64
 WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
 WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
 
-# Pattern checks compile a grammar, and clients reuse their schemas across
-# turns, so keep the result for a bounded number of patterns.
-PATTERN_CHECK_CACHE_SIZE = 1024
-
 
 @lru_cache(maxsize=PATTERN_CHECK_CACHE_SIZE)
 def _grammar_takes_pattern(pattern):
-    """Whether llguidance can compile a JSON Schema ``pattern``."""
+    """Whether the grammar compiler takes a JSON Schema ``pattern``. It keeps
+    the pattern's search semantics but rejects look-around, word boundaries
+    and backreferences, which are left to validation of the complete output."""
     string = json.dumps({"type": "string", "pattern": pattern})
     return not LLMatcher.validate_grammar(f"%llguidance {{}}\nstart: %json {string}\n")
 
@@ -213,7 +162,7 @@ def _grammar_takes_pattern(pattern):
 def _grammar_compatible_schema(schema):
     """Guide generation with supported constraints; validate the original."""
     output = copy.deepcopy(schema)
-    for node in _schemas(output):
+    for node in subschemas(output):
         if isinstance(node, dict):
             node.pop("propertyNames", None)
             pattern = node.pop("pattern", None)
@@ -230,10 +179,78 @@ def _grammar_compatible_schema(schema):
         # Any value, with the whitespace between its tokens bounded.
         output = {}
     if isinstance(output, dict):
-        output["x-guidance"] = {
-            "lenient": True,
-            "whitespace_pattern": WHITESPACE,
-        }
+        output["x-guidance"] = {"lenient": True, "whitespace_pattern": WHITESPACE}
+    return output
+
+
+# Keywords that apply further schemas to the instance a schema describes.
+IN_PLACE_APPLICATORS = {
+    "allOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "dependencies",
+    "extends",
+    "$dynamicRef",
+    "$recursiveRef",
+}
+SCHEMA_IDENTIFIERS = {
+    "$schema",
+    "$id",
+    "$anchor",
+    "$dynamicAnchor",
+    "$defs",
+    "definitions",
+}
+# Keywords by which an object says which properties it takes beyond those it
+# declares.
+MORE_PROPERTIES = {"additionalProperties", "unevaluatedProperties", "patternProperties"}
+
+
+def _extended(node):
+    """Whether other schemas apply to the instance `node` describes, so that
+    `node` may declare only some of its properties."""
+    keys = set(node) - SCHEMA_ANNOTATIONS - SCHEMA_IDENTIFIERS
+    if keys & IN_PLACE_APPLICATORS or ("$ref" in keys and keys != {"$ref"}):
+        return True
+    unions = keys & {"anyOf", "oneOf"}
+    return bool(unions and keys - unions - {"type"})
+
+
+def _strict_schema(schema):
+    """The schema a strict tool's arguments are generated to, as vLLM and
+    SGLang generate them with XGrammar's strict mode: an object that does not
+    say which properties it takes beyond those it declares takes none, and
+    an array that does not say which items it takes beyond its leading ones
+    takes none. Validation keeps the declared schema.
+
+    A schema that other schemas of the same instance extend, as an allOf
+    does, may declare only some of its properties, and closing it would
+    refuse the others; a schema composed that way is left as declared."""
+    if any(_extended(node) for node in subschemas(schema) if isinstance(node, dict)):
+        return schema
+    output = copy.deepcopy(schema)
+    for node in subschemas(output):
+        if not isinstance(node, dict):
+            continue
+        keys = set(node)
+        # A union or a reference describes its instance by its alternatives
+        # or its target, which are closed in their own places.
+        if keys & {"anyOf", "oneOf", "$ref"}:
+            continue
+        kind = node.get("type")
+        kinds = kind if isinstance(kind, list) else [kind]
+        if "object" in kinds or (kind is None and "properties" in keys):
+            if not keys & MORE_PROPERTIES:
+                node["additionalProperties"] = False
+        if "array" in kinds or (kind is None and "prefixItems" in keys):
+            if isinstance(node.get("items"), list):
+                if not keys & {"additionalItems", "unevaluatedItems"}:
+                    node["additionalItems"] = False
+            elif not keys & {"items", "unevaluatedItems"}:
+                node["items"] = False
     return output
 
 
@@ -257,7 +274,7 @@ def _lookup_tool_reference(ref, root):
                 continue
             raise APIError(400, f"unresolved tool parameter reference: {ref}")
         return current
-    for node in _schemas(root):
+    for node in subschemas(root):
         if isinstance(node, dict) and fragment in (
             node.get("$anchor"),
             node.get("$dynamicAnchor"),
@@ -287,7 +304,7 @@ def _resolve_tool_schema(schema, root):
 
 def _schema_with_root(schema, root):
     def local_refs(value):
-        for node in _schemas(value):
+        for node in subschemas(value):
             ref = node.get("$ref") if isinstance(node, dict) else None
             if isinstance(ref, str) and ref.startswith("#"):
                 yield node
@@ -315,8 +332,11 @@ def _schema_with_root(schema, root):
     return output
 
 
-def raw_string_schema(schema, root):
-    return _raw_string_schema(schema, root, frozenset(), {})
+def raw_string_schema(schema):
+    """How a parameter value is written: ("raw", None) as raw text,
+    ("literal", values) as one of `values`, or None as JSON. Framing makes
+    each parameter schema self-contained, so it is its own reference root."""
+    return _raw_string_schema(schema, schema, frozenset(), {})
 
 
 def _raw_string_schema(schema, root, ancestors, results):
@@ -447,15 +467,13 @@ def _json_size(value, limit):
     return size
 
 
-def tool_argument_schema(root, budget=None):
+def tool_argument_schema(root, budget):
     """Project object fields for XML framing; validate the untouched schema.
 
     Cross-field assertions remain on ToolPolicy.validators. This projection
     preserves the set of possible field values rather than choosing a branch
     before the model has supplied the discriminator or dependent properties.
     """
-    if budget is None:
-        budget = [MAX_FRAMED_SCHEMA_BYTES]
 
     def charge(size):
         budget[0] -= size
@@ -593,14 +611,10 @@ def tool_argument_schema(root, budget=None):
     return shape
 
 
-def _tool_arguments_grammar(schema):
-    return _argument_grammar(tool_argument_schema(schema))
-
-
 def _parameter_rules(rule, prefix, value_schema):
     rules = []
     closing = json.dumps(PARAMETER_CLOSE)
-    string_schema = raw_string_schema(value_schema, value_schema)
+    string_schema = raw_string_schema(value_schema)
     value_schema = _grammar_compatible_schema(value_schema)
     if string_schema is None:
         rules.append(
@@ -714,7 +728,7 @@ def normalize_response_format(value):
     if ref := _remote_ref(schema):
         raise APIError(400, f"remote schema reference is not allowed: {ref}")
     try:
-        validator = build_validator(schema, _schemas, LOCAL_REGISTRY)
+        validator = build_validator(schema)
     except SchemaError as error:
         raise APIError(400, f"invalid response schema: {error.message}") from error
     return schema, validator
@@ -750,11 +764,14 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             schema = {}
         if not isinstance(schema, (dict, bool)):
             raise APIError(400, f"invalid tool schema for {name}")
+        strict = function.get("strict")
+        if strict is not None and not isinstance(strict, bool):
+            raise APIError(400, f"strict must be a boolean for tool {name}")
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
-            validators[name] = build_validator(schema, _schemas, LOCAL_REGISTRY)
-            schemas[name] = schema
+            validators[name] = build_validator(schema)
+            schemas[name] = _strict_schema(schema) if strict else schema
         except SchemaError as error:
             raise APIError(
                 400, f"invalid tool schema for {name}: {error.message}"
@@ -776,9 +793,11 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
             or name not in validators
         ):
             raise APIError(400, "invalid named tool_choice")
-        # The prompt keeps every tool; the grammar and validators force the call.
+        # The prompt keeps every tool; the grammar and validators force the
+        # call, exactly one, as a forced function is defined.
         validators = {name: validators[name]}
         schemas = {name: schemas[name]}
+        parallel = False
     elif choice not in ("auto", "required"):
         raise APIError(400, "invalid tool_choice")
     policy = ToolPolicy(
@@ -803,6 +822,9 @@ def tool_grammar(policy, thinking, response_schema=None):
         # An older declared dialect leaves newer keywords unchecked, so framing
         # can meet any JSON value where it reads part of a schema.
         raise APIError(400, "unsupported tool parameter schema") from error
+    # Text of the model's own may come before a call only where the answer
+    # may be text. A required call, like a JSON answer, stands apart from the
+    # reasoning and from other calls by whitespace alone.
     separator = "WS" if policy.required or response_schema is not None else "TEXT"
     side_grammars = []
     tag_rules = []
@@ -811,7 +833,7 @@ def tool_grammar(policy, thinking, response_schema=None):
         side_grammars.append({"name": grammar_name, "lark_grammar": grammar})
         tag_rules.append(
             f"tool_{index}: {separator} {TOOL_CALL_OPEN} "
-            f"{json.dumps(FUNCTION_OPEN + name + '>' + chr(10))} "
+            f"{json.dumps(function_opening(name))} "
             f"@{grammar_name} {json.dumps(FUNCTION_CLOSE.removesuffix(TOOL_CALL_CLOSE))} "
             f"{TOOL_CALL_CLOSE}"
         )

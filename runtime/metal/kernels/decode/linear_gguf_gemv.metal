@@ -21,7 +21,7 @@ __attribute__((always_inline)) inline float gemv_code(uint word, uint s) {
 }
 
 // silu(gate) * up of the bf16-rounded gate and up sums, as the M=8 gate/up epilogue.
-inline bfloat gemv_gate_up(float gate, float up) { return bfloat(float(bfloat(up)) * gguf_silu(float(bfloat(gate)))); }
+inline bfloat gemv_gate_up(float gate, float up) { return bfloat(float(bfloat(up)) * splash_silu(float(bfloat(gate)))); }
 
 template <GemvEpilogue Ep, class Out>
 inline void gemv_store(device Out *output, device bfloat *aux, uint row, float v) {

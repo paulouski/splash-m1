@@ -226,7 +226,7 @@ kernel void prefill_linear_q5_mma64(
     device const bfloat *input [[buffer(0)]], device const uchar *weights [[buffer(1)]],
     device const uchar *hi [[buffer(2)]], device const half *scales [[buffer(3)]],
     device const half *biases [[buffer(4)]], device bfloat *output [[buffer(5)]],
-    device const float *sums [[buffer(6)]], constant Q4PrefillParams &p [[buffer(7)]], Q5MM_THREADS) {
+    device const float *sums [[buffer(6)]], constant Q4Params &p [[buffer(7)]], Q5MM_THREADS) {
   Q5MM_PROJECT(Affine, output, output);
 }
 
@@ -235,7 +235,7 @@ kernel void prefill_linear_q5_mma64_residual(
     device const uchar *hi [[buffer(2)]], device const half *scales [[buffer(3)]],
     device const half *biases [[buffer(4)]], device const bfloat *residual [[buffer(5)]],
     device bfloat *output [[buffer(6)]], device const float *sums [[buffer(7)]],
-    constant Q4PrefillParams &p [[buffer(8)]], Q5MM_THREADS) {
+    constant Q4Params &p [[buffer(8)]], Q5MM_THREADS) {
   Q5MM_PROJECT(Residual, output, residual);
 }
 
@@ -244,7 +244,7 @@ kernel void prefill_linear_q5_mma64_up_silu_sums(
     device const uchar *hi [[buffer(2)]], device const half *scales [[buffer(3)]],
     device const half *biases [[buffer(4)]], device const bfloat *gate [[buffer(5)]],
     device bfloat *output [[buffer(6)]], device const float *sums [[buffer(7)]],
-    device float *outputSums [[buffer(8)]], constant Q4PrefillParams &p [[buffer(9)]], Q5MM_THREADS) {
+    device float *outputSums [[buffer(8)]], constant Q4Params &p [[buffer(9)]], Q5MM_THREADS) {
   Q5MM_PROJECT(UpWithGate, output, gate);
   q5mm::write_output_sums<32>(output, outputSums, p.output_size, tg, sg, lane);
 }
