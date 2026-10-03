@@ -233,4 +233,4 @@ if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/i
     echo '    Bash: source "$HOME/Library/Application Support/Splash M1/app/current/install/completions/splash.bash"'
     echo '    Zsh:  source "$HOME/Library/Application Support/Splash M1/app/current/install/completions/_splash"'
 fi
-echo "  Upgrade: run this installer again.  Uninstall: rm -rf \"$APP\" \"$wrapper\""
+echo "  Upgrade: run this installer again.  Uninstall: splash-m1 uninstall"

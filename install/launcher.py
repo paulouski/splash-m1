@@ -600,6 +600,13 @@ def parse_args(argv=None):
         )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
+    remove = commands.add_parser(
+        "uninstall", help="remove Splash M1, its models, weight cache and settings"
+    )
+    remove.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    remove.add_argument(
+        "--keep-models", action="store_true", help="keep downloaded models and weight cache"
+    )
     args = parser.parse_args(argv)
     args.simple_start = simple_start
     if simple_start:
@@ -626,9 +633,27 @@ def parse_args(argv=None):
     return args
 
 
+def _uninstall(args):
+    try:
+        from . import uninstall
+    except ImportError:
+        import uninstall
+    try:
+        done = uninstall.run(
+            args.keep_models,
+            confirm=None if args.yes else lambda: input("Remove these? [y/N] ").strip().lower() in ("y", "yes"),
+        )
+    except model_artifacts.ModelError as error:
+        raise LauncherError(str(error)) from None
+    print("Splash M1 removed." if done else "Cancelled.")
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
     try:
+        if args.command == "uninstall":
+            return _uninstall(args)
         return serve(args) if args.command == "serve" else coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)

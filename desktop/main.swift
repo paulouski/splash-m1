@@ -287,6 +287,11 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
             keyEquivalent: "q"
         )
         quitItem.target = NSApp
+        let uninstallItem = NSMenuItem(
+            title: "Uninstall Splash…", action: #selector(uninstallSplash), keyEquivalent: "")
+        uninstallItem.target = self
+        appMenu.addItem(uninstallItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(quitItem)
         appMenuItem.submenu = appMenu
         mainMenu.addItem(appMenuItem)
@@ -404,6 +409,21 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             sendAction("delete", model: model)
         }
+    }
+
+    @objc private func uninstallSplash() {
+        let alert = NSAlert()
+        alert.messageText = "Uninstall Splash M1?"
+        alert.informativeText =
+            "Removes the app, the splash-m1 command, settings, downloaded models and the weight cache. Local checkpoints you chose by path are not touched."
+        alert.alertStyle = .warning
+        alert.showsSuppressionButton = true
+        alert.suppressionButton?.title = "Keep downloaded models"
+        alert.addButton(withTitle: "Uninstall")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, startSupervisor() else { return }
+        statusLabel.stringValue = "Uninstalling…"
+        sendAction(alert.suppressionButton?.state == .on ? "uninstall_keep" : "uninstall")
     }
 
     @objc private func modelInputChanged() {
@@ -595,6 +615,11 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
                 startButton.title = "Download & Start"
             }
             statusLabel.stringValue = "Deleted \(model ?? "model")."
+        case "uninstalled":
+            if let id = Bundle.main.bundleIdentifier {
+                UserDefaults.standard.removePersistentDomain(forName: id)
+            }
+            NSApp.terminate(nil)
         case "model_checked":
             isCheckingModel = false
             spinner.stopAnimation(nil)

@@ -154,7 +154,6 @@ class LauncherTests(unittest.TestCase):
             "doctor",
             "model",
             "models",
-            "uninstall",
         ):
             with self.subTest(command=command), mock.patch("sys.stderr", io.StringIO()):
                 with self.assertRaises(SystemExit):

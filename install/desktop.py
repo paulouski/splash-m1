@@ -18,11 +18,12 @@ import urllib.request
 from pathlib import Path
 
 if __package__:
-    from . import desktop_models, launcher, paths
+    from . import desktop_models, launcher, paths, uninstall
 else:
     import desktop_models
     import launcher
     import paths
+    import uninstall
 
 ROOT = paths.ROOT
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
@@ -225,6 +226,16 @@ def _delete_action(output, action, model, *, busy=False):
         _event(output, "error", message=str(error))
 
 
+def _uninstall_action(output, action, *, busy=False):
+    try:
+        if busy:
+            raise desktop_models.models.ModelError("Stop Splash before uninstalling.")
+        uninstall.run(action == "uninstall_keep", echo=lambda *_: None, from_app=True)
+        _event(output, "uninstalled")
+    except (desktop_models.models.ModelError, OSError) as error:
+        _event(output, "error", message=str(error))
+
+
 class _Control:
     def __init__(self, fd):
         self.fd = fd
@@ -258,6 +269,8 @@ class _Control:
                     "models",
                     "delete_plan",
                     "delete",
+                    "uninstall",
+                    "uninstall_keep",
                     "check",
                     "start",
                     "stop",
@@ -377,6 +390,8 @@ def _monitor(process, control, output, model=MODEL, *, checking=False):
                 _emit_models(output)
             elif action in ("delete_plan", "delete"):
                 _delete_action(output, action, _selected_model, busy=True)
+            elif action in ("uninstall", "uninstall_keep"):
+                _uninstall_action(output, action, busy=True)
             elif action in ("stop", "quit"):
                 stop_requested = action
         if control.eof:
@@ -481,6 +496,12 @@ def supervise(
         if action in ("delete_plan", "delete"):
             try:
                 _delete_action(output, action, selected_model)
+            except BrokenPipeError:
+                return
+            continue
+        if action in ("uninstall", "uninstall_keep"):
+            try:
+                _uninstall_action(output, action)
             except BrokenPipeError:
                 return
             continue

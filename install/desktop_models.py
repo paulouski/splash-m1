@@ -325,11 +325,15 @@ def _revision_strategy(snapshot):
     return scan_cache_dir(snapshot.parents[2]).delete_revisions(snapshot.name)
 
 
-def _delete_plan(model, models_root):
-    model = normalize_model_id(model)
-    drafts = {family.draft.repo for family in families.FAMILIES} | {
+def draft_repos():
+    return {family.draft.repo for family in families.FAMILIES} | {
         upstream.PRISM_DRAFT_REPO
     }
+
+
+def _delete_plan(model, models_root):
+    model = normalize_model_id(model)
+    drafts = draft_repos()
     links, assemblies, pins = [], set(), {}
     for link in models.selection_links(models_root):
         try:

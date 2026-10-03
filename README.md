@@ -14,6 +14,8 @@ curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/insta
 
 The installer verifies the download and puts **Splash M1.app** in /Applications (or ~/Applications if that is not writable). Files downloaded by curl carry no quarantine flag, so the app opens without a Gatekeeper warning. Add `-s -- --cli-only` after `bash` to skip the app. Alternatively, download the **Mac app** ZIP from the releases page, unzip it, and drag **Splash M1.app** to Applications (see **First launch** below).
 
+To remove Splash M1 with its app, command, settings and downloaded models, run `splash-m1 uninstall` (`--keep-models` keeps the models, `--yes` skips the prompt), or choose **Uninstall Splash…** in the app menu.
+
 1. Open Splash M1 (`open -a "Splash M1"`). Use the recommended model, or paste a Hugging Face model link or repository ID and click **Check Model**. Unsupported configurations are refused before model weights are downloaded. Click **Download & Start** to download the selected model and its matching draft, then prepare them for your Mac.
 3. The app opens your browser when the chat is ready. Keep Splash M1 running while you chat; use **Stop** or quit the app to release the model.
 
@@ -91,9 +93,9 @@ python3.13 -m venv .venv
 .venv/bin/python -m pip install -r install/requirements.txt
 make -j8
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only --max-context 32K
+# Macs below 32 GB of memory: ./splash serve --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --language-only
 ~~~
 
-# Macs below 32 GB of memory: ./splash serve --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --language-only
 The server downloads the selected model and matching draft from Hugging Face, then prepares weights for this build. When the server reports Ready, open http://127.0.0.1:8000 or connect an agent. Press Ctrl+C to stop it.
 
 ## API
