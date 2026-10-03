@@ -78,8 +78,14 @@ inline constexpr int32_t kQuantizedMinimum = -127;
 inline constexpr int32_t kQuantizedMaximum = 127;
 // Every tensor region of an extent starts on this boundary. The attention
 // kernels were tuned on it, and regions aligned to less cost Apple10's 35B
-// verify kernel a fixed ~25 µs per dispatch.
+// verify kernel a fixed ~25 µs per dispatch. The Apple7/8 build uses 8 KiB:
+// the INT8 scale tensors then need 16-page units instead of 128, so a small
+// pool wastes far fewer pages on its last extent.
+#if defined(SPLASH_MACOS15_BUILD)
+inline constexpr uint64_t kExtentRegionAlignmentBytes = 8 * 1024;
+#else
 inline constexpr uint64_t kExtentRegionAlignmentBytes = 64 * 1024;
+#endif
 // The size a pool aims its extents at (Layout::extentPagesFor stays within
 // half and one and a half times it): each extent costs the serving loop an
 // allocation and a release, and an extent returns memory only once all of

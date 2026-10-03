@@ -41,7 +41,7 @@ reject '--phases takes both, verify or prefill' --phases typo
 reject '--tile takes mpp or register' --tile typo
 reject 'unknown option --unknown' --unknown 1
 # The 27B's INT8 extents hold whole 128-page alignment units.
-reject 'does not hold whole alignment units' --shapes 27b --extent-pages 448
+reject 'does not hold whole alignment units' --shapes 27b --extent-pages 456
 # Valid values must reach the final sentinel, still without opening Metal.
 reject 'unknown option --sentinel' \
     --lanes 1,2,3,4 --histories 0,2048,131072 --repeat 1 \

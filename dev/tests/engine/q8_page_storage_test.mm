@@ -145,7 +145,8 @@ void run(const std::string &metallib) {
         [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
         "a pool of a part of an extent was accepted");
     requireThrows<std::invalid_argument>(
-        [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 64); },
+        [&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256,
+                           kvLayout.extentAlignmentPages() / 2); },
         "an extent of a part of an alignment unit was accepted");
 
     metal::MetalBuffer table = test::sharedBuffer(backend, 4 * sizeof(SplashKvPage));

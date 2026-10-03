@@ -1,6 +1,6 @@
 ENGINE_TEST_BUILD := $(BUILD)/engine-tests
 ENGINE_TEST_CXXFLAGS := -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(MACOS15_DEFINE)
 # Production flags less -O3, so Metal optimizes at its default -O2. With
 # metal 32023 the kernels built with them get the same AIR as at -O3, but
 # three production kernels do not (shared/gguf_linear, moe_gguf,
@@ -302,7 +302,7 @@ $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_MEMORY_TEST): runtime/metal/DeviceCapabilities.cpp \
 		runtime/engine/MemoryPlan.cpp \
 		dev/tests/engine/engine_memory_plan_test.cpp | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
+	$(RUN_CONFIGURED) $(CXX) $(filter-out -DSPLASH_MACOS15_BUILD,$(ENGINE_TEST_CXXFLAGS)) $(TEST_INPUTS) -o $@
 
 # The macOS-15 device rules (dense KV fallback) need SPLASH_MACOS15_BUILD.
 $(TEST_MEMORY_MACOS15_TEST): runtime/metal/DeviceCapabilities.cpp \

@@ -24,14 +24,36 @@ void testByteAccounting() {
   static_assert(bf16.scaleBytesPerLayerPage() == 0);
   constexpr Layout compact{10, 2, 256, Format::BFloat16};
   static_assert(compact.bytesPerModelPage() == 655'360);
+#if defined(SPLASH_MACOS15_BUILD)
+  static_assert(compact.extentAlignmentPages() == 1);
+  static_assert(compact.minimumExtentPages() == 103 && compact.maximumExtentPages() == 307);
+#else
   static_assert(compact.extentAlignmentPages() == 2);
   static_assert(compact.minimumExtentPages() == 104 && compact.maximumExtentPages() == 306);
+#endif
   // A pool's extents hold whole alignment units, so that every tensor region
   // of an extent starts 64 KiB-aligned: the 512-byte-per-page scale regions
   // need 128 pages for four KV heads and 256 for two, BF16 one or two. The
   // size is chosen per pool between half and one and a half times the
   // 128 MiB target, leaving the fewest of its pages over, the one nearest the
   // target on a tie.
+#if defined(SPLASH_MACOS15_BUILD)
+  // The Apple7/8 build aligns regions to 8 KiB: 16-page units for four KV
+  // heads, 32 for two.
+  static_assert(kExtentRegionAlignmentBytes == 8 * 1024);
+  static_assert(kOracleLayout.extentAlignmentPages() == 16);
+  static_assert(kOracleLayout.minimumExtentPages() == 64 &&
+                kOracleLayout.maximumExtentPages() == 176);
+  static_assert(kOracleLayout.extentPagesFor(63) == 0 && kOracleLayout.extentPagesFor(64) == 64 &&
+                kOracleLayout.extentPagesFor(356) == 176);
+  constexpr Layout compactInt8{10, 2, 256};
+  static_assert(compactInt8.bytesPerModelPage() == 332'800);
+  static_assert(compactInt8.extentAlignmentPages() == 32);
+  static_assert(compactInt8.minimumExtentPages() == 224 && compactInt8.maximumExtentPages() == 576);
+  static_assert(compactInt8.extentPagesFor(223) == 0 && compactInt8.extentPagesFor(511) == 480);
+  static_assert(compactInt8.extentPagesFor(10'240) == 320);
+  static_assert(compactInt8.extentPagesFor(10'496) == 256);
+#else
   static_assert(kExtentRegionAlignmentBytes == 64 * 1024);
   static_assert(kOracleLayout.extentAlignmentPages() == 128);
   static_assert(kOracleLayout.minimumExtentPages() == 128 &&
@@ -47,6 +69,7 @@ void testByteAccounting() {
   // than 256 (81.25 MiB). With 256 pages over, only 256 leaves nothing.
   static_assert(compactInt8.extentPagesFor(10'240) == 512);
   static_assert(compactInt8.extentPagesFor(10'496) == 256);
+#endif
   // 448 pages divide by 32, 56 and 64 (128 MiB, the target); 97 leaves one
   // page over 32, 48 and 96 extents, of which 48 (96 MiB) is nearest.
   static_assert(bf16.extentPagesFor(31) == 0 && bf16.extentPagesFor(448) == 64 &&

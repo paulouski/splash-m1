@@ -43,7 +43,8 @@ void testUnifiedElasticBudget() {
   EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
   const auto &budget = plan.breakdown();
   require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == 4 &&
-              budget.kvExtentPages == 128,
+              budget.kvExtentPages ==
+                  model().targetKvLayout.extentPagesFor(budgetPages(budget)),
           "execution geometry did not reach memory planning");
   require(budget.fixedRuntimeBytes == model().fixedRuntimeBytes(),
           "active state was incorrectly precharged as fixed memory");
@@ -51,7 +52,9 @@ void testUnifiedElasticBudget() {
               budget.hardBudgetBytes - budget.fixedRuntimeBytes,
           "state and KV do not share one dynamic budget");
   require(budget.minimumDynamicBytes ==
-                  budget.laneStateBytes + budget.kvExtentBytes &&
+                  budget.laneStateBytes +
+                      kvRunwayPages(model().targetKvLayout.minimumExtentPages()) *
+                          budget.kvPageBytes &&
               budget.minimumRequiredBytes ==
                   budget.fixedRuntimeBytes + budget.minimumDynamicBytes,
           "minimum B1 plus the KV runway is incorrect");
@@ -68,7 +71,9 @@ void testUnifiedElasticBudget() {
           "advertised context exceeds elastic KV capacity");
   const std::string json = plan.toStatusJson();
   require(json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
-              json.find("\"kv_extent_pages\":128") != std::string::npos,
+              json.find("\"kv_extent_pages\":" +
+                        std::to_string(budget.kvExtentPages)) !=
+                  std::string::npos,
           "elastic state/KV budget is missing from memory status");
   require(json.find("\"working_set_margin_bytes\":" +
                     std::to_string(budget.workingSetMarginBytes)) !=
@@ -258,7 +263,7 @@ void testModelProvidedKvGeometry() {
   require(budget.kvPageTokens == 32 && budget.kvPageBytes == 332'800 &&
               budget.kvExtentPages ==
                   compact.targetKvLayout.extentPagesFor(budgetPages(budget)) &&
-              budget.kvExtentPages % 256 == 0,
+              budget.kvExtentPages % compact.targetKvLayout.extentAlignmentPages() == 0,
           "memory plan ignored model-provided Q8 geometry");
   require(plan.toStatusJson().find("\"attention_layers\":10") !=
               std::string::npos &&
@@ -281,19 +286,26 @@ void testExtentSizeFollowsThePool() {
         reference.fixedRuntimeBytes + reference.laneStateBytes +
             pages * reference.kvPageBytes);
   };
-  for (const auto [pages, extent] :
-       std::array<std::array<uint64_t, 2>, 4>{{{10'240, 512}, {10'496, 256},
-                                              {10'751, 256}, {511, 256}}}) {
+#if defined(SPLASH_MACOS15_BUILD)
+  constexpr std::array<std::array<uint64_t, 2>, 4> cases{
+      {{10'240, 320}, {10'496, 256}, {10'751, 288}, {511, 480}}};
+  constexpr uint64_t smallest = 224;
+#else
+  constexpr std::array<std::array<uint64_t, 2>, 4> cases{
+      {{10'240, 512}, {10'496, 256}, {10'751, 256}, {511, 256}}};
+  constexpr uint64_t smallest = 256;
+#endif
+  for (const auto [pages, extent] : cases) {
     const auto result = planFor(pages);
     require(result.plan && result.plan->breakdown().kvExtentPages == extent &&
                 result.plan->breakdown().kvCapacityPages == pages - pages % extent &&
                 result.plan->breakdown().kvExtentBytes == extent * 332'800,
             "the extent size does not leave the fewest pool pages over");
   }
-  const auto tooSmall = planFor(255);
+  const auto tooSmall = planFor(smallest - 1);
   require(!tooSmall.plan && tooSmall.status.code == BudgetErrorCode::KvPoolDoesNotFit &&
               tooSmall.status.breakdown.minimumDynamicBytes ==
-                  reference.laneStateBytes + 256 * 332'800,
+                  reference.laneStateBytes + smallest * 332'800,
           "a budget below the smallest extent was accepted");
 }
 
