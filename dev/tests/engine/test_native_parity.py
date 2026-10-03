@@ -152,24 +152,24 @@ class MemoryThresholdTests(unittest.TestCase):
     def test_installer_and_desktop_agree_on_the_full_memory_threshold(self):
         script = (ROOT / "dev/tools/install.sh").read_text()
         (threshold,) = re.findall(r'"\$mem" -ge (\d+)', script)
-        self.assertEqual(int(threshold), desktop_models.FULL_MEMORY_BYTES)
+        self.assertEqual(int(threshold), upstream.FULL_MEMORY_BYTES)
 
     def test_desktop_gate_admits_exactly_the_threshold(self):
         for memory, full in (
             (16 * 1024**3, False),
-            (desktop_models.FULL_MEMORY_BYTES - 1, False),
-            (desktop_models.FULL_MEMORY_BYTES, True),
+            (upstream.FULL_MEMORY_BYTES - 1, False),
+            (upstream.FULL_MEMORY_BYTES, True),
         ):
             with (
                 self.subTest(memory),
-                mock.patch.object(desktop_models, "_memory_bytes", return_value=memory),
+                mock.patch.object(upstream, "_memory_bytes", return_value=memory),
             ):
                 if full:
-                    desktop_models._require_memory("mlx-affine")
+                    upstream.require_memory("mlx-affine")
                 else:
                     with self.assertRaises(models.ModelError):
-                        desktop_models._require_memory("mlx-affine")
-                desktop_models._require_memory(upstream.PRISM_FORMAT)
+                        upstream.require_memory("mlx-affine")
+                upstream.require_memory(upstream.PRISM_FORMAT)
 
 
 if __name__ == "__main__":

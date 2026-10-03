@@ -93,6 +93,7 @@ make -j8
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit --language-only --max-context 32K
 ~~~
 
+# Macs below 32 GB of memory: ./splash serve --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --language-only
 The server downloads the selected model and matching draft from Hugging Face, then prepares weights for this build. When the server reports Ready, open http://127.0.0.1:8000 or connect an agent. Press Ctrl+C to stop it.
 
 ## API

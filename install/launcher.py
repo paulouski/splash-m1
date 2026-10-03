@@ -31,6 +31,10 @@ COMMAND = "splash-m1" if paths.PACKAGED else "splash"
 MODEL_EXAMPLE = "mlx-community/Qwen3.8-27B-4bit"
 MODEL_EXAMPLE_OPTIONS = " --language-only --max-context 32K"
 HELP_EXAMPLE = f"{COMMAND} serve --model {MODEL_EXAMPLE}{MODEL_EXAMPLE_OPTIONS}"
+# Macs below 32 GiB run only this 2-bit Prism checkpoint (install/upstream.py).
+BONSAI_MODEL = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+BONSAI_EXAMPLE = f"{COMMAND} serve --model {BONSAI_MODEL} --language-only"
+FULL_MEMORY_BYTES = 32 * 1024**3
 # A copy: the launcher runs before .venv exists; server/chat_templates imports Jinja2.
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -453,6 +457,7 @@ def parse_args(argv=None):
         epilog=(
             "Quick start:\n"
             f"  {HELP_EXAMPLE}\n"
+            f"  {BONSAI_EXAMPLE}  # Macs below 32 GB\n"
             f"  {COMMAND} opencode  # in another terminal, after Ready\n\n"
             f"Use {COMMAND} serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent."
@@ -465,14 +470,16 @@ def parse_args(argv=None):
         aliases=["start"],
         help="run the local server; Ctrl+C stops it",
         description=(
-            f"Start {MODEL_EXAMPLE} in the foreground with language-only mode "
-            "and a 32K context."
+            f"Start {MODEL_EXAMPLE} (or {BONSAI_MODEL} below 32 GB of memory) "
+            "in the foreground with language-only mode and a 32K context "
+            "(automatic below 32 GB)."
             if simple_start
             else "Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            f"Defaults: --model {MODEL_EXAMPLE} --language-only --max-context 32K.\n"
+            f"Defaults: --model {MODEL_EXAMPLE} --language-only --max-context 32K;\n"
+            f"below 32 GB of memory: --model {BONSAI_MODEL} --language-only.\n"
             "Override --model or --max-context as needed.\n\n"
             "After Ready, use the browser and API URLs printed below. Keep this terminal open; Ctrl+C stops Splash."
             if simple_start
@@ -585,10 +592,11 @@ def parse_args(argv=None):
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
     if simple_start:
+        full = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") >= FULL_MEMORY_BYTES
         server.set_defaults(
-            model=MODEL_EXAMPLE,
+            model=MODEL_EXAMPLE if full else BONSAI_MODEL,
             language_only=True,
-            max_context=_parse_max_context("32K"),
+            max_context=_parse_max_context("32K") if full else None,
         )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")

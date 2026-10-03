@@ -399,7 +399,7 @@ def _monitor(process, control, output, model=MODEL, *, checking=False):
             buffer.extend(chunk)
             for line in _lines(buffer):
                 _event(output, "log", message=line)
-                if line.startswith("error: "):
+                if line.startswith("error: ") and not error_message:
                     error_message = line.removeprefix("error: ")
                 if "Ready · " in line:
                     saw_ready_line = True
@@ -422,7 +422,7 @@ def _monitor(process, control, output, model=MODEL, *, checking=False):
         if process.poll() is not None:
             for line in _lines(buffer):
                 _event(output, "log", message=line)
-                if line.startswith("error: "):
+                if line.startswith("error: ") and not error_message:
                     error_message = line.removeprefix("error: ")
             _stop_group(process)
             if checking and process.returncode == 0:

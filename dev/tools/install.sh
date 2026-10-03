@@ -227,6 +227,7 @@ case ":$PATH:" in
     *) echo "Add it to your PATH first:  export PATH=\"$dir:\$PATH\"" ;;
 esac
 echo "  splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit --language-only --max-context 32K"
+echo "  Macs below 32 GB:  splash-m1 serve --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --language-only"
 if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/install/completions/_splash" ]; then
     echo "  Optional shell completion (Zsh needs compinit initialized):"
     echo '    Bash: source "$HOME/Library/Application Support/Splash M1/app/current/install/completions/splash.bash"'

@@ -47,7 +47,7 @@ Runtime tuning variables are experimental and unsupported as a user interface. U
 | Variable | Effect | Default | Read |
 | --- | --- | --- | --- |
 | `SPLASH_DECODE_M1` | `1` decodes prompt-lookup misses as one row through the PQ2_0 GEMV (Bonsai only; allocates its scratch) | off | once per model runtime |
-| `SPLASH_DECODE_LADDER` | `1` enables the adaptive autoregressive/speculative decode policy; `--decode-ladder` sets it | off | once per model runtime |
+| `SPLASH_DECODE_LADDER` | `1` enables the adaptive autoregressive/speculative decode policy | off | once per model runtime |
 | `SPLASH_DECODE_LADDER_WINDOW`, `_ELIGIBLE`, `_PROBE`, `_MIN_EVIDENCE`, `_MAX_PERIOD` | Policy cycle counts: rolling window, cycles between probes, probe length, probe evidence, longest probe period | 8, 8, 8, 8, 64 | once per model runtime |
 | `SPLASH_DECODE_LADDER_GATE`, `_BACKOFF_LOSS` | Probe speed ratio that switches mode; loss fraction that doubles the probe period | 1.05, 0.20 | once per model runtime |
 | `SPLASH_LOOKUP_MIN` | Shortest earlier match (tokens) that prompt-lookup drafting uses; `0` turns it off | 16 | once per process |

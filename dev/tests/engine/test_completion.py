@@ -1,3 +1,4 @@
+import json
 import os
 import pty
 import select
@@ -17,6 +18,7 @@ SUGGESTED = ("suggested/Model-4bit",)
 LOCAL = ("community/custom-splash", "community/linked-splash")
 GGUF = ("unsloth/Model-GGUF:Q8_0", "unsloth/Model-GGUF:UD-Q4_K_M")
 UPSTREAM = (*GGUF, "mlx-community/Model-4bit")
+SELECTED = "selected/Language-Only"
 
 
 def bash_paths():
@@ -108,10 +110,13 @@ class CompletionTests(unittest.TestCase):
             (models / model).unlink(missing_ok=True)
             (models / model).symlink_to(assembly, target_is_directory=True)
         # A selection root (.selections/<sha256>) records model.json too, but
-        # it is a hidden installation, not a model id.
+        # it is a hidden installation: its link name is no model id, but its
+        # recorded model is one.
         selection = self.root / (name + " selection assembly")
         selection.mkdir()
-        (selection / "model.json").write_text("{}")
+        (selection / "model.json").write_text(
+            json.dumps({"model": SELECTED, "sources": {"model": "x"}}, indent=2)
+        )
         (models / ".selections").mkdir(exist_ok=True)
         (models / ".selections/0123").unlink(missing_ok=True)
         (models / ".selections/0123").symlink_to(selection, target_is_directory=True)
@@ -188,7 +193,7 @@ class CompletionTests(unittest.TestCase):
                 _, directory = self.layout(str(release), release=release)
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, SELECTED)),
                 )
                 self.assertEqual(self.run_helper(directory, "unsloth/"), list(GGUF))
                 self.assertEqual(self.run_helper(directory, "community/l"), [LOCAL[1]])
@@ -226,7 +231,7 @@ class CompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, "official/New")),
+                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, SELECTED, "official/New")),
                 )
                 self.assertEqual(
                     self.run_helper(directory, "official/N"), ["official/New"]
@@ -234,7 +239,7 @@ class CompletionTests(unittest.TestCase):
                 cache.write_text("invalid\n")
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, SELECTED)),
                 )
 
     def test_actual_bash_completion(self):
@@ -242,19 +247,19 @@ class CompletionTests(unittest.TestCase):
         cases = (
             (
                 ["splash", ""],
-                ["serve", "claude", "codex", "opencode", "hermes", "pi"],
+                ["serve", "start", "claude", "codex", "opencode", "hermes", "pi"],
             ),
             (["splash", "co"], ["codex"]),
             (
                 ["splash", "serve", "--model", ""],
-                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, SELECTED)),
             ),
             (["splash", "serve", "--model", "community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model=community/l"], [LOCAL[1]]),
             (["splash", "serve", "--model", "=", "community/l"], [LOCAL[1]]),
             (
                 ["splash", "serve", "--model", "="],
-                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM)),
+                sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, SELECTED)),
             ),
             (["splash", "serve", "--", "--model", ""], []),
             (["splash", "serve", "--max-context", ""], []),

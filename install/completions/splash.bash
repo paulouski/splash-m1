@@ -11,10 +11,10 @@ _splash() {
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
     if [[ $COMP_CWORD -eq 1 ]]; then
-        COMPREPLY=($(compgen -W 'serve claude codex opencode hermes pi' -- "$cur"))
+        COMPREPLY=($(compgen -W 'serve start claude codex opencode hermes pi' -- "$cur"))
         return 0
     fi
-    [[ ${COMP_WORDS[1]} == serve ]] || return 0
+    [[ ${COMP_WORDS[1]} == serve || ${COMP_WORDS[1]} == start ]] || return 0
     for ((i=2; i<COMP_CWORD; i++)); do
         [[ ${COMP_WORDS[i]} == -- ]] && return 0
     done

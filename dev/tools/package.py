@@ -196,6 +196,8 @@ class SplashM1 < Formula
       Serve a model:
         splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit --language-only --max-context 32K
     CAVEAT
+      Macs below 32 GB:
+        splash-m1 serve --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit --language-only
   end
 
   test do

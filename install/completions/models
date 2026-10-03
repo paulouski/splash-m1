@@ -34,6 +34,12 @@ cache_file="$data_dir/catalog/official-models.txt"
         owner_directory=${directory%/*}
         printf '%s/%s\n' "${owner_directory##*/}" "$repository"
     done
+    # Language-only and pinned selections link under .selections/<hash>; the
+    # model id is the top-level "model" of the assembly's model.json.
+    for record in "$models_dir"/.selections/*/model.json; do
+        [ -f "$record" ] || continue
+        sed -n 's/^  "model": "\(.*\)",$/\1/p' "$record"
+    done
 } | SPLASH_COMPLETION_PREFIX=${1-} LC_ALL=C awk '
     BEGIN {
         prefix = ENVIRON["SPLASH_COMPLETION_PREFIX"]

@@ -5,7 +5,11 @@ import Darwin
 final class DesktopApp: NSObject, NSApplicationDelegate {
     private let setupKey = "successfulSetup"
     private let selectedModelKey = "selectedModel"
-    private let recommendedModel = "mlx-community/Qwen3.8-27B-4bit"
+    // Below 32 GiB only the 2-bit Prism checkpoint fits.
+    private var recommendedModel: String {
+        ProcessInfo.processInfo.physicalMemory < 32 * 1024 * 1024 * 1024
+            ? "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit" : "mlx-community/Qwen3.8-27B-4bit"
+    }
     private let chatURL = URL(string: "http://127.0.0.1:8000")!
     private let apiURL = "http://127.0.0.1:8000/v1"
 
@@ -85,8 +89,7 @@ final class DesktopApp: NSObject, NSApplicationDelegate {
         let intro = NSTextField(
             wrappingLabelWithString:
                 "Choose an installed model or enter a Hugging Face repo ID or URL. "
-                + "Model files are stored separately from the app, and cached files are reused. "
-                + "Later launches may start the last model automatically."
+                + "Model files are stored separately from the app, and cached files are reused."
         )
         intro.maximumNumberOfLines = 4
 

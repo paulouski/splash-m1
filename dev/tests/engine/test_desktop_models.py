@@ -472,7 +472,7 @@ class DiskSpaceTests(unittest.TestCase):
                     desktop_models.shutil, "disk_usage", return_value=mock.Mock(free=free)
                 ),
             ):
-                desktop_models._require_disk_space(
+                upstream.require_disk_space(
                     MODEL, fmt, target, set(target.files), draft
                 )
 
@@ -504,7 +504,7 @@ class DiskSpaceTests(unittest.TestCase):
             mock.patch.object(upstream, "_weight_files", return_value={"a.safetensors"}),
             mock.patch.object(desktop_models.shutil, "disk_usage", side_effect=AssertionError),
         ):
-            desktop_models._require_disk_space(MODEL, "mlx-affine", target, target.files, target)
+            upstream.require_disk_space(MODEL, "mlx-affine", target, target.files, target)
 
 
 class PrismModelTests(unittest.TestCase):
@@ -591,17 +591,51 @@ class PrismModelTests(unittest.TestCase):
         self.assertNotIn("target/hadamard.json", target.files)
 
     def test_sixteen_gigabytes_admit_only_prism(self):
-        with mock.patch.object(desktop_models, "_memory_bytes", return_value=16 * 1024**3):
+        with mock.patch.object(upstream, "_memory_bytes", return_value=16 * 1024**3):
             self.assertEqual(self.check(prism_config())[0], MODEL)
             with self.assertRaisesRegex(models.ModelError, "32 GB"):
                 self.check(target_config())
+
+    def test_install_gates_memory_and_disk_before_download_with_prism_draft(self):
+        names = []
+        for label, config, memory, free, message in (
+            ("memory", target_config(), 16 * 1024**3, 100 * 10**9, "32 GB.*Bonsai"),
+            ("disk", prism_config(), 16 * 1024**3, 10**9, "not enough free disk"),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                target, draft = repositories(root, target=config)
+                target.files.add("hadamard.json")
+                target.unreachable_reason = None
+                selection = models.Selection.of(
+                    root / "models", MODEL, language_only=True
+                )
+
+                def resolve(name, **_kwargs):
+                    names.append(name)
+                    return draft
+
+                with (
+                    mock.patch.object(hub.Repository, "resolve", side_effect=resolve),
+                    mock.patch.object(upstream, "_memory_bytes", return_value=memory),
+                    mock.patch.object(upstream, "_weight_bytes", return_value=(10**10, 10**10)),
+                    mock.patch.object(hub, "folder", return_value=root),
+                    mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "w")}),
+                    mock.patch.object(
+                        upstream.shutil, "disk_usage", return_value=mock.Mock(free=free)
+                    ),
+                    self.assertRaisesRegex(models.ModelError, message),
+                ):
+                    upstream._install(selection, target, None)
+                self.assertEqual(target.downloads, [])
+        self.assertEqual(names, [upstream.PRISM_DRAFT_REPO])
 
     def test_serve_uses_automatic_context_below_32_gigabytes(self):
         for memory, expected in ((16 * 1024**3, False), (32 * 1024**3, True)):
             commands = []
             with (
                 mock.patch.object(desktop_models, "check_model", side_effect=lambda model: model),
-                mock.patch.object(desktop_models, "_memory_bytes", return_value=memory),
+                mock.patch.object(upstream, "_memory_bytes", return_value=memory),
                 mock.patch.object(
                     desktop_models.os, "execv", side_effect=lambda _python, command: commands.append(command)
                 ),

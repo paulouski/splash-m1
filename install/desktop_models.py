@@ -25,25 +25,7 @@ COMPATIBILITY_MESSAGE = (
     "Metadata is compatible; tensor validation follows during startup."
 )
 DESKTOP_FAMILY = "Qwen3.8-27B"
-# Below this only the 2-bit Prism checkpoint fits, with an automatic context.
-FULL_MEMORY_BYTES = 32 * 1024**3
 HF_HOSTS = {"hf.co", "huggingface.co"}
-# Prepared Prism target images and draft, in bytes; an affine target prepares
-# to about its own weight size.
-PRISM_PREPARED_BYTES = 8_600_000_000
-# Free space left after a download, as the native weight preparation requires.
-DISK_RESERVE = 2 * 1024**3
-
-
-def _memory_bytes():
-    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-
-
-def _require_memory(target_format):
-    if target_format != upstream.PRISM_FORMAT and _memory_bytes() < FULL_MEMORY_BYTES:
-        raise models.ModelError(
-            "this model requires 32 GB of memory; Macs with less can run the 2-bit Prism (Bonsai) checkpoint"
-        )
 
 
 def normalize_model_id(value):
@@ -210,7 +192,6 @@ def _require_installed_metadata(link, record, model):
         raise models.ModelError("installed assembly is missing checkpoint weights")
     target_config = models.read_json(link / "config.json")
     family = _require_target_metadata(target_config, record["target_format"])
-    _require_memory(record["target_format"])
     if record["target_format"] == upstream.PRISM_FORMAT and (
         "target/hadamard.json" not in files
     ):
@@ -244,6 +225,7 @@ def check_model(value, *, models_root=None):
                 f"no verified installed assembly is available for {model}"
             )
         _require_installed_metadata(selection.link, installed, model)
+        upstream.require_memory(installed["target_format"])
         return model
 
     if not any(name.endswith(".safetensors") for name in target_repo.files):
@@ -260,56 +242,17 @@ def check_model(value, *, models_root=None):
             "the desktop app requires a text-only MLX affine checkpoint"
         )
     family = _require_target_metadata(target.config, target.format)
-    _require_memory(target.format)
+    upstream.require_memory(target.format)
     draft_repo = hub.Repository.resolve(
         upstream.default_draft(family, target.format), installation=selection.link
     )
     with hub.as_model_errors(f"cannot inspect the {family.name} draft"):
         _require_draft_repository(draft_repo, family)
-    _require_disk_space(
-        model, target.format, target_repo, set(target.files.values()), draft_repo
-    )
+    if installed is None or installed_revision != target_repo.revision:
+        upstream.require_disk_space(
+            model, target.format, target_repo, set(target.files.values()), draft_repo
+        )
     return model
-
-
-def _weight_bytes(repo, names):
-    """(total, bytes the Hub cache lacks) of the safetensors in names, or None
-    when the Hub gave no sizes for them."""
-    weights = [n for n in names if n.endswith(".safetensors")]
-    if repo.directory is not None or not all(n in repo.sizes for n in weights):
-        return None
-    blobs = hub.folder(repo.name) / "blobs"
-    total = missing = 0
-    for size, blob in (repo.sizes[n] for n in weights):
-        total += size
-        if not (blob and (blobs / blob).exists()):
-            missing += size
-    return total, missing
-
-
-def _require_disk_space(model, target_format, target_repo, target_names, draft_repo):
-    """Refuse before any download when the files still to fetch, their
-    prepared weights and a reserve do not fit. Unknown sizes skip the check."""
-    target = _weight_bytes(target_repo, target_names)
-    draft = _weight_bytes(draft_repo, upstream._weight_files(draft_repo))
-    if target is None or draft is None:
-        return
-    prepared = PRISM_PREPARED_BYTES if target_format == upstream.PRISM_FORMAT else target[0]
-    volumes = {}
-    for path, size in (
-        (hub.folder(target_repo.name).parent, target[1] + draft[1]),
-        (_weight_cache(), prepared),
-    ):
-        while not path.exists():
-            path = path.parent
-        need = volumes.setdefault(path.stat().st_dev, [path, shutil.disk_usage(path).free, 0])
-        need[2] += size
-    for path, free, size in volumes.values():
-        if free < size + DISK_RESERVE:
-            raise models.ModelError(
-                f"not enough free disk space for {model}: needs about "
-                f"{(size + DISK_RESERVE) / 1e9:.1f} GB, {free / 1e9:.1f} GB available on {path}"
-            )
 
 
 def installed_models(models_root=None):
@@ -344,11 +287,6 @@ def _require_stopped():
         fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def _weight_cache():
-    path = os.environ.get("SPLASH_WEIGHT_CACHE")
-    return Path(path) if path else Path.home() / "Library/Caches/Splash/weights"
-
-
 def _tree_bytes(path):
     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
 
@@ -360,7 +298,7 @@ def _prepared_entries(assemblies):
         f"{path}/{part}" for path in assemblies for part in ("target", "vision")
     )
     entries = []
-    cache = _weight_cache()
+    cache = upstream._weight_cache()
     for entry in sorted(cache.iterdir()) if cache.is_dir() else ():
         if not models.is_hex_digest(entry.name, 64):
             continue
@@ -454,7 +392,7 @@ def delete(model, models_root=None):
         assembly.collect_garbage(models_root)
         for snapshot in plan["snapshots"]:
             _revision_strategy(snapshot).execute()
-    cache = _weight_cache()
+    cache = upstream._weight_cache()
     if plan["prepared"]:
         with (cache / "prepare.lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -481,7 +419,7 @@ def _serve(model):
         "--port",
         "8000",
     ]
-    if _memory_bytes() >= FULL_MEMORY_BYTES:
+    if upstream._memory_bytes() >= upstream.FULL_MEMORY_BYTES:
         command[-2:-2] = ["--max-context", "32K"]
     os.execv(str(paths.PYTHON), command)
 
