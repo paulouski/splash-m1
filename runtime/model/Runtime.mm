@@ -364,14 +364,17 @@ struct Runtime::Impl {
                                       .constrained = true,
                                       .penalties = {1.1F, 0.5F, 0.5F},
                                       .minP = 0.05F};
-    const std::array<ops::SamplingPolicy, 2> policies{sampled, {}};
-    const std::array<uint32_t, 2> stateLanes{0, 1};
+    const std::array<ops::SamplingPolicy, 2> allPolicies{sampled, {}};
+    const uint32_t n = std::min<uint32_t>(2, decodeArena->laneCount());
+    const std::span<const ops::SamplingPolicy> policies(allPolicies.data(), n);
+    const std::array<uint32_t, 2> allStateLanes{0, 1};
+    const std::span<const uint32_t> stateLanes(allStateLanes.data(), n);
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
-    sampling.addInitial(graph, policies, samplingBuffers(2), 0,
+    sampling.addInitial(graph, policies, samplingBuffers(n), 0,
                         geometry.target.stopTokens[0],
                         geometry.target.stopTokens[1], penalties);
-    sampling.addVerify(graph, policies, samplingBuffers(2),
+    sampling.addVerify(graph, policies, samplingBuffers(n),
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
     backend.preparePipelines(graph.dispatches());

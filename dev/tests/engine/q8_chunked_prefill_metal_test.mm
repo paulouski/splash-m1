@@ -31,8 +31,10 @@ constexpr uint32_t kQueryHeads = 24;
 constexpr uint32_t kQueryHeadsPerKvHead = 6;
 constexpr std::string_view kChunkedPrefillStorePipeline =
     "prefill_attention_q8_store";
+#ifndef SPLASH_MACOS15_BUILD
 constexpr std::string_view kPrefillAttentionSplitPipeline =
     "prefill_attention_q8_split";
+#endif
 constexpr std::string_view kPrefillAttentionRegisterSplitPipeline =
     "prefill_attention_q8_split_sgf";
 constexpr std::string_view kPrefillAttentionReducePipeline =
@@ -920,8 +922,12 @@ void run(const char *libraryPath) {
   testContract();
   using splash::ops::AttentionTile;
   for (const auto [name, tile] :
+#ifdef SPLASH_MACOS15_BUILD
+       {std::pair{kPrefillAttentionRegisterSplitPipeline, AttentionTile::Register}}) {
+#else
        {std::pair{kPrefillAttentionSplitPipeline, AttentionTile::Mpp},
         std::pair{kPrefillAttentionRegisterSplitPipeline, AttentionTile::Register}}) {
+#endif
     const AttentionPipelines attention{makePipeline(device, library, name.data()),
                                        reduce, tile};
     std::cout << "prefill attention tile: " << name << '\n';

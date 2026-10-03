@@ -848,6 +848,7 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
 
 // Where the distribution of each selected row of the sampled lanes ends, one
 // group per row.
+[[max_total_threads_per_threadgroup(SPLASH_TARGET_VOCABULARY_THREADS)]]
 kernel void decode_sample_vocabulary_search(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],
@@ -872,6 +873,7 @@ kernel void decode_sample_vocabulary_search(
 // groups per row: the first token after a prompt, a verify row's draft
 // token's probability and the correction a rejection takes or, for the last
 // verify row, which follows the whole draft, its bonus token.
+[[max_total_threads_per_threadgroup(SPLASH_TARGET_VOCABULARY_THREADS)]]
 kernel void decode_sample_vocabulary_draw(
     device const float *logits [[buffer(0)]],
     device const uint *token_mask [[buffer(1)]],

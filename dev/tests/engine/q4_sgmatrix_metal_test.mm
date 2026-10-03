@@ -39,6 +39,8 @@ struct Guarded {
     for (uint64_t i = size; i < size + 256; ++i) require(p[i] == 0xa5, "out-of-view write");
   }
 };
+uint16_t floatToHalfBits(float v) { _Float16 h = (_Float16)v; uint16_t r; std::memcpy(&r, &h, 2); return r; }
+float halfBitsToFloat(uint16_t r) { _Float16 h; std::memcpy(&h, &r, 2); return (float)h; }
 uint32_t hash(uint32_t v) { v ^= v >> 16; v *= 0x7feb352d; v ^= v >> 15; return v * 0x846ca68b; }
 Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t seed, bool zero) {
   const uint64_t params = uint64_t(shape.outputSize) * shape.inputSize / 64;
@@ -50,8 +52,8 @@ Projection weights(metal::MetalBackend &backend, LinearMatrix shape, uint32_t se
   auto *b = static_cast<uint16_t *>(p.affine().biases.contents());
   for (uint64_t i = 0; i < params * 32; ++i) q[i] = zero ? 0 : hash(uint32_t(i) + seed);
   for (uint64_t i = 0; i < params; ++i) {
-    s[i] = floatToBf16((int(hash(uint32_t(i) + seed + 7) % 17) - 8) / 2048.0f);
-    b[i] = zero ? 0 : floatToBf16(-float((hash(uint32_t(i) + seed + 11) % 16)) * bf16ToFloat(s[i]));
+    s[i] = floatToHalfBits((int(hash(uint32_t(i) + seed + 7) % 17) - 8) / 2048.0f);
+    b[i] = zero ? 0 : floatToHalfBits(-float((hash(uint32_t(i) + seed + 11) % 16)) * halfBitsToFloat(s[i]));
   }
   return p;
 }
@@ -72,7 +74,7 @@ Exact exact(const Projection &p, const uint16_t *input, uint32_t row, uint32_t c
       const uint32_t nibble = (q[at * 32 + k / 2] >> (4 * (k % 2))) & 15;
       dot += x * nibble; sum += x; absolute += std::abs(x);
     }
-    const double scale = bf16ToFloat(sc[at]), bias = bf16ToFloat(bi[at]);
+    const double scale = halfBitsToFloat(sc[at]), bias = halfBitsToFloat(bi[at]);
     value += scale * dot + bias * sum;
     quantMagnitude += absolute * std::abs(scale);
     magnitude += absolute * (15 * std::abs(scale) + std::abs(bias));

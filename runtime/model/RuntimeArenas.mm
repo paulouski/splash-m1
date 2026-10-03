@@ -118,7 +118,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   // The split partials and counters and the rotated rows of the largest
   // prefill plan.
   for (const auto &projection : geometry.target.prefillProjections) {
-    const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
+    const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection, rows);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
     put(PrefillTensor::LinearRotated, linear.rotated);
@@ -339,18 +339,19 @@ uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
 }
 
 ops::LinearScratchSize DecodeArena::linearScratchSize(
-    const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
+    const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators,
+    uint32_t laneCount) {
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft, whose own
   // projections are affine.
-  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p, laneCount));
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
-    result.include(operators.linear().decodeScratchSize(shape));
+    result.include(operators.linear().decodeScratchSize(shape, laneCount));
   return result;
 }
 
@@ -360,7 +361,7 @@ uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
   const uint32_t lanes = decodeArenaLanes(geometry, operators, activeLanes);
   return checkedAdd(decodeArenaBaseBytes(geometry, operators, lanes),
                     checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
-                               DecodeArena::linearScratchSize(geometry, operators).bytes(),
+                               DecodeArena::linearScratchSize(geometry, operators, lanes).bytes(),
                                "Q4 decode scratch"),
                     "planned gate scratch");
 }

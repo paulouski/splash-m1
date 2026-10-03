@@ -415,12 +415,12 @@ $(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
 
 $(TEST_Q8_ATTENTION_TEST): dev/tests/engine/q8_flash_attention_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(MACOS15_DEFINE) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(MACOS15_DEFINE) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_Q4_SGMATRIX_TEST): dev/tests/engine/q4_sgmatrix_metal_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
@@ -493,7 +493,7 @@ tune-kernels: preflight $(TARGET) $(TUNE_KERNELS) $(LIB)
 
 $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(MACOS15_DEFINE) -fobjc-arc $< $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm $(TUNING_SOURCES) \

@@ -1117,6 +1117,9 @@ void scratchBoundsRotated() {
     require(linear.decodeScratchSize(shape).rotated == (rotated ? rotatedBytes(17408, 32) : 0) &&
                 linear.prefillScratchSize(shape).rotated == (rotated ? rotatedBytes(17408, 2048) : 0),
             "rotated scratch bounds");
+    require(linear.decodeScratchSize(shape, 1).rotated == (rotated ? rotatedBytes(17408, 8) : 0) &&
+                linear.prefillScratchSize(shape, 128).rotated == (rotated ? rotatedBytes(17408, 128) : 0),
+            "rotated scratch bounds follow the lanes and rows");
   }
 }
 

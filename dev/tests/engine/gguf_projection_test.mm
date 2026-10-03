@@ -759,7 +759,8 @@ void bonsaiShape(MetalBackend &backend, const Linear &linear, const BonsaiShape 
   std::uniform_real_distribution<float> small(-0.1f, 0.1f);
   std::vector<float> floats(uint64_t{s.floatColumns} * K);
   for (float &v : floats) v = small(rng);
-  MetalBuffer floatBuffer = backend.allocateBuffer(std::max<uint64_t>(floats.size() * sizeof(float), 4));
+  MetalBuffer floatBuffer = backend.allocateBuffer(std::max<uint64_t>(floats.size() * sizeof(float), 4),
+                                                     splash::metal::BufferStorage::Shared, "floats");
   std::memcpy(floatBuffer.contents(), floats.data(), floats.size() * sizeof(float));
   const auto build = [&](const std::vector<Tensor> &tensors) {
     BlockWeights blocks;

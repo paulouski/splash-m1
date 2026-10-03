@@ -498,7 +498,12 @@ enum class Phase : uint8_t { Prefill, Verify };
 
 template <Phase phase>
 std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
+                          
+#ifdef SPLASH_MACOS15_BUILD
+                          ops::AttentionTile tile = ops::AttentionTile::Register) {
+#else
                           ops::AttentionTile tile = ops::AttentionTile::Mpp) {
+#endif
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
@@ -814,7 +819,11 @@ int main(int argc, char **argv) {
       return 0;
     }
     require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
+#ifdef SPLASH_MACOS15_BUILD
+    for (auto format : {kv::Format::Int8})
+#else
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+#endif
     for (uint32_t heads : {24U, 16U}) {
       const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
       for (const auto [history, rows] :

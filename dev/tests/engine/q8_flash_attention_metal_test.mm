@@ -770,7 +770,11 @@ void run(const char *libraryPath) {
       if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
         checkReduce(device, queue, library, shape, splits, 1);
     }
+    #ifdef SPLASH_MACOS15_BUILD
+    for (const bool registerTile : {true}) {
+#else
     for (const bool registerTile : {false, true}) {
+#endif
     const Pipelines pipelines = makePipelines(device, library, shape, registerTile);
     for (uint32_t width = 1; width <= 4; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);

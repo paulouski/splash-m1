@@ -353,7 +353,7 @@ public:
     }
     // Each field exists only when some plan uses it (split-only plans have
     // partials and counters but no activation table).
-    const auto linearSize = linearScratchSize(geometry_, operators);
+    const auto linearSize = linearScratchSize(geometry_, operators, lanes_);
     const auto allocate = [&](uint64_t bytes, metal::BufferStorage storage, const char *label) {
       return bytes ? backend_.allocateBuffer(bytes, storage, label) : metal::MetalBuffer{};
     };
@@ -410,7 +410,8 @@ public:
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
   static ops::LinearScratchSize linearScratchSize(const RuntimeGeometry &geometry,
-                                                 const ops::ExecutionPlans &operators);
+                                                 const ops::ExecutionPlans &operators,
+                                                 uint32_t laneCount = kLaneCount);
 
   [[nodiscard]] metal::MetalBuffer gateScratch() const { return gateScratch_; }
 
