@@ -280,6 +280,11 @@ class DeleteModelTests(unittest.TestCase):
 
 
 class DesktopModelTests(unittest.TestCase):
+    def setUp(self):
+        memory = mock.patch.object(upstream, "_memory_bytes", return_value=32 * 1024**3)
+        memory.start()
+        self.addCleanup(memory.stop)
+
     def test_normalizes_ids_and_default_branch_urls_only(self):
         self.assertEqual(desktop_models.normalize_model_id(MODEL), MODEL)
         self.assertEqual(
@@ -520,6 +525,11 @@ class DiskSpaceTests(unittest.TestCase):
 
 
 class PrismModelTests(unittest.TestCase):
+    def setUp(self):
+        memory = mock.patch.object(upstream, "_memory_bytes", return_value=32 * 1024**3)
+        memory.start()
+        self.addCleanup(memory.stop)
+
     def check(self, config, *, hadamard=True, language_only=True):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

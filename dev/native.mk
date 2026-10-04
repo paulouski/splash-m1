@@ -654,7 +654,6 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_PRISM_MLX)
 	$(TEST_GGUF_REFERENCE) $(WEIGHT_GOLDENS)
 	$(TEST_GGUF_PLANNER)
-	$(TEST_LINEAR_GRAPH_DUMP) $(LIB) dev/tests/fixtures/linear-graph-dump.txt
 	$(TEST_TUNING_WORKLOADS)
 	$(TEST_LINEAR_PLAN) --cpu
 	$(TEST_LINEAR_TUNING) --cpu
@@ -685,7 +684,8 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TUNE_KERNELS) \
 	$(TEST_LOGPROBS_TEST)
 	$(TEST_Q8_CPU_TEST)
 
-test-engine-metal: $(TEST_METAL_TARGETS)
+test-engine-metal: $(TEST_METAL_TARGETS) $(TEST_LINEAR_GRAPH_DUMP)
+	$(TEST_LINEAR_GRAPH_DUMP) $(LIB) dev/tests/fixtures/linear-graph-dump.txt
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB) \
 		$(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PREPARATION) $(LIB) $(WEIGHT_GOLDENS)

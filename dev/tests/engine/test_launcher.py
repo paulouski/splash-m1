@@ -153,7 +153,9 @@ class LauncherTests(unittest.TestCase):
             )
 
     def test_start_defaults_and_overrides_preserve_serve_defaults(self):
-        args = launcher.parse_args(["start"])
+        pages = {"SC_PHYS_PAGES": 2 * 1024**2, "SC_PAGE_SIZE": 16 * 1024}
+        with mock.patch.object(launcher.os, "sysconf", side_effect=pages.get):
+            args = launcher.parse_args(["start"])
         self.assertEqual(args.command, "serve")
         self.assertTrue(args.simple_start)
         self.assertEqual(args.model, "mlx-community/Qwen3.8-27B-4bit")
