@@ -8,9 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from install import desktop_models, families, models, upstream
+from test_desktop_models import prism_config, target_config
 
-from .test_desktop_models import prism_config, target_config
+from install import desktop_models, families, models, upstream
 
 ROOT = Path(__file__).resolve().parents[3]
 

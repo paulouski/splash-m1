@@ -749,7 +749,8 @@ class NativeBackend:
                 if len(event.logprobs) != len(event.tokens):
                     raise RuntimeError("engine returned no logprobs")
                 job.logprob_entries.extend(
-                    (token, *entry) for token, entry in zip(event.tokens, event.logprobs)
+                    (token, *entry)
+                    for token, entry in zip(event.tokens, event.logprobs)
                 )
             if job.constraint is not None:
                 job.constraint.commit(event.tokens)

@@ -498,7 +498,7 @@ enum class Phase : uint8_t { Prefill, Verify };
 
 template <Phase phase>
 std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
-                          
+
 #ifdef SPLASH_MACOS15_BUILD
                           ops::AttentionTile tile = ops::AttentionTile::Register) {
 #else

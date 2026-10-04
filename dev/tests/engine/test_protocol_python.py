@@ -441,7 +441,9 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assertEqual(sorted(labels), ["prompt tokens", "score tokens"])
 
     def test_logprobs_request_and_tokens_roundtrip(self):
-        request = replace(example_request(), constraint=p.ConstraintMode.NONE, logprobs=21)
+        request = replace(
+            example_request(), constraint=p.ConstraintMode.NONE, logprobs=21
+        )
         self.assertEqual(decode_client(p.serialize_message(request)), request)
         tokens = p.TokensEvent(
             7,

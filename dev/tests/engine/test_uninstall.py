@@ -5,8 +5,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from dev.tests.engine.test_desktop_models import (
+    DRAFT_REVISION,
+    MODEL,
+    REVISION,
+    install,
+)
 from install import families, hub, paths, uninstall
-from dev.tests.engine.test_desktop_models import DRAFT_REVISION, MODEL, REVISION, install
 
 
 class UninstallTests(unittest.TestCase):
@@ -59,21 +64,39 @@ class UninstallTests(unittest.TestCase):
 
     def test_removes_everything_managed(self):
         self.assertTrue(uninstall.run(from_app=True, echo=lambda *_: None))
-        for gone in (self.app, self.wrapper, self.data, self.weights.parent, self.prefs):
+        for gone in (
+            self.app,
+            self.wrapper,
+            self.data,
+            self.weights.parent,
+            self.prefs,
+        ):
             self.assertFalse(gone.exists(), gone)
-        self.assertFalse((self.cache / hub.folder_name(MODEL) / "snapshots" / REVISION).exists())
+        self.assertFalse(
+            (self.cache / hub.folder_name(MODEL) / "snapshots" / REVISION).exists()
+        )
         draft = families.FAMILIES[0].draft.repo
-        self.assertFalse((self.cache / hub.folder_name(draft) / "snapshots" / DRAFT_REVISION).exists())
+        self.assertFalse(
+            (
+                self.cache / hub.folder_name(draft) / "snapshots" / DRAFT_REVISION
+            ).exists()
+        )
         self.untouched()
 
     def test_keep_models_and_declined_confirm(self):
-        self.assertFalse(uninstall.run(from_app=True, confirm=lambda: False, echo=lambda *_: None))
+        self.assertFalse(
+            uninstall.run(from_app=True, confirm=lambda: False, echo=lambda *_: None)
+        )
         self.assertTrue(self.app.exists() and self.link.is_symlink())
         self.assertTrue(uninstall.run(True, from_app=True, echo=lambda *_: None))
-        self.assertFalse(self.app.exists() or self.wrapper.exists() or self.prefs.exists())
+        self.assertFalse(
+            self.app.exists() or self.wrapper.exists() or self.prefs.exists()
+        )
         self.assertFalse((self.data / "app").exists())
         self.assertTrue(self.link.is_symlink() and self.weights.is_dir())
-        self.assertTrue((self.cache / hub.folder_name(MODEL) / "snapshots" / REVISION).is_dir())
+        self.assertTrue(
+            (self.cache / hub.folder_name(MODEL) / "snapshots" / REVISION).is_dir()
+        )
         self.untouched()
 
 

@@ -252,7 +252,9 @@ class DeleteModelTests(unittest.TestCase):
 
     def test_bonsai_draft_stays_shared(self):
         link = self.models / "team" / "bonsai"
-        entry = install(self.root, link, "team/Bonsai", REVISION, upstream.PRISM_DRAFT_REPO)
+        entry = install(
+            self.root, link, "team/Bonsai", REVISION, upstream.PRISM_DRAFT_REPO
+        )
         draft = (
             self.cache
             / hub.folder_name(upstream.PRISM_DRAFT_REPO)
@@ -467,9 +469,13 @@ class DiskSpaceTests(unittest.TestCase):
             with (
                 mock.patch.object(hub, "folder", return_value=root),
                 mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "w")}),
-                mock.patch.object(upstream, "_weight_files", return_value={"d.safetensors"}),
                 mock.patch.object(
-                    desktop_models.shutil, "disk_usage", return_value=mock.Mock(free=free)
+                    upstream, "_weight_files", return_value={"d.safetensors"}
+                ),
+                mock.patch.object(
+                    desktop_models.shutil,
+                    "disk_usage",
+                    return_value=mock.Mock(free=free),
                 ),
             ):
                 upstream.require_disk_space(
@@ -501,10 +507,16 @@ class DiskSpaceTests(unittest.TestCase):
         target.sizes = {}
         target.files = {"a.safetensors"}
         with (
-            mock.patch.object(upstream, "_weight_files", return_value={"a.safetensors"}),
-            mock.patch.object(desktop_models.shutil, "disk_usage", side_effect=AssertionError),
+            mock.patch.object(
+                upstream, "_weight_files", return_value={"a.safetensors"}
+            ),
+            mock.patch.object(
+                desktop_models.shutil, "disk_usage", side_effect=AssertionError
+            ),
         ):
-            upstream.require_disk_space(MODEL, "mlx-affine", target, target.files, target)
+            upstream.require_disk_space(
+                MODEL, "mlx-affine", target, target.files, target
+            )
 
 
 class PrismModelTests(unittest.TestCase):
@@ -555,7 +567,9 @@ class PrismModelTests(unittest.TestCase):
                 selection = mock.Mock(draft_model=override)
                 target = mock.Mock(files={"a"}, unreachable_reason=None)
                 with mock.patch.object(
-                    hub.Repository, "resolve", side_effect=lambda name, **_k: names.append(name)
+                    hub.Repository,
+                    "resolve",
+                    side_effect=lambda name, **_k: names.append(name),
                 ):
                     upstream._resolve_draft(family, selection, None, target, fmt)
                 self.assertEqual(names, [override or expected])
@@ -618,9 +632,13 @@ class PrismModelTests(unittest.TestCase):
                 with (
                     mock.patch.object(hub.Repository, "resolve", side_effect=resolve),
                     mock.patch.object(upstream, "_memory_bytes", return_value=memory),
-                    mock.patch.object(upstream, "_weight_bytes", return_value=(10**10, 10**10)),
+                    mock.patch.object(
+                        upstream, "_weight_bytes", return_value=(10**10, 10**10)
+                    ),
                     mock.patch.object(hub, "folder", return_value=root),
-                    mock.patch.dict(os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "w")}),
+                    mock.patch.dict(
+                        os.environ, {"SPLASH_WEIGHT_CACHE": str(root / "w")}
+                    ),
                     mock.patch.object(
                         upstream.shutil, "disk_usage", return_value=mock.Mock(free=free)
                     ),
@@ -634,10 +652,14 @@ class PrismModelTests(unittest.TestCase):
         for memory, expected in ((16 * 1024**3, False), (32 * 1024**3, True)):
             commands = []
             with (
-                mock.patch.object(desktop_models, "check_model", side_effect=lambda model: model),
+                mock.patch.object(
+                    desktop_models, "check_model", side_effect=lambda model: model
+                ),
                 mock.patch.object(upstream, "_memory_bytes", return_value=memory),
                 mock.patch.object(
-                    desktop_models.os, "execv", side_effect=lambda _python, command: commands.append(command)
+                    desktop_models.os,
+                    "execv",
+                    side_effect=lambda _python, command: commands.append(command),
                 ),
             ):
                 desktop_models._serve(MODEL)

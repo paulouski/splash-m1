@@ -479,9 +479,7 @@ def _install(selection, repo, installed, draft=None):
         family = families.family_for(target.config)
         require_memory(target.format)
         if draft is None:
-            draft = _resolve_draft(
-                family, selection, installed, repo, target.format
-            )
+            draft = _resolve_draft(family, selection, installed, repo, target.format)
         require_disk_space(
             selection.model, target.format, repo, set(target.files.values()), draft
         )
@@ -606,7 +604,9 @@ def require_disk_space(model, target_format, target_repo, target_names, draft_re
     ):
         while not path.exists():
             path = path.parent
-        need = volumes.setdefault(path.stat().st_dev, [path, shutil.disk_usage(path).free, 0])
+        need = volumes.setdefault(
+            path.stat().st_dev, [path, shutil.disk_usage(path).free, 0]
+        )
         need[2] += size
     for path, free, size in volumes.values():
         if free < size + DISK_RESERVE:

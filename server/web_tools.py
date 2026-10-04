@@ -10,10 +10,7 @@ import urllib.request
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-if __package__:
-    from .errors import APIError
-else:
-    from errors import APIError
+from .errors import APIError
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "

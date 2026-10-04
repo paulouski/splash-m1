@@ -139,7 +139,12 @@ class PreparationIdentityTest(unittest.TestCase):
                 )
 
     def test_every_input_says_which_models_editing_it_prepares_again(self):
-        names = {"AFFINE": "affine", "GGUF": "GGUF", "PRISM": "Prism MLX", "VISION": "vision"}
+        names = {
+            "AFFINE": "affine",
+            "GGUF": "GGUF",
+            "PRISM": "Prism MLX",
+            "VISION": "vision",
+        }
         for name in {path for paths in INPUTS.values() for path in paths}:
             with self.subTest(input=name):
                 kinds = " and ".join(

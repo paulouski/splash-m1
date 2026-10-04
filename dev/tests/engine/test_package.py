@@ -652,7 +652,9 @@ class InstallerTests(unittest.TestCase):
             text=True,
         ).stdout
         self.assertNotIn("com.apple.quarantine", attributes)
-        self.assertEqual([entry.name for entry in self.apps.iterdir()], ["Splash M1.app"])
+        self.assertEqual(
+            [entry.name for entry in self.apps.iterdir()], ["Splash M1.app"]
+        )
 
     def test_app_checksum_mismatch_changes_nothing(self):
         self.publish("1.0")

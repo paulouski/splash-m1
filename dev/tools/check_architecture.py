@@ -109,7 +109,12 @@ def check_package_imports() -> list[str]:
     header = ast.dump(
         ast.parse('__name__ == "__main__" and not __package__', mode="eval").body
     )
-    entry_points = {"install/launcher.py", "install/models.py", "install/catalog.py"}
+    entry_points = {
+        "install/launcher.py",
+        "install/models.py",
+        "install/catalog.py",
+        "install/desktop.py",
+    }
     errors = []
     for package in ("server", "install"):
         paths = sorted((ROOT / package).glob("*.py"))

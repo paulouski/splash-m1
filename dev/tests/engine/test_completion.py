@@ -231,7 +231,16 @@ class CompletionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     self.run_helper(directory),
-                    sorted((*OFFICIAL, *SUGGESTED, *LOCAL, *UPSTREAM, SELECTED, "official/New")),
+                    sorted(
+                        (
+                            *OFFICIAL,
+                            *SUGGESTED,
+                            *LOCAL,
+                            *UPSTREAM,
+                            SELECTED,
+                            "official/New",
+                        )
+                    ),
                 )
                 self.assertEqual(
                     self.run_helper(directory, "official/N"), ["official/New"]

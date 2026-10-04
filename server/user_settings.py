@@ -5,24 +5,16 @@ import os
 import tempfile
 from pathlib import Path
 
-if __package__:
-    from install import paths
+from install import paths
 
-    from .errors import APIError
+from .errors import APIError
 
-    DEFAULT_PATH = (
-        paths.DATA / "settings.json"
-        if paths.PACKAGED
-        else Path.home() / "Library/Application Support/Splash/settings.json"
-    )
-else:
-    from errors import APIError
+DEFAULT_PATH = (
+    paths.DATA / "settings.json"
+    if paths.PACKAGED
+    else Path.home() / "Library/Application Support/Splash/settings.json"
+)
 
-    packaged = (Path(__file__).resolve().parents[1] / "release.json").is_file()
-    data_name = "Splash M1" if packaged else "Splash"
-    DEFAULT_PATH = (
-        Path.home() / "Library/Application Support" / data_name / "settings.json"
-    )
 MIN_IDLE_UNLOAD_SECONDS = 30
 MAX_IDLE_UNLOAD_SECONDS = 86400
 

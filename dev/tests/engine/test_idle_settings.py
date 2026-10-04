@@ -46,7 +46,9 @@ def wait_for(condition, timeout=3.0):
 class IdleUnloadBackendTests(unittest.TestCase):
     def backend(self, idle_unload=0.0):
         runtime = IdleRuntime()
-        backend = NativeBackend(runtime, None, lambda _record: None, idle_unload=idle_unload)
+        backend = NativeBackend(
+            runtime, None, lambda _record: None, idle_unload=idle_unload
+        )
         self.addCleanup(backend.close)
         return runtime, backend
 
@@ -195,35 +197,29 @@ class SavedSettingTests(unittest.TestCase):
                     release.write_text("{}")
                 else:
                     release.unlink(missing_ok=True)
-                for direct in (False, True):
-                    direct_environment = {
-                        **environment,
-                        "PYTHONPATH": str(staged / "server") if direct else str(staged),
-                    }
-                    code = (
-                        "import user_settings; print(user_settings.DEFAULT_PATH)"
-                        if direct
-                        else "from server.user_settings import DEFAULT_PATH; print(DEFAULT_PATH)"
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from server.user_settings import DEFAULT_PATH; print(DEFAULT_PATH)",
+                    ],
+                    cwd=staged,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+                with self.subTest(packaged=packaged):
+                    self.assertEqual(
+                        result.stdout.strip(),
+                        str(
+                            home
+                            / "Library/Application Support"
+                            / name
+                            / "settings.json"
+                        ),
                     )
-                    result = subprocess.run(
-                        [sys.executable, "-c", code],
-                        cwd=staged / "server" if direct else staged,
-                        env=direct_environment,
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                        check=True,
-                    )
-                    with self.subTest(packaged=packaged, direct=direct):
-                        self.assertEqual(
-                            result.stdout.strip(),
-                            str(
-                                home
-                                / "Library/Application Support"
-                                / name
-                                / "settings.json"
-                            ),
-                        )
 
     def test_missing_or_corrupt_file_means_no_saved_value(self):
         with tempfile.TemporaryDirectory() as directory:

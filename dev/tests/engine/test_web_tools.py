@@ -339,7 +339,9 @@ class SizeCapTest(unittest.TestCase):
 
 class EndpointTests(unittest.TestCase):
     def setUp(self):
-        backend = NativeBackend(IdleRuntime(), None, lambda _record: None, idle_unload=0.0)
+        backend = NativeBackend(
+            IdleRuntime(), None, lambda _record: None, idle_unload=0.0
+        )
         self.addCleanup(backend.close)
         self.server = api.FrontendServer(
             ("127.0.0.1", 0),

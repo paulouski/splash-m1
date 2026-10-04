@@ -39,7 +39,9 @@ def _stop_server():
                     try:
                         pid = json.load(lock)["pid"]
                     except (OSError, ValueError, KeyError, TypeError):
-                        raise models.ModelError("Splash is serving; stop it first") from None
+                        raise models.ModelError(
+                            "Splash is serving; stop it first"
+                        ) from None
                     if type(pid) is not int or pid <= 0:
                         raise models.ModelError("Splash is serving; stop it first")
                     os.kill(pid, signal.SIGTERM)
@@ -92,7 +94,9 @@ def _plan(keep_models):
             items.append((label, path, _size(path, skip) if size is None else size))
 
     bundles = [Path(d) for d in (os.environ.get("SPLASH_APP_DIR"),) if d]
-    bundles = [d / "Splash M1.app" for d in [*bundles, *APP_DIRS, home / "Applications"]]
+    bundles = [
+        d / "Splash M1.app" for d in [*bundles, *APP_DIRS, home / "Applications"]
+    ]
     running = paths.ROOT.parents[2] if len(paths.ROOT.parents) > 2 else None
     if running is not None and running.suffix == ".app":
         bundles.append(running)
@@ -125,7 +129,8 @@ def _plan(keep_models):
                     drafts.append(snapshot)
         model_ids = sorted(set(model_ids))
         model_bytes = sum(
-            desktop_models.delete_plan(model, models_root)["bytes"] for model in model_ids
+            desktop_models.delete_plan(model, models_root)["bytes"]
+            for model in model_ids
         )
         draft_bytes = sum(
             desktop_models._revision_strategy(s).expected_freed_size for s in drafts
@@ -138,7 +143,10 @@ def _plan(keep_models):
     for label, path in (
         ("App settings", home / f"Library/Preferences/{BUNDLE_ID}.plist"),
         ("App cache", home / f"Library/Caches/{BUNDLE_ID}"),
-        ("Saved window state", home / f"Library/Saved Application State/{BUNDLE_ID}.savedState"),
+        (
+            "Saved window state",
+            home / f"Library/Saved Application State/{BUNDLE_ID}.savedState",
+        ),
     ):
         add(label, path)
     return items, model_ids, drafts, models_root
@@ -157,9 +165,11 @@ def _gb(size):
 
 def run(keep_models=False, *, confirm=None, echo=print, from_app=False):
     """Remove Splash. Returns False when confirm declines."""
-    if not from_app and subprocess.run(
-        ["pgrep", "-x", "SplashM1"], capture_output=True
-    ).returncode == 0:
+    if (
+        not from_app
+        and subprocess.run(["pgrep", "-x", "SplashM1"], capture_output=True).returncode
+        == 0
+    ):
         raise models.ModelError("quit Splash M1 before uninstalling.")
     _stop_server()
     items, model_ids, drafts, models_root = _plan(keep_models)

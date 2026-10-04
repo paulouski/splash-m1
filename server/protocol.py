@@ -668,7 +668,8 @@ def _validated_request(
         if scores and (request.image_spans or request.image_pixels):
             raise ValueError("score requests are text-only")
         if not 0 <= request.logprobs <= MAX_TOP_LOGPROBS + 1 or (
-            request.logprobs and (scores or request.constraint is not ConstraintMode.NONE)
+            request.logprobs
+            and (scores or request.constraint is not ConstraintMode.NONE)
         ):
             raise ValueError(
                 "logprobs need top_logprobs <= 20 and an unconstrained generation"
