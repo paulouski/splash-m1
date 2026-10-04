@@ -2024,6 +2024,12 @@ def parse_args(argv=None):
         metavar="MODEL_DIRECTORY",
         help="installed model directory holding target/ and draft/",
     )
+    parser.add_argument(
+        "draft_root",
+        nargs="?",
+        metavar="DRAFT_DIRECTORY",
+        help="draft directory when MODEL_DIRECTORY is a local target directory",
+    )
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument(
         "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
@@ -2043,6 +2049,7 @@ def _native_command(args):
         args.binary,
         "serve-native",
         args.model_root,
+        *filter(None, [getattr(args, "draft_root", None)]),
         "auto" if args.max_context is None else str(args.max_context),
         "auto" if args.max_memory is None else str(args.max_memory),
     ]
