@@ -125,6 +125,9 @@ def source_inputs(data):
 
 class InstallerRestartsTest(unittest.TestCase):
     def setUp(self):
+        memory = mock.patch.object(upstream, "_memory_bytes", return_value=32 * 1024**3)
+        memory.start()
+        self.addCleanup(memory.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
