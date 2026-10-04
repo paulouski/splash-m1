@@ -4,9 +4,9 @@ Splash M1 is an unofficial community fork of [Inco's Splash](https://github.com/
 
 ## Start with the Mac app
 
-The desktop app is being prepared for release. No public download has been published yet. Check the [releases page](https://github.com/paulouski/splash-m1/releases) for availability.
+Release candidates are published on the [releases page](https://github.com/paulouski/splash-m1/releases). They are ad-hoc signed and not notarized.
 
-Once a desktop release is available, install the app and the `splash-m1` command with one line in Terminal:
+Install the app and the `splash-m1` command with one line in Terminal:
 
 ~~~sh
 curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | bash
@@ -71,7 +71,7 @@ This fork builds on Inco's Splash engine and the community Apple7 kernel port. S
 
 ## Command-line installation
 
-The command-line package is also implemented but has not been published yet. After a release containing the installer asset is published, the same one-line installer provides the command (`-s -- --cli-only` skips the app); run it with:
+The same one-line installer provides the command (`-s -- --cli-only` skips the app); run it with:
 
 ~~~sh
 curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/install.sh | bash
