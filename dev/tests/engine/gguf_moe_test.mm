@@ -678,8 +678,14 @@ int main(int argc, const char *argv[]) {
     }
     try {
       MetalBackend backend(argv[1]);
-      const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
-                           floatOnlyChain(backend) + moe(backend);
+#ifdef SPLASH_MACOS15_BUILD
+      constexpr bool apple9Kernels = false;  // the macOS 15 metallib has no Apple9+ kernels
+#else
+      constexpr bool apple9Kernels = true;
+#endif
+      const int failures = floatProjection(backend) +
+                           (apple9Kernels ? floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) : 0) +
+                           moe(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

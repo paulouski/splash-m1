@@ -61,7 +61,6 @@ MACOS15_EXCLUDED_KERNELS := \
 	runtime/metal/kernels/decode/linear_q4.metal \
 	runtime/metal/kernels/decode/linear_q4_grid_split.metal \
 	runtime/metal/kernels/shared/gguf_linear.metal \
-	runtime/metal/kernels/shared/moe.metal \
 	runtime/metal/kernels/shared/moe_gguf.metal \
 	runtime/metal/kernels/shared/vision.metal
 ifeq ($(MACOS15),1)

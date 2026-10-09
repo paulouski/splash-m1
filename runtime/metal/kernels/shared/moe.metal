@@ -2,7 +2,9 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/moe_expert_slab.h"
+#if __METAL_VERSION__ >= 400
 #include "metal/kernels/common/q4_mpp_tiles.h"
+#endif
 
 // Routes group rows by expert so each tile streams its weights once. Each row
 // carries top_k routed experts plus the shared expert (id `experts`), weighted
@@ -34,6 +36,7 @@ inline float moe_route_group_term(float dot, float scale, float sum,
   return fma(dot, scale, sum * bias);
 }
 
+#if __METAL_VERSION__ >= 400  // MPP route-score tiles
 // Eight rows by 32 experts per threadgroup. Simdgroup s owns K slice s and
 // stages its rows in threadgroup memory, so a ragged tail never reads past
 // the last live row; the threadgroup then sums the slice partials in order.
@@ -264,6 +267,7 @@ kernel void moe_route_scores_q8_m32(
     }
   });
 }
+#endif // __METAL_VERSION__ >= 400
 
 // The shared expert's scalar gate weight of input `dimension`: the Q8 affine
 // row of a packed model, or the F32 tensor of a GGUF (ffn_gate_inp_shexp),
@@ -604,6 +608,7 @@ kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
       table, sums, width, group, simd_lane, simd_group);
 }
 
+#if __METAL_VERSION__ >= 400  // MPP expert tiles; the macOS 15 build uses the *_mma kernels
 // One expert tile: 8 grouped rows times TileN output columns, read through
 // the same Q4 tile as the dense projections. The expert's weights stream once
 // per tile instead of once per route. Decode plans run this fused gate/up
@@ -721,6 +726,8 @@ kernel void moe_expert_down_q4_m8_n256_sg4(
                                  shared_down, output, params, group,
                                  input_sums, simd_lane, simd_group);
 }
+
+#endif // __METAL_VERSION__ >= 400
 
 kernel void moe_combine(
     device const bfloat *expert_output [[buffer(0)]],
