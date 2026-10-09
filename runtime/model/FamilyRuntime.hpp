@@ -53,7 +53,8 @@ public:
                                      std::span<const uint32_t> /*inputTokens*/,
                                      uint32_t /*rowBegin*/) {}
   // A decode lane of `stateLane` at decode `lane`; `anchor` is the pending
-  // token that starts the step at `position`.
+  // token that starts the step at `position`. Runs before any proposal exists
+  // (an MTP head drafts them on the GPU afterwards).
   virtual void beforeDecodeLane(uint64_t /*requestId*/, uint32_t /*lane*/,
                                 uint32_t /*stateLane*/, uint64_t /*position*/,
                                 uint32_t /*anchor*/) {}

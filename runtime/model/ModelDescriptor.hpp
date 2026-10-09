@@ -25,7 +25,7 @@ enum class TargetSource : uint8_t { Packed, Mlx, Gguf, PrismMlx };
 enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 
 // What proposes the tokens a verify step checks: a DFlash2 draft, nothing
-// (prompt lookup alone), or the model's own MTP head (not implemented).
+// (prompt lookup alone), or the model's own MTP head (Qwen3.8-Flash-Next).
 enum class ProposalSource : uint8_t { DFlash2, None, Mtp };
 
 // Package metadata validated before weight buffers are loaded. The engine
