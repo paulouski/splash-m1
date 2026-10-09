@@ -13,7 +13,12 @@ from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
 from .errors import APIError
-from .schema_validation import build_validator, json_objects, subschemas
+from .schema_validation import (
+    build_validator,
+    check_schema,
+    json_objects,
+    subschemas,
+)
 
 # The chat template's tool-call tags, as it lays a call out: grammars write
 # calls that way, and the projector reads them that way (output.py). A call
@@ -844,7 +849,7 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         if ref := _remote_ref(schema):
             raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
         try:
-            build_validator(schema)
+            check_schema(schema)
         except SchemaError as error:
             raise APIError(
                 400, f"invalid tool schema for {name}: {error.message}"
