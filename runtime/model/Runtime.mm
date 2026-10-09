@@ -2011,6 +2011,82 @@ struct Runtime::Impl {
     return results;
   }
 
+  // An MTP cycle has one host dependency between its two Metal commands: the
+  // verify rows' PLE rows hash from the proposals the first command drafts, and
+  // the family reads them from the SSD. This ticket keeps the scheduler batch
+  // (and therefore its DecodeArena lanes) owned across that dependency; the
+  // engine polls it (takeMaskRequests), so the engine thread stages and submits
+  // the verify only once the draft is done, and waits for neither.
+  class MtpDecodeTicket final : public ModelBatchTicket {
+  public:
+    MtpDecodeTicket(Impl &impl, std::vector<DecodeLaneResult> lanes, std::span<const ModelBatchItem> items,
+                    const CommandGraph &draft, std::function<void()> completion)
+        : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), wake_(std::move(completion)) {
+      submit(draft);
+    }
+
+    std::vector<ModelMaskRequest> takeMaskRequests() override {
+      if (stage_ == Stage::Draft && command_.ready()) stageVerify();
+      return {};
+    }
+
+    bool ready() const noexcept override { return stage_ == Stage::Verify && command_.ready(); }
+
+    std::vector<ModelStepResult> wait() override {
+      if (stage_ == Stage::Draft) stageVerify();
+      if (stage_ != Stage::Verify) throw std::logic_error("MTP decode ticket is not in flight");
+      addTiming(command_.wait());
+      stage_ = Stage::Done;
+      return impl_.finalizeDecode(lanes_, items_, timing_);
+    }
+
+    double wallMilliseconds() const noexcept override { return timing_.wallSeconds * 1000.0; }
+
+  private:
+    enum class Stage : uint8_t { Draft, Verify, Done };
+
+    // The draft is done: stage the verify rows of every lane from its
+    // proposals and submit the verify, policy, acceptance and commit.
+    void stageVerify() {
+      addTiming(command_.wait());
+      std::array<Request *, kLaneCount> entries{};
+      std::array<uint32_t, kLaneCount> maximumRetained{};
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
+        entries[lane] = lanes_[lane].request;
+        maximumRetained[lane] = lanes_[lane].maximumRetained;
+        impl_.stageFamilyVerifyLane(*entries[lane], items_[lane], lane);
+      }
+      const std::span<Request *const> active(entries.data(), lanes_.size());
+      CommandGraph verify;
+      const uint32_t width = static_cast<uint32_t>(lanes_.size());
+      impl_.encodeBatchVerifyInput(verify, width);
+      impl_.encodeBatchEmbedding(verify, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+      impl_.encodeTargetVerifyBatchForward(verify, active, items_);
+      impl_.encodeTargetVerifyBatchPolicy(verify, active);
+      impl_.encodeBatchAcceptance(verify, active, {maximumRetained.data(), lanes_.size()});
+      impl_.encodeBatchGdnCommit(verify, active);
+      submit(verify);
+      stage_ = Stage::Verify;
+    }
+
+    void submit(const CommandGraph &graph) {
+      command_ = impl_.backend.submitCommandAsync(graph.dispatches(), wake_);
+    }
+
+    void addTiming(CommandTiming value) noexcept {
+      timing_.gpuSeconds += value.gpuSeconds;
+      timing_.wallSeconds += value.wallSeconds;
+    }
+
+    Impl &impl_;
+    std::vector<DecodeLaneResult> lanes_;
+    std::vector<ModelBatchItem> items_;
+    Stage stage_ = Stage::Draft;
+    CommandTicket command_;
+    CommandTiming timing_;
+    std::function<void()> wake_;
+  };
+
   // A constrained DFlash cycle has one host dependency between three Metal
   // commands: draft proposals define the grammar simulation, while the target
   // forward is independent of the resulting mask.  This ticket keeps the
@@ -2675,16 +2751,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
   const bool draftSkipped = lanes[0].draftSkipped;
-  CommandTiming draftTiming;
   if (lanes[0].mtp) {
-    // The proposals are the GPU's: draft them, stage the verify rows' PLE
-    // from them, then verify.
+    // The proposals are the GPU's: the first command drafts them, the ticket
+    // stages the verify rows' PLE from them and submits the verify.
     impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false, true);
-    draftTiming = impl_->backend.submitCommand(commandGraph.dispatches());
-    for (uint32_t lane = 0; lane < width; ++lane)
-      impl_->stageFamilyVerifyLane(*requests[lane], items[lane], lane);
-    commandGraph = CommandGraph();
-  } else if (!draftSkipped) {
+    return std::make_unique<Impl::MtpDecodeTicket>(*impl_, std::move(lanes), items, commandGraph,
+                                                   std::move(completion));
+  }
+  if (!draftSkipped) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width);
     impl_->encodeDraftBatchGraph(commandGraph, entries,
@@ -2707,10 +2781,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes), items = std::move(copiedItems),
-                 draftTiming](CommandTiming timing) mutable {
-    timing.gpuSeconds += draftTiming.gpuSeconds;
-    timing.wallSeconds += draftTiming.wallSeconds;
+  auto finish = [impl, lanes = std::move(lanes),
+                 items = std::move(copiedItems)](CommandTiming timing) mutable {
     return impl->finalizeDecode(lanes, items, timing);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(

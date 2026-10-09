@@ -27,6 +27,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace splash;
@@ -282,7 +283,7 @@ public:
         items.push_back({requests[i].id, positions[i], 0, tables[i]});
         items.back().pageTableRevision = 1;
       }
-      auto results = runtime_->decode(plan, items);
+      auto results = polled_ ? poll(plan, items) : runtime_->decode(plan, items);
       require(results.size() == prompts.size(), "a decode batch lost a lane");
       for (size_t i = 0; i < prompts.size(); ++i) {
         require(results[i].failure.empty() && !results[i].outputTokens.empty(),
@@ -303,7 +304,20 @@ public:
     return runs;
   }
 
+  // Decode through the ticket the way the engine does: poll it until it is ready, then take its results.
+  void pollTickets(bool polled) { polled_ = polled; }
+
 private:
+  std::vector<ModelStepResult> poll(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    const std::unique_ptr<ModelBatchTicket> ticket = runtime_->submit(plan, items, {});
+    while (true) {
+      static_cast<void>(ticket->takeMaskRequests());
+      if (ticket->ready()) break;
+      std::this_thread::yield();
+    }
+    return ticket->wait();
+  }
+
   void begin(const ModelRequest &request) {
     runtime_->beginColdRequest(request, static_cast<uint32_t>(request.id % 4));
   }
@@ -331,6 +345,7 @@ private:
   std::unique_ptr<model::QwenStateStorage> states_;
   std::unique_ptr<model::Runtime> runtime_;
   uint64_t nextId_ = 100;
+  bool polled_ = false;
 };
 
 struct Closeness final {
@@ -400,6 +415,45 @@ void writeMtpHead(const std::filesystem::path &path, const SmallTarget &target) 
   noPle.pleNgram = 0;
   qwen4Metadata(keys, noPle, 1);
   splash::test::writeFile(path, test_gguf::file(keys, head));
+}
+
+// The expected value of a PLE row from the whole table.
+void checkStaging(const std::vector<SpyFamily::Call> &calls, const std::vector<Run> &runs, const model::Qwen4PleTable &table,
+                  const std::vector<uint8_t> &rows, uint32_t verifyRows) {
+  PleHasher hasher(table.hash);
+  const uint32_t heads = hasher.heads();
+  size_t checked = 0;
+  for (const SpyFamily::Call &call : calls) {
+    const auto run = std::find_if(runs.begin(), runs.end(), [&](const Run &r) { return r.id == call.request; });
+    if (run == runs.end()) continue;
+    std::vector<uint32_t> sequence = run->prompt;
+    sequence.insert(sequence.end(), run->tokens.begin(), run->tokens.end());
+    require(call.position + 1 <= sequence.size() && sequence[call.position] == call.tokens[0],
+            "a verify's first row is not the request's anchor");
+    require(call.tokens.size() == verifyRows && call.slots.size() == uint64_t{verifyRows} * heads,
+            "a verify staged another number of rows");
+    const uint64_t base = uint64_t{call.lane} * verifyRows * heads;
+    std::vector<uint32_t> ids(heads);
+    for (uint32_t row = 0; row < verifyRows; ++row) {
+      hasher.rows(
+          call.position + row, call.tokens[row],
+          [&](uint64_t at) -> std::optional<uint32_t> {
+            if (at >= call.position) return call.tokens[at - call.position];
+            return sequence[at];
+          },
+          ids.data());
+      for (uint32_t head = 0; head < heads; ++head) {
+        const uint64_t slot = call.slots[uint64_t{row} * heads + head] - base;
+        require((slot + 1) * pleRowBytes <= call.staged.size(), "a staged slot lies outside the staging");
+        require(std::equal(call.staged.begin() + slot * pleRowBytes, call.staged.begin() + (slot + 1) * pleRowBytes,
+                           rows.begin() + uint64_t{ids[head]} * pleRowBytes),
+                "a verify row's staged PLE row differs from the whole table's");
+        ++checked;
+      }
+    }
+  }
+  require(checked > 0, "no verify row was checked");
+  std::printf("staged PLE rows of %zu verify rows' heads == the whole table's\n", checked);
 }
 
 // Each cycle's accepted count is the longest prefix of its proposals that the target's tokens (the emitted ones,
@@ -580,6 +634,7 @@ void run(const std::string &metallib) {
   SpyFamily &spy = *spyOwner;
   Session drafting(backend, mtpPackage, std::move(spyOwner));
   constexpr uint32_t steps = 3;
+  const std::vector<uint8_t> wholeTable = tableBytes(table);
 
   const Run mtp = drafting.generate(prompt, 40, 8);
   std::printf("MTP decode: %zu tokens in %zu cycles, drafted %u accepted %u:", mtp.tokens.size(), mtp.cycles.size(),
@@ -587,6 +642,7 @@ void run(const std::string &metallib) {
   for (const uint32_t token : mtp.tokens) std::printf(" %u", token);
   std::printf("\n");
   checkAcceptance(mtp, spy.calls, steps);
+  checkStaging(spy.calls, {mtp}, table, wholeTable, 8);
   for (size_t i = 0; i < mtp.tokens.size(); ++i) {
     if (mtp.tokens[i] == decoded.tokens[i]) continue;
     // The verify rows round differently from the draft-less cycle's: only a near tie may flip.
@@ -623,6 +679,7 @@ void run(const std::string &metallib) {
   require(batch[0].tokens == std::vector<uint32_t>(mtp.tokens.begin(), mtp.tokens.begin() + 16) &&
               batch[1].tokens == single.tokens,
           "a batch of two changed the MTP decode's tokens");
+  checkStaging(spy.calls, {mtp, chunked, batch[0], batch[1], single}, table, wholeTable, 8);
   const auto proposalsOf = [&](uint64_t id) {
     std::vector<std::vector<uint32_t>> proposals;
     for (const SpyFamily::Call &call : spy.calls)
@@ -636,6 +693,12 @@ void run(const std::string &metallib) {
   }
   std::printf("MTP: chunked prefill and a batch of two propose what the one request does\n");
 
+  // The engine polls the ticket instead of waiting for it: the verify is staged and submitted from the poll.
+  drafting.pollTickets(true);
+  const Run polled = drafting.generate(prompt, 40, 8);
+  require(polled.tokens == mtp.tokens && polled.drafted == mtp.drafted && polled.accepted == mtp.accepted,
+          "a polled MTP ticket decodes other tokens than a waited one");
+  std::printf("polled ticket == waited ticket\n");
 }
 
 } // namespace
