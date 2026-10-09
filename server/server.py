@@ -2079,6 +2079,8 @@ def _native_command(args, prefill_bound_ms=None):
         command.extend(
             ("--max-image-patches", str(image_input.max_patches(args.max_image_pixels)))
         )
+    if args.allow_idle_sleep:
+        command.extend(("--idle-sleep", "allow"))
     if args.prefill_mode != "bounded":
         command.extend(("--prefill-mode", args.prefill_mode))
     elif prefill_bound_ms != serve_options.PREFILL_BOUND_DEFAULT_MS:

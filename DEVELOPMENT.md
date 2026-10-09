@@ -40,6 +40,7 @@ The default listener is `127.0.0.1:8000`; use `--port` or `SPLASH_PORT` for anot
 | `--allowed-host NAME` | none | Additional HTTP Host name, e.g. `mymac.local`; repeatable. Does not change the bind address. |
 | `--allowed-origin ORIGIN` | none | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any (set `--api-key` too); repeatable. |
 | `--api-key` | `SPLASH_API_KEY` or none | Require a bearer token or `x-api-key`. |
+| `--allow-idle-sleep` | off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 | `--max-memory` / `--max-context` | auto | Metal allocation ceiling (e.g. `28G`) and context limit (up to `256K`). |
 | `--max-cache-disk` | `0` (off) | SSD cache for KV pages and states, e.g. `16G`. |
 | `--served-model-name NAME` | none | Additional API model ID; repeatable. With `--announce-served-name`, responses report the first alias. |

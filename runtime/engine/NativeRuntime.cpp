@@ -202,6 +202,8 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
   }
   telemetry_.emplace(request.requestId,
                      RequestTelemetry{.arrivedMilliseconds = nowMonotonic});
+  if (telemetry_.size() == 1 && config_.holdingRequests)
+    config_.holdingRequests(true);
   return true;
 }
 
@@ -423,8 +425,7 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
       std::vector<float>(optionLogits.begin(), optionLogits.end())});
-  pendingMasks_.erase(requestId);
-  telemetry_.erase(requestId);
+  ended(requestId);
 }
 
 void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
@@ -434,8 +435,14 @@ void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
     config_.metrics->capacityFailed();
   requestError(requestId, std::string(wire.code), std::move(message),
                wire.retryable);
+  ended(requestId);
+}
+
+void NativeRuntime::ended(uint64_t requestId) {
   pendingMasks_.erase(requestId);
   telemetry_.erase(requestId);
+  if (telemetry_.empty() && config_.holdingRequests)
+    config_.holdingRequests(false);
 }
 
 NativeRuntime::Clocks NativeRuntime::clocks() {
