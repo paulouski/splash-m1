@@ -93,6 +93,26 @@ void testInstalledManifestBindsExecutionGeometry() {
   root.write(executionManifest(8, R"(,"description":"package metadata")"));
   static_cast<void>(model::inspectModelPackage(root.path()));
 
+  // A whole number written as a float, as Python writes 1e7, is that
+  // integer; a fraction is not one.
+  std::string floatRows = executionManifest();
+  const std::string rows = "\"draft_query_rows\":8,";
+  const size_t rowsAt = floatRows.find(rows);
+  require(rowsAt != std::string::npos, "test manifest lost draft rows");
+  root.write(std::string(floatRows).replace(rowsAt, rows.size(),
+                                            "\"draft_query_rows\":8.0,"));
+  static_cast<void>(model::inspectModelPackage(root.path()));
+  root.write(floatRows.replace(rowsAt, rows.size(),
+                               "\"draft_query_rows\":8.5,"));
+  try {
+    static_cast<void>(model::inspectModelPackage(root.path()));
+    throw std::runtime_error("fractional geometry was accepted");
+  } catch (const std::invalid_argument &error) {
+    require(std::string_view(error.what()).find("draft_query_rows") !=
+                std::string_view::npos,
+            "fractional geometry did not identify its field");
+  }
+
   std::string missingGeometry = executionManifest();
   const std::string requiredField = "\"draft_sliding_window\":2048,";
   const size_t field = missingGeometry.find(requiredField);

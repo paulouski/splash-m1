@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 
 #include <array>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -94,14 +95,21 @@ uint64_t requireUnsigned(NSDictionary *object, NSString *key,
                                 " must be an unsigned integer");
   }
   NSNumber *number = static_cast<NSNumber *>(value);
-  if (CFNumberIsFloatType((__bridge CFNumberRef)number) ||
-      number.longLongValue <= 0 ||
-      static_cast<uint64_t>(number.longLongValue) !=
-          number.unsignedLongLongValue) {
-    throw std::invalid_argument(std::string(label) +
-                                " must be a positive unsigned integer");
+  if (CFNumberIsFloatType((__bridge CFNumberRef)number)) {
+    // A config saved from Python writes a float that holds a whole number,
+    // rope_theta=1e7 as 10000000.0, and the installer compares it equal to
+    // that integer. A double holds every integer exactly up to 2^53 - 1.
+    const double real = number.doubleValue;
+    if (std::isfinite(real) && real >= 1 && real <= 9007199254740991.0 &&
+        std::floor(real) == real)
+      return static_cast<uint64_t>(real);
+  } else if (number.longLongValue > 0 &&
+             static_cast<uint64_t>(number.longLongValue) ==
+                 number.unsignedLongLongValue) {
+    return number.unsignedLongLongValue;
   }
-  return number.unsignedLongLongValue;
+  throw std::invalid_argument(std::string(label) +
+                              " must be a positive unsigned integer");
 }
 
 void requireEqual(uint64_t actual, uint64_t expected,
