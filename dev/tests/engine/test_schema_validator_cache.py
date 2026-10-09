@@ -91,6 +91,38 @@ class ValidatorCacheTests(unittest.TestCase):
         self.assertTrue(validator.is_valid({"a": 1}))
         self.assertFalse(validator.is_valid({"b": 1}))
 
+    def test_references_keep_patterns_bounded(self):
+        # A reference into an unknown keyword reaches a $schema the build
+        # leaves, and jsonschema would validate there with that dialect's
+        # class, which matches patterns with the unbounded standard engine.
+        for container, dialect in (
+            ("$defs", "https://json-schema.org/draft/2020-12/schema"),
+            ("x-stash", "https://json-schema.org/draft/2020-12/schema"),
+            ("x-stash", "http://json-schema.org/draft-07/schema#"),
+        ):
+            target = {"$schema": dialect, "type": "string", "pattern": "^a+$"}
+            validator = self.build(
+                {"$ref": f"#/{container}/s", container: {"s": target}}
+            )
+            with (
+                self.subTest(container=container, dialect=dialect),
+                mock.patch.object(validation.regex, "search", side_effect=TimeoutError),
+                self.assertRaises(validation.SchemaEvaluationError),
+            ):
+                validator.is_valid("aa")
+
+    def test_references_keep_their_dialect(self):
+        # The draft-07 target's items list is a schema per position, which
+        # the document's 2020-12 dialect would refuse.
+        target = {
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "items": [{"type": "string"}],
+            "additionalItems": False,
+        }
+        validator = self.build({"$ref": "#/x-stash/s", "x-stash": {"s": target}})
+        self.assertTrue(validator.is_valid(["a"]))
+        self.assertFalse(validator.is_valid(["a", 1]))
+
     def test_caller_mutation_does_not_change_cached_validator(self):
         schema = {"properties": {"x": {"type": "integer"}}}
         first = self.build(schema)

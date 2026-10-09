@@ -6,6 +6,7 @@ import threading
 from collections import OrderedDict
 from functools import lru_cache
 
+import attrs
 import regex
 from jsonschema import ValidationError, validators
 from jsonschema.exceptions import UndefinedTypeCheck
@@ -138,7 +139,7 @@ def _known_type(base, name):
 
 @lru_cache(maxsize=8)
 def _bounded_class(base):
-    return validators.extend(
+    bounded = validators.extend(
         base,
         {
             "pattern": _pattern,
@@ -146,6 +147,28 @@ def _bounded_class(base):
             "additionalProperties": _additional_properties,
         },
     )
+    evolve = bounded.evolve
+
+    # evolve validates a schema with the standard class its $schema names. A
+    # reference can reach a declaration under any keyword, not only at the
+    # positions build_validator removes them from: keep its dialect, bounded.
+    def bounded_evolve(self, **changes):
+        schema = changes.get("schema")
+        if isinstance(schema, dict) and "$schema" in schema:
+            dialect = base
+            if isinstance(schema["$schema"], str):
+                dialect = validators.validator_for(schema, default=base)
+            changes["schema"] = {k: v for k, v in schema.items() if k != "$schema"}
+            if dialect is not base:
+                # As evolve builds its class, with the dialect's bounded one.
+                for field in attrs.fields(bounded):
+                    if field.init and field.alias not in changes:
+                        changes[field.alias] = getattr(self, field.name)
+                return _bounded_class(dialect)(**changes)
+        return evolve(self, **changes)
+
+    bounded.evolve = bounded_evolve
+    return bounded
 
 
 _VALIDATOR_CACHE_SIZE = 256
