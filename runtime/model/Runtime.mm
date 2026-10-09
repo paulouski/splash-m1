@@ -244,6 +244,9 @@ struct Runtime::Impl {
     bool draftSkipped = false;
     // Row 0 alone is decoded, through the one-row GEMV (SPLASH_DECODE_M1).
     bool singleRow = false;
+    // The MTP head drafts the proposals on the GPU in a command of its own,
+    // before the verify's PLE rows can be staged.
+    bool mtp = false;
   };
 
   // What a lane's GPU table was last written from. Its entries stay valid
@@ -307,6 +310,12 @@ struct Runtime::Impl {
   std::unique_ptr<DFlashDraft> draftModel;
   uint32_t prefillRows = kPrefillRows;
   uint32_t decodeLanes = kLaneCount;
+  // Proposals the MTP head drafts per cycle (SPLASH_MTP_DRAFTS, 1 to 7).
+  const uint32_t mtpDraftSteps = [] {
+    const char *value = std::getenv("SPLASH_MTP_DRAFTS");
+    if (!value || !*value) return 3L;
+    return std::clamp<long>(std::strtol(value, nullptr, 10), 1, kDraftProposalTokens);
+  }();
   // Read once at startup (SPLASH_DECODE_LADDER and friends); --decode-ladder
   // sets the same environment variable before the runtime is constructed
   // (runtime/main.mm).
@@ -338,8 +347,8 @@ struct Runtime::Impl {
                        ? std::make_unique<DFlashDraft>(value.package.draft, value.backend, operators)
                        : nullptr),
         prefillRows(value.prefillRows), decodeLanes(value.decodeLanes) {
-    if (package.descriptor.proposals == ProposalSource::Mtp)
-      throw std::invalid_argument("MTP proposals are not implemented");
+    if ((package.descriptor.proposals == ProposalSource::Mtp) != targetModel.hasMtp())
+      throw std::invalid_argument("the MTP proposals and the target's MTP head disagree");
     if (states.layout() != package.stateLayout() ||
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -1469,6 +1478,33 @@ struct Runtime::Impl {
     return captures;
   }
 
+  // The verify rows' tokens of a lane as verify_input_tokens reads them (the
+  // anchor, then the proposals, clamped into the vocabulary), handed to the
+  // family once the proposals are final.
+  void stageFamilyVerifyLane(const Request &entry, const ModelBatchItem &item, uint32_t lane) {
+    if (!family)
+      return;
+    std::array<uint32_t, kDecodeRows> rowTokens;
+    const uint32_t *proposals = proposedTokens(lane);
+    const uint32_t last = geometry.target.vocabularySize - 1;
+    rowTokens[0] = std::min(*entry.pendingToken, last);
+    for (uint32_t row = 1; row < kDecodeRows; ++row)
+      rowTokens[row] = std::min(proposals[row - 1], last);
+    family->beforeVerifyLane(entry.id, lane, item.logicalPosition, rowTokens);
+  }
+
+  // The MTP head's proposals are written by the GPU: a lane's sparse
+  // candidates are its tokens alone, each at probability one.
+  void stageMtpSampling(uint32_t lane) {
+    auto *ids = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Candidates), "MTP q ids");
+    auto *probs = contents<float>(decodeArena->get(lane, DecodeTensor::ProposalProbs), "MTP q probs");
+    for (uint32_t position = 0; position < kDraftProposalTokens; ++position)
+      for (uint32_t i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i) {
+        ids[position * SPLASH_DRAFT_CANDIDATES + i] = geometry.target.vocabularySize;
+        probs[position * SPLASH_DRAFT_CANDIDATES + i] = i == 0 ? 1.0F : 0.0F;
+      }
+  }
+
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
                          uint32_t lane) {
     if (!entry.resident || !entry.promptComplete || !entry.pendingToken) {
@@ -1592,10 +1628,13 @@ struct Runtime::Impl {
         std::span(anchors).first(lanes), std::span(policies).first(lanes));
   }
 
+  // The target's verify forward or, with `mtpDraft`, the MTP head's draft
+  // steps over the same rows (QwenTarget::addMtpDraft).
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
-                                      bool singleRow = false) {
+                                      bool singleRow = false,
+                                      bool mtpDraft = false) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1676,6 +1715,16 @@ struct Runtime::Impl {
           DecodeTensor::ChunkKeysBase, layer, storage);
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
+    }
+    if (mtpDraft) {
+      buffers.anchors = d(DecodeTensor::DraftInputTokens);
+      buffers.proposals = d(DecodeTensor::ProposedTokens);
+      buffers.candidates = d(DecodeTensor::Candidates);
+      buffers.proposalsPerLane = kDraftProposalTokens;
+      buffers.candidatesPerProposal = SPLASH_DRAFT_CANDIDATES;
+      targetModel.addMtpDraft(graph, std::move(buffers), kvPages.layers(), std::span(chunks).first(lanes), lanes,
+                              mtpDraftSteps);
+      return;
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
                           std::span(chunks).first(lanes), lanes);
@@ -1792,6 +1841,7 @@ struct Runtime::Impl {
     buffers.retainedCounts = decodeArena->packed(DecodeTensor::RetainedCount, width);
     buffers.layerLanes = decodeArena->laneCount();
     buffers.pleConvolution = decodeArena->packed(DecodeTensor::PleConvolution, width);
+    buffers.streams = decodeArena->packed(DecodeTensor::HyperStreams, width);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request *entry = lanes[std::min(lane, width - 1)];
       if (!entry)
@@ -1921,7 +1971,8 @@ struct Runtime::Impl {
                          std::move(output),
                          false,
                          DecodeStage::Regular,
-                         laneResult.draftSkipped && !laneResult.lookup ? 0 : kDraftProposalTokens,
+                         laneResult.mtp ? mtpDraftSteps
+                                        : (laneResult.draftSkipped && !laneResult.lookup ? 0 : kDraftProposalTokens),
                          std::min(laneResult.accepted, laneResult.retained - 1)});
       ModelStepResult &result = results.back();
       result.outputLogprobs = std::move(outputLogprobs);
@@ -2563,12 +2614,18 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.currentAnchor = *entry.pendingToken;
     const bool arLane = !constrained && width == 1 &&
                         entry.decodePolicy.mode() == engine::DecodeMode::Ar;
-    const bool noDraft = !impl_->draftModel;
+    // The MTP head drafts every unconstrained cycle that decodes more than
+    // the anchor.
+    const bool mtpLane = impl_->targetModel.hasMtp() && !constrained && !arLane;
+    const bool noDraft = !impl_->draftModel && !mtpLane;
     laneResult.maximumRetained =
-        arLane ? 1u : std::min(remaining, kDecodeRows);
+        arLane ? 1u : std::min(remaining, mtpLane ? impl_->mtpDraftSteps + 1 : kDecodeRows);
 
     impl_->prepareDecodeLane(entry, item, lane);
-    if (!constrained && width == 1) {
+    if (mtpLane) {
+      laneResult.mtp = true;
+      impl_->stageMtpSampling(lane);
+    } else if (!constrained && width == 1) {
       uint32_t *lookupTokens = impl_->proposedTokens(lane);
       laneResult.lookup =
           !arLane && Impl::promptLookup(entry, *entry.pendingToken, lookupTokens);
@@ -2597,16 +2654,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
       if (Impl::samplingEnabled(entry))
         impl_->stageLookupSamplingProposal(lane, proposals);
     }
-    if (impl_->family) {
-      // The rows' tokens as verify_input_tokens reads them.
-      std::array<uint32_t, kDecodeRows> rowTokens;
-      const uint32_t *proposals = impl_->proposedTokens(lane);
-      const uint32_t last = impl_->geometry.target.vocabularySize - 1;
-      rowTokens[0] = std::min(*entry.pendingToken, last);
-      for (uint32_t row = 1; row < kDecodeRows; ++row)
-        rowTokens[row] = std::min(proposals[row - 1], last);
-      impl_->family->beforeVerifyLane(entry.id, lane, item.logicalPosition, rowTokens);
-    }
+    // The MTP head's proposals are not known yet: its lanes stage after the
+    // draft command.
+    if (!laneResult.mtp)
+      impl_->stageFamilyVerifyLane(entry, item, lane);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
     maximumRetained[lane] = laneResult.maximumRetained;
@@ -2624,7 +2675,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->packed(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->packed(DecodeTensor::DraftRopeSin, width));
   const bool draftSkipped = lanes[0].draftSkipped;
-  if (!draftSkipped) {
+  CommandTiming draftTiming;
+  if (lanes[0].mtp) {
+    // The proposals are the GPU's: draft them, stage the verify rows' PLE
+    // from them, then verify.
+    impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false, true);
+    draftTiming = impl_->backend.submitCommand(commandGraph.dispatches());
+    for (uint32_t lane = 0; lane < width; ++lane)
+      impl_->stageFamilyVerifyLane(*requests[lane], items[lane], lane);
+    commandGraph = CommandGraph();
+  } else if (!draftSkipped) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width);
     impl_->encodeDraftBatchGraph(commandGraph, entries,
@@ -2647,8 +2707,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes),
-                 items = std::move(copiedItems)](CommandTiming timing) mutable {
+  auto finish = [impl, lanes = std::move(lanes), items = std::move(copiedItems),
+                 draftTiming](CommandTiming timing) mutable {
+    timing.gpuSeconds += draftTiming.gpuSeconds;
+    timing.wallSeconds += draftTiming.wallSeconds;
     return impl->finalizeDecode(lanes, items, timing);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(

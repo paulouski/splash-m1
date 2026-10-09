@@ -30,13 +30,30 @@ public:
   // reads as they are: the model has no output norm.
   void addHead(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer logits, uint32_t lanes,
                ops::LinearScratch scratch) const;
-  // Each lane's PLE history after its retained rows.
-  void addPleCommit(metal::CommandGraph &graph, const QwenTargetCommitBuffers &buffers, uint32_t lanes) const;
+  // Each lane's PLE history after its retained rows and, with the MTP head,
+  // the streams of its last retained row.
+  void addStateCommit(metal::CommandGraph &graph, const QwenTargetCommitBuffers &buffers, uint32_t lanes) const;
+  // `steps` MTP draft steps over each lane's verify rows (QwenTarget::addMtpDraft).
+  void addMtpDraft(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
+                   std::span<const SplashKvLayer> kvLayers, std::span<const kv::ChunkedPrefillParams> chunks,
+                   uint32_t lanes, uint32_t steps) const;
 
 private:
   struct PrefillStep;
   struct VerifyStep;
 
+  [[nodiscard]] VerifyStep verifyStep(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &buffers,
+                                      std::span<const SplashKvLayer> kvLayers,
+                                      std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const;
+  void addVerifyProjection(VerifyStep &step, metal::MetalBuffer input, const ops::Projection &projection,
+                           metal::MetalBuffer output, ops::PreparedInput prepared = {}) const;
+  void addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
+                    metal::MetalBuffer output) const;
+  void addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer, const QwenAttentionWeights &mixer,
+                          uint32_t attentionLayer) const;
+  void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history, uint32_t limit,
+                    bool full) const;
+  [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;
   [[nodiscard]] ops::HyperShape hyperShape() const noexcept;
   [[nodiscard]] ops::PleShape pleShape() const noexcept;
   const Qwen4ExpWeights &weights_;

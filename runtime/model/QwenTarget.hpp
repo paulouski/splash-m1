@@ -152,7 +152,7 @@ struct QwenTargetGeometry final {
       });
     };
     return captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
-           stateLayout.layers + kvLayout.attentionLayers == layers &&
+           stateLayout.layers + kvLayout.attentionLayers == layers + qwen4.mtpLayers &&
            gdnShape().valid() &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
@@ -259,6 +259,14 @@ struct QwenTargetVerifyBuffers final {
   // Qwen3.8-Flash-Next: each lane's PLE history before the step (the
   // commit writes the one after it).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistories;
+  // The MTP head's draft (Qwen4ExpTarget::addMtpDraft): each lane's rows'
+  // first tokens (row 0 its anchor), and the proposals and sparse candidates
+  // it writes.
+  metal::MetalBuffer anchors;
+  metal::MetalBuffer proposals;
+  metal::MetalBuffer candidates;
+  uint32_t proposalsPerLane = 0;
+  uint32_t candidatesPerProposal = 0;
 };
 
 struct QwenTargetCommitBuffers final {
@@ -278,6 +286,9 @@ struct QwenTargetCommitBuffers final {
   metal::MetalBuffer pleConvolution;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistoriesIn;
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistoriesOut;
+  // With the MTP head: the step's residual streams, whose row before each
+  // lane's next position it carries.
+  metal::MetalBuffer streams;
 };
 
 template <class Layout, class Layer>
@@ -333,6 +344,14 @@ public:
                     metal::MetalBuffer hidden, uint32_t rows) const;
   void addStateCommit(metal::CommandGraph &graph,
                       QwenTargetCommitBuffers buffers, uint32_t lanes) const;
+  // Qwen3.8-Flash-Next with its MTP head.
+  [[nodiscard]] bool hasMtp() const noexcept { return geometry_.qwen4.mtpLayers != 0; }
+  // `steps` draft steps over each lane's verify rows before the verify: step
+  // j writes proposal j - 1, the last one also every later proposal. The
+  // verify then writes the head's KV at its rows (addVerify).
+  void addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                   std::span<const SplashKvLayer> kvLayers, std::span<const kv::ChunkedPrefillParams> chunks,
+                   uint32_t lanes, uint32_t steps) const;
 
 private:
   using WeightView =

@@ -142,6 +142,9 @@ enum class PrefillTensor : uint32_t {
   QsaScores,
   QsaMask,
   QsaBlocks,
+  MtpStreams,
+  MtpInput,
+  MtpTokens,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -241,6 +244,9 @@ public:
     h.qsaScores = get(PrefillTensor::QsaScores);
     h.qsaMask = get(PrefillTensor::QsaMask);
     h.qsaBlocks = get(PrefillTensor::QsaBlocks);
+    h.mtpStreams = get(PrefillTensor::MtpStreams);
+    h.mtpInput = get(PrefillTensor::MtpInput);
+    h.mtpTokens = get(PrefillTensor::MtpTokens);
     return h;
   }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
@@ -340,6 +346,9 @@ enum class DecodeTensor : uint32_t {
   QsaScores,
   QsaMask,
   QsaBlocks,
+  MtpStreams,
+  MtpInput,
+  MtpTokens,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -504,6 +513,9 @@ public:
     h.qsaScores = packed(DecodeTensor::QsaScores, lanes);
     h.qsaMask = packed(DecodeTensor::QsaMask, lanes);
     h.qsaBlocks = packed(DecodeTensor::QsaBlocks, lanes);
+    h.mtpStreams = packed(DecodeTensor::MtpStreams, lanes);
+    h.mtpInput = packed(DecodeTensor::MtpInput, lanes);
+    h.mtpTokens = packed(DecodeTensor::MtpTokens, lanes);
     h.qsaBlockLaneBytes = sizes_[static_cast<uint32_t>(DecodeTensor::QsaBlocks)];
     return h;
   }

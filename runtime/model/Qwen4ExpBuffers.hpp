@@ -25,6 +25,8 @@ struct Qwen4Geometry final {
   uint32_t indexerTopBlocks = 0;
   uint32_t hiddenSize = 0;
   uint32_t maximumContextTokens = 0;
+  // The MTP head's full-attention blocks (0 or 1), the last of the KV layers.
+  uint32_t mtpLayers = 0;
 
   [[nodiscard]] constexpr explicit operator bool() const noexcept { return hyperConnections != 0; }
   [[nodiscard]] constexpr uint32_t streamWidth() const noexcept { return hyperConnections * hiddenSize; }
@@ -75,6 +77,11 @@ struct Qwen4Buffers final {
   uint64_t qsaBlockLaneBytes = 0;
   uint32_t qsaScoreRows = 0;
   uint32_t qsaMaskWords = 0;
+  // The MTP head: its fp32 streams, the bf16 inputs of its eh projection
+  // (rows of 2 * hidden per stream) and a draft step's tokens.
+  metal::MetalBuffer mtpStreams;
+  metal::MetalBuffer mtpInput;
+  metal::MetalBuffer mtpTokens;
 };
 
 } // namespace splash::model

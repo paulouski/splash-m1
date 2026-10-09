@@ -34,18 +34,26 @@ void requireCompatibleModelPackage(const ModelPackage &package) {
 namespace {
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layout,
-                         const QwenTargetFiles<Qwen3_8Layout> &files) {
+                         const QwenTargetFiles<Qwen3_8Layout> &files, GgufMtpLoader *) {
   return loadQwen3_8Weights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
-                         const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
+                         const QwenTargetFiles<Qwen3_6MoeLayout> &files, GgufMtpLoader *) {
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
-                         const QwenTargetFiles<Qwen4ExpLayout> &files) {
-  return loadQwen4ExpWeights(backend, layout, files);
+                         const QwenTargetFiles<Qwen4ExpLayout> &files, GgufMtpLoader *mtp) {
+  return loadQwen4ExpWeights(backend, layout, files, mtp);
+}
+
+// The one GGUF of a Qwen3.8-Flash-Next MTP head, in mtp/ beside the target's
+// shards.
+std::filesystem::path findMtpGguf(const std::filesystem::path &targetDirectory) {
+  const std::vector<std::filesystem::path> files = findTargetGgufs(targetDirectory / "mtp");
+  if (files.size() != 1) throw std::invalid_argument("mtp/ must hold one GGUF");
+  return files.front();
 }
 
 } // namespace
@@ -83,20 +91,26 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
         // needs normal memory pressure, which the residency of the files
         // mapped before it would take away on a Mac with little memory.
         const auto read = [&](const QwenTargetFiles<Layout> &files,
-                              std::span<const PreparedWeight> target, const auto &prepareTarget) {
+                              std::span<const PreparedWeight> target, const auto &prepareTarget,
+                              GgufMtpLoader *mtp = nullptr) {
           prepared.insert(prepared.end(), target.begin(), target.end());
+          if (mtp) prepared.insert(prepared.end(), mtp->weights().begin(), mtp->weights().end());
           if (!prepared.empty()) PreparedWeights().requireSpace(prepared, check);
           if (vision) static_cast<void>(vision->prepare());
           if (draft) draft->prepare();
           prepareTarget();
-          return readTarget(backend, layout, files);
+          if (mtp) mtp->prepare();
+          return readTarget(backend, layout, files, mtp);
         };
         if constexpr (Layout::ggufOnly) {
           if (result.descriptor.targetSource != TargetSource::Gguf)
             throw std::invalid_argument("this model's weights load from a GGUF only");
           GgufTargetLoader loader(backend, findTargetGgufs(directory), ggufTargetGeometry(layout),
                                   admitConversion);
-          return read(loader, loader.weights(), [&] { loader.prepare(); });
+          std::optional<GgufMtpLoader> mtp;
+          if (result.descriptor.proposals == ProposalSource::Mtp)
+            mtp.emplace(backend, findMtpGguf(directory), ggufTargetGeometry(layout), admitConversion);
+          return read(loader, loader.weights(), [&] { loader.prepare(); }, mtp ? &*mtp : nullptr);
         } else {
           switch (result.descriptor.targetSource) {
           case TargetSource::Packed:
@@ -209,6 +223,12 @@ uint64_t preparedModelWeightBytes(const ModelPaths &paths, const ModelDescriptor
             return PreparedImages<affine::Image>::bytes(affineTargetImages(layout, source));
         },
         descriptor.target);
+  }
+  if (descriptor.proposals == ProposalSource::Mtp) {
+    WeightSource source(findMtpGguf(paths.target));
+    const gguf::Image image =
+        gguf::planMtpImage(GgufFile(source), ggufTargetGeometry(std::get<Qwen4ExpLayout>(descriptor.target)));
+    bytes += PreparedImages<gguf::Image>::bytes(std::span(&image, 1));
   }
   if (descriptor.hasDraft() && descriptor.draftFromCheckpoint())
     bytes += PreparedImages<affine::Image>::bytes(draftCheckpointImages(descriptor.draft));

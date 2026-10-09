@@ -64,12 +64,18 @@ public:
     writeBlocks(scratch_.prefillBlocks, uint64_t{rowBegin} * sizeof(Qwen4QsaBlock), position, rows);
   }
 
+  // The QSA blocks a step's rows complete depend on the position alone, and an MTP draft pools them before the
+  // proposals (hence the PLE rows) exist.
+  void beforeDecodeLane(uint64_t /*requestId*/, uint32_t lane, uint32_t /*stateLane*/, uint64_t position,
+                        uint32_t /*anchor*/) override {
+    writeBlocks(scratch_.decodeBlocks.at(lane), 0, position, ExecutionLimits::targetVerifyRows);
+  }
+
   void beforeVerifyLane(uint64_t requestId, uint32_t lane, uint64_t position,
                         std::span<const uint32_t> rowTokens) override {
     const auto rows = static_cast<uint32_t>(rowTokens.size());
     gather(position, rowTokens, historyOf(requestId), scratch_.decodeRows.at(lane), scratch_.decodeSlots.at(lane), 0,
            uint64_t{lane} * rows * heads_, rows);
-    writeBlocks(scratch_.decodeBlocks.at(lane), 0, position, rows);
   }
 
   void afterCommit(uint64_t requestId, std::optional<uint32_t> previousAnchor,

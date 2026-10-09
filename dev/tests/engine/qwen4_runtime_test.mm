@@ -133,9 +133,70 @@ private:
   std::vector<uint8_t> row_;
 };
 
+// One decode cycle of a request: what it emitted and how many of its proposals the verify accepted.
+struct Cycle final {
+  std::vector<uint32_t> outputs;
+  uint32_t drafted = 0, accepted = 0;
+};
+
+// The family the model installs, which also records what each verify stages: the rows' tokens and the PLE rows
+// and slots the family left for them.
+class SpyFamily final : public model::FamilyRuntime {
+public:
+  struct Call final {
+    uint64_t request = 0;
+    uint32_t lane = 0;
+    uint64_t position = 0;
+    std::vector<uint32_t> tokens, slots;
+    std::vector<uint8_t> staged;
+  };
+
+  SpyFamily(std::unique_ptr<model::FamilyRuntime> inner, uint32_t heads) : inner_(std::move(inner)), heads_(heads) {}
+  void attach(const model::FamilyScratch &scratch) override {
+    scratch_ = scratch;
+    inner_->attach(scratch);
+  }
+  void onActivate(uint64_t request, uint32_t lane, std::span<const uint32_t> prompt) override {
+    inner_->onActivate(request, lane, prompt);
+  }
+  void onEnd(uint64_t request) override { inner_->onEnd(request); }
+  void beforePrefillSequence(uint64_t request, uint64_t position, std::span<const uint32_t> input,
+                             uint32_t rowBegin) override {
+    inner_->beforePrefillSequence(request, position, input, rowBegin);
+  }
+  void beforeDecodeLane(uint64_t request, uint32_t lane, uint32_t stateLane, uint64_t position,
+                        uint32_t anchor) override {
+    inner_->beforeDecodeLane(request, lane, stateLane, position, anchor);
+  }
+  void beforeVerifyLane(uint64_t request, uint32_t lane, uint64_t position,
+                        std::span<const uint32_t> rowTokens) override {
+    inner_->beforeVerifyLane(request, lane, position, rowTokens);
+    Call call{request, lane, position, {rowTokens.begin(), rowTokens.end()}, {}, {}};
+    const uint64_t count = uint64_t{heads_} * rowTokens.size();
+    const auto *slots = static_cast<const uint32_t *>(scratch_.decodeSlots.at(lane).contents());
+    call.slots.assign(slots, slots + count);
+    const auto *rows = static_cast<const uint8_t *>(scratch_.decodeRows.at(lane).contents());
+    call.staged.assign(rows, rows + count * pleRowBytes);
+    calls.push_back(std::move(call));
+  }
+  void afterCommit(uint64_t request, std::optional<uint32_t> previous, std::span<const uint32_t> selected) override {
+    inner_->afterCommit(request, previous, selected);
+  }
+
+  std::vector<Call> calls;
+
+private:
+  std::unique_ptr<model::FamilyRuntime> inner_;
+  uint32_t heads_;
+  model::FamilyScratch scratch_;
+};
+
 struct Run final {
+  uint64_t id = 0;
+  std::vector<uint32_t> prompt;
   std::vector<uint32_t> tokens;
   std::vector<ops::TokenLogprobs> logprobs;
+  std::vector<Cycle> cycles;
   uint32_t drafted = 0, accepted = 0;
 };
 
@@ -181,13 +242,13 @@ public:
   }
 
   // `count` greedy tokens after `prompt`: the first prefill's selection, then decode cycles.
-  Run generate(const std::vector<uint32_t> &prompt, uint32_t count, uint32_t logprobs = 0) {
-    return generateTogether({prompt}, count, logprobs).front();
+  Run generate(const std::vector<uint32_t> &prompt, uint32_t count, uint32_t logprobs = 0, uint32_t chunk = 0) {
+    return generateTogether({prompt}, count, logprobs, chunk).front();
   }
 
   // The same for several prompts at once, decoded in one batch of that width.
   std::vector<Run> generateTogether(const std::vector<std::vector<uint32_t>> &prompts, uint32_t count,
-                                    uint32_t logprobs = 0) {
+                                    uint32_t logprobs = 0, uint32_t chunk = 0) {
     std::vector<ModelRequest> requests(prompts.size());
     std::vector<Run> runs(prompts.size());
     std::vector<uint64_t> positions;
@@ -197,8 +258,13 @@ public:
       requests[i].maxNewTokens = count;
       requests[i].logprobs = logprobs;
       begin(requests[i]);
-      const ModelStepResult first = prefill(requests[i].id, prompts[i], 0, static_cast<uint32_t>(prompts[i].size()));
-      require(first.failure.empty() && first.outputTokens.empty(), "the prompt's prefill did not leave an anchor");
+      runs[i].id = requests[i].id;
+      runs[i].prompt = prompts[i];
+      const auto size = static_cast<uint32_t>(prompts[i].size());
+      for (uint32_t at = 0; at < size; at += chunk ? chunk : size) {
+        const ModelStepResult first = prefill(requests[i].id, prompts[i], at, std::min(chunk ? chunk : size, size - at));
+        require(first.failure.empty() && first.outputTokens.empty(), "the prompt's prefill did not leave an anchor");
+      }
       positions.push_back(prompts[i].size());
     }
     const auto done = [&] {
@@ -226,6 +292,7 @@ public:
         run.logprobs.insert(run.logprobs.end(), results[i].outputLogprobs.begin(), results[i].outputLogprobs.end());
         run.drafted += results[i].draftedTokens;
         run.accepted += results[i].acceptedDraftTokens;
+        run.cycles.push_back({results[i].outputTokens, results[i].draftedTokens, results[i].acceptedDraftTokens});
         positions[i] += results[i].outputTokens.size() - results[i].outputTokensWithoutKv;
       }
     }
@@ -292,6 +359,75 @@ Closeness compare(const std::vector<float> &left, const std::vector<float> &righ
 
 uint32_t argmax(const std::vector<float> &values) {
   return static_cast<uint32_t>(std::max_element(values.begin(), values.end()) - values.begin());
+}
+
+// The MTP head of a Flash-Next target as unsloth ships it: its block 4 is a full-attention block (here the target's
+// last one, weights and all) with the nextn tensors beside it, whose values are random.
+void writeMtpHead(const std::filesystem::path &path, const SmallTarget &target) {
+  const model::gguf::TargetGeometry &g = target.geometry;
+  const uint64_t streams = g.streamWidth();
+  std::vector<Tensor> head;
+  for (const Tensor &tensor : target.tensors) {
+    if (tensor.name.starts_with("blk.3.")) {
+      head.push_back(tensor);
+      head.back().name = "blk.4." + tensor.name.substr(6);
+    } else if (tensor.name.starts_with("output_hc_")) {
+      head.push_back(tensor);
+      head.back().name = "blk.4.nextn.hc_head_" + tensor.name.substr(10);
+    }
+  }
+  // Norm values near one come from their name; the tensors take their real names after.
+  const auto add = [&](const std::string &name, std::vector<uint64_t> dims, uint32_t type) {
+    uint64_t elements = 1;
+    for (uint64_t dim : dims) elements *= dim;
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    head.push_back({name, std::move(dims), type, test_gguf::Bytes(elements / traits.blockElements * traits.blockBytes)});
+  };
+  const size_t nextn = head.size();
+  add("blk.4.nextn.eh_proj.weight", {2ull * g.hiddenSize, g.hiddenSize}, kQ8_0);
+  add("blk.4.nextn.enorm_norm.weight", {g.hiddenSize}, model::ggml::kF32);
+  add("blk.4.nextn.hnorm_norm.weight", {streams}, model::ggml::kF32);
+  std::vector<Tensor> fresh(head.begin() + static_cast<std::ptrdiff_t>(nextn), head.end());
+  randomizeRealistic(fresh, 2200);
+  for (size_t i = 0; i < fresh.size(); ++i) {
+    head[nextn + i].data = std::move(fresh[i].data);
+    auto &name = head[nextn + i].name;
+    if (const size_t at = name.find("_norm"); at != std::string::npos) name.erase(at, 5);
+  }
+  std::vector<test_gguf::Key> keys = metadata(g);
+  keys[1] = test_gguf::uint32Key("qwen4exp.block_count", g.layers + 1);
+  model::gguf::TargetGeometry noPle = g;
+  noPle.pleNgram = 0;
+  qwen4Metadata(keys, noPle, 1);
+  splash::test::writeFile(path, test_gguf::file(keys, head));
+}
+
+// Each cycle's accepted count is the longest prefix of its proposals that the target's tokens (the emitted ones,
+// then the next cycle's anchor) repeat, and the proposals reach the verify rows as they were drafted.
+void checkAcceptance(const Run &run, const std::vector<SpyFamily::Call> &calls, uint32_t steps) {
+  require(calls.size() == run.cycles.size(), "a decode cycle staged no verify rows");
+  size_t distinct = 0, accepted = 0, partial = 0;
+  std::vector<char> seen(kVocabulary);
+  for (size_t cycle = 0; cycle + 2 < run.cycles.size(); ++cycle) {
+    const Cycle &now = run.cycles[cycle];
+    const std::vector<uint32_t> &proposals = calls[cycle].tokens;
+    require(proposals[0] == now.outputs[0], "a verify's first row is not the cycle's anchor");
+    require(now.drafted == steps, "a cycle drafted another number of proposals");
+    std::vector<uint32_t> target(now.outputs.begin() + 1, now.outputs.end());
+    target.push_back(run.cycles[cycle + 1].outputs[0]);
+    uint32_t expected = 0;
+    while (expected < steps && expected < target.size() && proposals[expected + 1] == target[expected]) ++expected;
+    require(now.accepted == expected && now.outputs.size() == expected + 1,
+            "a cycle accepted " + std::to_string(now.accepted) + " proposals, the target's tokens repeat " +
+                std::to_string(expected));
+    for (uint32_t i = 1; i <= steps; ++i) distinct += !std::exchange(seen[proposals[i]], char{1});
+    accepted += expected;
+    partial += expected > 0 && expected < steps;
+  }
+  std::printf("MTP: %zu cycles, %zu distinct proposal tokens, accepted %zu, cycles with a partial acceptance %zu\n",
+              run.cycles.size(), distinct, accepted, partial);
+  require(distinct > 1, "the MTP head proposes one token only");
+  require(accepted > 0, "no MTP proposal was ever accepted");
 }
 
 void run(const std::string &metallib) {
@@ -421,6 +557,85 @@ void run(const std::string &metallib) {
               together[1].tokens == alone.tokens,
           "a request decoded in a batch of two selects other tokens than alone");
   std::printf("batch of two == each alone\n");
+
+  // The MTP head drafts: the same model with the head, whose proposals the verify checks. The tokens it selects
+  // are the draft-less decode's (a near tie may go either way); its drafts are what a verify consumed.
+  writeMtpHead(dir / "mtp.gguf", target);
+  model::GgufMtpLoader head(backend, dir / "mtp.gguf", geometry, {});
+  head.prepare();
+  model::Qwen4ExpLayout withMtp = layout;
+  withMtp.mtpLayers = 1;
+  model::ModelPackage mtpPackage;
+  mtpPackage.descriptor = model::makeModelDescriptor(
+      "qwen4-mtp-test", withMtp,
+      model::nullDraftLayout(layout.hiddenSize, layout.vocabularySize, layout.capturedHiddenSize()),
+      ops::VisionLayout{.outputHiddenSize = layout.hiddenSize});
+  mtpPackage.descriptor.proposals = model::ProposalSource::Mtp;
+  mtpPackage.descriptor.targetSource = model::TargetSource::Gguf;
+  mtpPackage.descriptor.visionSource = model::VisionSource::None;
+  mtpPackage.target = model::loadQwen4ExpWeights(backend, withMtp, loader, &head);
+  mtpPackage.draft.layout = mtpPackage.descriptor.draft;
+  const uint32_t heads = layout.pleHeads();
+  auto spyOwner = std::make_unique<SpyFamily>(model::makeFamilyRuntime(mtpPackage), heads);
+  SpyFamily &spy = *spyOwner;
+  Session drafting(backend, mtpPackage, std::move(spyOwner));
+  constexpr uint32_t steps = 3;
+
+  const Run mtp = drafting.generate(prompt, 40, 8);
+  std::printf("MTP decode: %zu tokens in %zu cycles, drafted %u accepted %u:", mtp.tokens.size(), mtp.cycles.size(),
+              mtp.drafted, mtp.accepted);
+  for (const uint32_t token : mtp.tokens) std::printf(" %u", token);
+  std::printf("\n");
+  checkAcceptance(mtp, spy.calls, steps);
+  for (size_t i = 0; i < mtp.tokens.size(); ++i) {
+    if (mtp.tokens[i] == decoded.tokens[i]) continue;
+    // The verify rows round differently from the draft-less cycle's: only a near tie may flip.
+    std::vector<uint32_t> before = prompt;
+    before.insert(before.end(), decoded.tokens.begin(), decoded.tokens.begin() + static_cast<std::ptrdiff_t>(i));
+    const std::vector<float> logits = session.score(before, 128);
+    const float best = logits[argmax(logits)];
+    std::printf("MTP decode differs at token %zu: %u against %u, logits %.3f and %.3f of best %.3f\n", i,
+                mtp.tokens[i], decoded.tokens[i], logits[mtp.tokens[i]], logits[decoded.tokens[i]], best);
+    require(logits[mtp.tokens[i]] > best - 0.3F && logits[decoded.tokens[i]] > best - 0.3F,
+            "the MTP decode left the draft-less decode before a near tie");
+    break;
+  }
+  std::printf("MTP decode == draft-less decode (or a near tie)\n");
+
+  // Chunked prefill carries the head's streams and KV across chunks, and a batch keeps each lane's own: the same
+  // prompts propose the same tokens.
+  const size_t spyBefore = spy.calls.size();
+  const Run chunked = drafting.generate(prompt, 24, 0, 33);
+  require(std::equal(chunked.tokens.begin(), chunked.tokens.end(), mtp.tokens.begin()),
+          "chunked prefill changed the MTP decode's tokens");
+  // The chunks round the head's KV differently, so a later proposal may flip at a near tie; the first proposal,
+  // which every carried stream and KV row of the prompt feeds, may not.
+  size_t compared = 0, flipped = 0;
+  for (size_t cycle = 0; cycle + 1 < std::min(chunked.cycles.size(), mtp.cycles.size()); ++cycle, ++compared) {
+    const std::vector<uint32_t> &whole = spy.calls[cycle].tokens, &parts = spy.calls[spyBefore + cycle].tokens;
+    require(whole[1] == parts[1], "chunked prefill changed the MTP head's first proposal");
+    flipped += whole != parts;
+  }
+  std::printf("MTP: chunked prefill (33) flipped a later proposal in %zu of %zu cycles\n", flipped, compared);
+  require(flipped * 5 <= compared, "chunked prefill changed the MTP head's proposals");
+  const std::vector<Run> batch = drafting.generateTogether({prompt, shorter}, 16);
+  const Run single = drafting.generate(shorter, 16);
+  require(batch[0].tokens == std::vector<uint32_t>(mtp.tokens.begin(), mtp.tokens.begin() + 16) &&
+              batch[1].tokens == single.tokens,
+          "a batch of two changed the MTP decode's tokens");
+  const auto proposalsOf = [&](uint64_t id) {
+    std::vector<std::vector<uint32_t>> proposals;
+    for (const SpyFamily::Call &call : spy.calls)
+      if (call.request == id) proposals.push_back(call.tokens);
+    return proposals;
+  };
+  for (const auto &[left, right] : {std::pair{batch[0].id, mtp.id}, std::pair{batch[1].id, single.id}}) {
+    const auto a = proposalsOf(left), b = proposalsOf(right);
+    for (size_t cycle = 0; cycle + 1 < std::min(a.size(), b.size()); ++cycle)
+      require(a[cycle] == b[cycle], "a batch of two changed the MTP head's proposals");
+  }
+  std::printf("MTP: chunked prefill and a batch of two propose what the one request does\n");
+
 }
 
 } // namespace

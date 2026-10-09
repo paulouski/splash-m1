@@ -70,7 +70,7 @@ QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) {
   QwenTargetGeometry result = moeGeometry(layout);
   result.qwen4 = {layout.hyperConnections, layout.hyperRank,        layout.pleLayer,  layout.pleNgram,
                   layout.pleHeadsPerNgram, layout.pleHeadDimension, layout.pleConvolutionTaps,
-                  layout.indexerTopBlocks, layout.hiddenSize, layout.maximumContextTokens};
+                  layout.indexerTopBlocks, layout.hiddenSize, layout.maximumContextTokens, layout.mtpLayers};
   return result;
 }
 
@@ -82,7 +82,7 @@ void requireWeights(const Weights &weights,
         return std::holds_alternative<QwenAttentionWeights>(layer.mixer);
       }));
   if (!geometry.valid() || weights.layers.size() != geometry.layers ||
-      attentionLayers != geometry.kvLayout.attentionLayers) {
+      attentionLayers + geometry.qwen4.mtpLayers != geometry.kvLayout.attentionLayers) {
     throw std::invalid_argument(
         "Qwen target weights do not match execution geometry");
   }
@@ -213,6 +213,19 @@ QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights) {
       qwenTargetGeometry(static_cast<const QwenTargetWeights<Qwen4ExpLayout, Qwen4ExpLayerWeights> &>(weights));
   QwenTargetGeometry head;
   includeHyper(head, weights.finalHyper);
+  // The MTP head's projections, run at the target's decode and prefill widths.
+  if (weights.mtp) {
+    const Qwen4MtpWeights &mtp = *weights.mtp;
+    includeHyper(head, mtp.head);
+    includeLayerExtras(head, mtp.block);
+    std::visit([&](const auto &mixer) {
+      includeProjection(head, mixer.inputProjection);
+      includeProjection(head, mixer.outputProjection);
+    }, mtp.block.mixer);
+    includeProjection(head, mtp.embedHidden);
+    if (mtp.block.ffn.layout() != geometry.moeLayout)
+      throw WeightStoreError("the MoE blocks of a target must share one weight layout");
+  }
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections}) {
     shapes->insert(shapes->end(), head.decodeProjections.begin(), head.decodeProjections.end());
     std::sort(shapes->begin(), shapes->end());
@@ -632,12 +645,20 @@ void QwenTarget::addEmbedding(metal::CommandGraph &graph,
                       rows);
 }
 
+void QwenTarget::addMtpDraft(metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
+                             std::span<const SplashKvLayer> kvLayers,
+                             std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes,
+                             uint32_t steps) const {
+  if (!hasMtp()) throw std::logic_error("the target has no MTP head");
+  qwen4_->addMtpDraft(graph, buffers, kvLayers, chunks, lanes, steps);
+}
+
 void QwenTarget::addStateCommit(metal::CommandGraph &graph,
                                 QwenTargetCommitBuffers buffers,
                                 uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");
-  if (qwen4_) qwen4_->addPleCommit(graph, buffers, lanes);
+  if (qwen4_) qwen4_->addStateCommit(graph, buffers, lanes);
   ops::GDN::addCommit(
       graph,
       {std::move(buffers.packed), std::move(buffers.mixed),

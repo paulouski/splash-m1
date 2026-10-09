@@ -36,6 +36,12 @@ void putQwen4(const RuntimeGeometry &geometry, uint64_t rows, uint64_t scoreRows
   put(Tensor::QsaScores, bytesFor<float>(scoreRows * q.qsaMaskWords() * 32));
   put(Tensor::QsaMask, bytesFor<uint32_t>(rows * q.qsaMaskWords()));
   put(Tensor::QsaBlocks, blockRecords * sizeof(Qwen4QsaBlock));
+  // The MTP head's streams, eh-projection inputs and draft tokens.
+  if (q.mtpLayers) {
+    put(Tensor::MtpStreams, bytesFor<float>(rows * q.streamWidth()));
+    put(Tensor::MtpInput, bytesFor<uint16_t>(rows * 2 * q.streamWidth()));
+    put(Tensor::MtpTokens, bytesFor<uint32_t>(rows));
+  }
 }
 
 } // namespace

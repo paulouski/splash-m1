@@ -180,14 +180,15 @@ ModelDescriptor qwen36Descriptor(std::string name) {
                              vision);
 }
 
-// Qwen3.8-Flash-Next decodes without a DFlash2 draft (its MTP head is a later
-// proposal source) and loads from a GGUF only; it serves no vision tower.
-ModelDescriptor qwen4ExpDescriptor(std::string name) {
-  constexpr Qwen4ExpLayout target;
+// Qwen3.8-Flash-Next decodes without a DFlash2 draft (with `mtp`, its MTP head
+// proposes) and loads from a GGUF only; it serves no vision tower.
+ModelDescriptor qwen4ExpDescriptor(std::string name, bool mtp) {
+  Qwen4ExpLayout target;
+  target.mtpLayers = mtp ? 1 : 0;
   ModelDescriptor result = makeModelDescriptor(
       std::move(name), target, nullDraftLayout(target.hiddenSize, target.vocabularySize, target.capturedHiddenSize()),
       kQwen4ExpVisionLayout);
-  result.proposals = ProposalSource::None;
+  result.proposals = mtp ? ProposalSource::Mtp : ProposalSource::None;
   result.targetSource = TargetSource::Gguf;
   return result;
 }
@@ -552,7 +553,12 @@ ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
     ModelDescriptor result;
     if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
     else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
-    else if (type == "qwen4_exp_text") result = qwen4ExpDescriptor(name);
+    else if (type == "qwen4_exp_text") {
+      // The MTP head proposes when mtp/ holds it (SPLASH_MTP=0 leaves it out).
+      const char *setting = std::getenv("SPLASH_MTP");
+      result = qwen4ExpDescriptor(name, !draftDirectory && std::filesystem::exists(targetDirectory / "mtp") &&
+                                            !(setting && std::string_view(setting) == "0"));
+    }
     else throw std::invalid_argument("unsupported model architecture: " + type);
     if (text)
       std::visit([&](const auto &layout) {
@@ -561,7 +567,7 @@ ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
             {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
             {"head_dim", layout.attentionHeadDimension}});
       }, result.target);
-    if (!draftDirectory && result.proposals != ProposalSource::None) {
+    if (!draftDirectory && result.proposals == ProposalSource::DFlash2) {
       const ModelDescriptor draftless = std::visit(
           [&](const auto &layout) {
             return makeModelDescriptor(
@@ -575,7 +581,7 @@ ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
     }
     result.targetSource = detectTargetFormat(targetDirectory);
 
-    if (draftDirectory && result.proposals == ProposalSource::None)
+    if (draftDirectory && result.proposals != ProposalSource::DFlash2)
       throw std::invalid_argument("this model has no DFlash2 draft");
     if (draftDirectory) {
       NSDictionary *draft = readObject(*draftDirectory / "config.json", "draft config");

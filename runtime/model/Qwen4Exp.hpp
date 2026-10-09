@@ -64,7 +64,8 @@ struct Qwen4ExpLayout final : QwenHybridLayout<1> {
   uint32_t pleHeadDimension = 160;
   uint32_t pleConvolutionTaps = 4;
   uint32_t pleEosToken = 248044;
-  // The MTP head's full-attention blocks (0 or 1).
+  // The MTP head's full-attention blocks (0 or 1); its KV is the last
+  // attention layer of the KV pages.
   uint32_t mtpLayers = 0;
 
   constexpr Qwen4ExpLayout()
@@ -99,15 +100,23 @@ struct Qwen4ExpLayout final : QwenHybridLayout<1> {
   // Rows of the PLE convolution's history: (taps - 1) taps pleNgram rows apart.
   [[nodiscard]] constexpr uint32_t pleHistory() const noexcept { return (pleConvolutionTaps - 1) * pleNgram; }
   // Every page also holds the QSA indexer's keys; every state cell the PLE
-  // convolution's history (bf16 rows of every stream).
+  // convolution's history (bf16 rows of every stream) and, with the MTP head,
+  // the streams of the position before the next one it reads (fp32).
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     kv::Layout layout = QwenHybridLayout<1>::kvLayout();
+    layout.attentionLayers += mtpLayers;
     layout.indexDimension = indexerHeadDimension;
     return layout;
   }
+  [[nodiscard]] constexpr uint64_t pleHistoryBytes() const noexcept {
+    return uint64_t{pleHistory()} * streamWidth() * sizeof(uint16_t);
+  }
+  [[nodiscard]] constexpr uint64_t mtpCarriedBytes() const noexcept {
+    return mtpLayers ? uint64_t{streamWidth()} * sizeof(float) : 0;
+  }
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
     GdnStateLayout layout = QwenHybridLayout<1>::gdnStateLayout();
-    layout.auxiliaryBytes = uint64_t{pleHistory()} * streamWidth() * sizeof(uint16_t);
+    layout.auxiliaryBytes = pleHistoryBytes() + mtpCarriedBytes();
     return layout;
   }
   // Tokens the indexer selects.
