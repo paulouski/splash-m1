@@ -67,7 +67,10 @@ void requireQwen4Layout(const Qwen4ExpLayout &layout) {
       !layout.indexerHeads || !layout.indexerHeadDimension || !layout.indexerTopBlocks ||
       !layout.indexerBlockTokens || layout.pleNgram < 2 || layout.pleNgram > 4 || !layout.pleHeadsPerNgram ||
       !layout.pleHeadDimension || !layout.pleConvolutionTaps || layout.pleLayer >= layout.layers ||
-      layout.isFullAttentionLayer(layout.pleLayer) || layout.mtpLayers > 1)
+      layout.isFullAttentionLayer(layout.pleLayer) || layout.mtpLayers > 1 ||
+      // The compiled QSA kernels (metal/abi/Qwen4.h).
+      layout.indexerHeads != 4 || layout.indexerHeadDimension != 128 || layout.indexerBlockTokens != 4 ||
+      layout.pleHeads() > 16)
     throw WeightStoreError("Qwen3.8-Flash-Next layout is inconsistent");
 }
 

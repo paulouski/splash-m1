@@ -375,6 +375,39 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   }
 }
 
+// A family's auxiliary state (Flash-Next's PLE history) sits after the GDN
+// layers' in the cell, is counted in its bytes, is zeroed at a cold start and
+// travels with the cell through a restore; none of it exists at 0 bytes.
+void testAuxiliaryState(metal::MetalBackend &backend) {
+  constexpr model::GdnStateLayout plain{1, 3, 128, 1, 128, 128};
+  model::GdnStateLayout withAux = plain;
+  withAux.auxiliaryBytes = 1000;
+  require(plain.cellBytes() == plain.convolutionBytes() + plain.recurrentBytes() &&
+              withAux.cellBytes() == plain.cellBytes() + alignUp(1000),
+          "auxiliary state is not counted after the GDN layers");
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
+                          queryHostAvailableMemory, 0);
+  const model::CompositeStateLayout layout{withAux, {1, 1, 4}};
+  model::QwenStateStorage storage(backend, governor.allocationAdmission(), layout, nullptr);
+  require(static_cast<bool>(storage.tryActivateLane(0, 5)), "lane activation failed");
+  const model::GdnParityBuffers &gdn = storage.current(0);
+  require(gdn.auxiliary.sizeBytes() == 1000 && storage.next(0).auxiliary.sizeBytes() == 1000,
+          "a cell has no auxiliary buffer of its bytes");
+  fill(gdn.stateBase, 9);
+  const auto image = bytesOf(gdn.auxiliary);
+  require(image.size() == 1000 && std::any_of(image.begin(), image.end(), [](uint8_t b) { return b; }),
+          "the auxiliary buffer is not part of the cell");
+  storage.clearForColdStart(0);
+  const auto cleared = bytesOf(storage.current(0).auxiliary);
+  require(std::all_of(cleared.begin(), cleared.end(), [](uint8_t b) { return b == 0; }),
+          "a cold start left auxiliary state");
+  storage.releaseLane(0, 5);
+  model::QwenStateStorage none(backend, governor.allocationAdmission(), {plain, {1, 1, 4}}, nullptr);
+  require(static_cast<bool>(none.tryActivateLane(0, 6)) && !none.current(0).auxiliary,
+          "a layout without auxiliary bytes has an auxiliary buffer");
+  none.releaseLane(0, 6);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -386,6 +419,7 @@ void run(const std::string &metallib) {
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);
   testStateSmallerThanSlot(backend);
+  testAuxiliaryState(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
       queryHostAvailableMemory, 0);

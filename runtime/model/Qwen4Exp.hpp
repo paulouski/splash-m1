@@ -96,6 +96,20 @@ struct Qwen4ExpLayout final : QwenHybridLayout<1> {
   // size from 2 to pleNgram, and their values.
   [[nodiscard]] constexpr uint32_t pleHeads() const noexcept { return (pleNgram - 1) * pleHeadsPerNgram; }
   [[nodiscard]] constexpr uint32_t pleWidth() const noexcept { return pleHeads() * pleHeadDimension; }
+  // Rows of the PLE convolution's history: (taps - 1) taps pleNgram rows apart.
+  [[nodiscard]] constexpr uint32_t pleHistory() const noexcept { return (pleConvolutionTaps - 1) * pleNgram; }
+  // Every page also holds the QSA indexer's keys; every state cell the PLE
+  // convolution's history (bf16 rows of every stream).
+  [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
+    kv::Layout layout = QwenHybridLayout<1>::kvLayout();
+    layout.indexDimension = indexerHeadDimension;
+    return layout;
+  }
+  [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
+    GdnStateLayout layout = QwenHybridLayout<1>::gdnStateLayout();
+    layout.auxiliaryBytes = uint64_t{pleHistory()} * streamWidth() * sizeof(uint16_t);
+    return layout;
+  }
   // Tokens the indexer selects.
   [[nodiscard]] constexpr uint32_t indexerTokens() const noexcept { return indexerTopBlocks * indexerBlockTokens; }
   bool operator==(const Qwen4ExpLayout &) const = default;

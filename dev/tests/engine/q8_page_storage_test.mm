@@ -76,6 +76,68 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
     require(next == extent + storage.extentBytes(), "the spans of an extent's pages do not cover it");
 }
 
+// A layout with QSA index regions (Flash-Next) adds each layer's index keys
+// and pooled keys after every layer's K/V region; without them every size
+// is the K/V layout's alone. The spans of an extent's pages still cover it
+// once, the index spans where indexPlacement puts them.
+void qsaIndexRegions(metal::MetalBackend &backend) {
+    static_assert(kvLayout.bytesPerModelPage() == kvLayout.attentionLayers * kvLayout.bytesPerLayerPage() &&
+                      kvLayout.indexBytesPerLayerPage() == 0,
+                  "a layout without an index changed its page bytes");
+    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+        kv::Layout layout{12, 2, 256, format};
+        layout.indexDimension = 128;
+        const uint32_t extentPages = layout.extentAlignmentPages();
+        require(extentPages % kv::Layout{12, 2, 256, format}.extentAlignmentPages() == 0 &&
+                    layout.bytesPerModelPage() ==
+                        12 * (layout.bytesPerLayerPage() + layout.indexBytesPerLayerPage()),
+                "an index layout's page bytes are not its K/V and index bytes");
+        require(layout.indexKeyBytesPerLayerPage() == 32 * 128 * 2 &&
+                    layout.indexPooledBytesPerLayerPage() == 8 * 128 * 4,
+                "an index layout's per-page index bytes are wrong");
+        kv::PageStorage storage(backend, [](uint64_t, const std::function<void()> &allocate) {
+            allocate();
+            return metal::AllocationResult{};
+        }, layout, extentPages, extentPages);
+        require(static_cast<bool>(storage.allocateExtent(0)), "an index layout's extent was refused");
+        const uint32_t tensors = format == kv::Format::Int8 ? 4 : 2;
+        std::byte *const extent = storage.spans(0).front().data();
+        std::vector<std::span<std::byte>> all;
+        for (uint32_t index = 0; index < extentPages; ++index) {
+            const auto spans = storage.spans(index);
+            require(spans.size() == layout.attentionLayers * (tensors + 2), "a page lacks its index spans");
+            const uint64_t keys = layout.indexKeyBytesPerLayerPage(), pooled = layout.indexPooledBytesPerLayerPage();
+            for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
+                const auto placement = storage.indexPlacement(layer);
+                const auto &keySpan = spans[layout.attentionLayers * tensors + 2 * layer];
+                const auto &pooledSpan = spans[layout.attentionLayers * tensors + 2 * layer + 1];
+                require(keySpan.data() == extent + placement.keysOffset + index * keys && keySpan.size() == keys &&
+                            pooledSpan.data() == extent + placement.pooledOffset + index * pooled &&
+                            pooledSpan.size() == pooled,
+                        "a page's index spans are not where indexPlacement puts them");
+            }
+            all.insert(all.end(), spans.begin(), spans.end());
+        }
+        std::sort(all.begin(), all.end(), [](auto left, auto right) { return left.data() < right.data(); });
+        std::byte *next = extent;
+        for (const auto span : all) {
+            require(span.data() == next, "the spans of an index layout's extent leave a gap or overlap");
+            next += span.size();
+        }
+        require(next == extent + storage.extentBytes(), "the spans of an index layout's extent do not cover it");
+        requireThrows<std::out_of_range>([&] { (void)storage.indexPlacement(12); }, "a layer past the layout had an index");
+    }
+    requireThrows<std::out_of_range>(
+        [&] {
+            kv::PageStorage plain(backend, [](uint64_t, const std::function<void()> &allocate) {
+                allocate();
+                return metal::AllocationResult{};
+            }, kvLayout, 128, 128);
+            (void)plain.indexPlacement(0);
+        },
+        "a layout without an index placed one");
+}
+
 // Writing a table from an index on leaves the entries before it as they
 // are, and refuses an index past the pages.
 void entriesFromFirst(const kv::PageStorage &storage, const metal::MetalBuffer &table) {
@@ -289,6 +351,7 @@ void run(const std::string &metallib) {
         require(!bf16.isAllocated(extent) && bf16.allocateExtent(1),
                 "BF16 extent could not be allocated again after release");
     }
+    qsaIndexRegions(backend);
     std::cout << "KV page storage tests passed\n";
 }
 
