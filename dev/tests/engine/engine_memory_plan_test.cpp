@@ -509,9 +509,20 @@ void testDeviceValidationMessageNamesWhatTheMacHas() {
 
 #endif
 
+void testDraftlessModelPlans() {
+  const ModelMemoryProfile draftless = test::modelMemoryProfile(2 * kGiB, 0, 1 * kGiB);
+  require(!draftless.validationError(), "a model without draft weights was refused");
+  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), draftless);
+  require(plan.breakdown().draftWeightsBytes == 0 &&
+              plan.breakdown().fixedRuntimeBytes + 1 * kGiB ==
+                  test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB).fixedRuntimeBytes(),
+          "a draftless plan charged draft weights");
+}
+
 int main() {
   try {
     testUnifiedElasticBudget();
+    testDraftlessModelPlans();
     testBf16BudgetAndStatus();
     testMinimumHoldsTheWarmupRunway();
     testMinimumRequiredBytesIsThePlans();

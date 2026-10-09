@@ -169,7 +169,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
   const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+      geometry.hasDraft ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                        : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -346,6 +347,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   // Includes the vocabulary head shared with the draft, whose own
   // projections are affine.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p, laneCount));
+  if (geometry.hasDraft)
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},

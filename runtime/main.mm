@@ -181,7 +181,7 @@ private:
 void printUsage(std::string_view executable) {
   writeStderrLine(
       "usage: " + std::string(executable) +
-      " serve-native MODEL_DIRECTORY | TARGET_DIRECTORY DRAFT_DIRECTORY"
+      " serve-native MODEL_DIRECTORY | TARGET_DIRECTORY [DRAFT_DIRECTORY]"
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--prefill-mode bounded|full]"
@@ -274,7 +274,18 @@ bool namesDirectory(std::string_view argument) {
   return !argument.empty() && std::filesystem::is_directory(std::filesystem::path(argument), error);
 }
 
+// A directory with its own config.json and no target/ is a lone target.
+bool isBareTarget(std::string_view argument) {
+  std::error_code error;
+  const std::filesystem::path path(argument);
+  return std::filesystem::is_regular_file(path / "config.json", error) &&
+         !std::filesystem::exists(path / "target", error);
+}
+
+// A target with no draft decodes without one.
 model::ModelDescriptor inspectModel(const model::ModelPaths &paths) {
+  if (paths.draft.empty())
+    return model::inspectLocalModel(paths.target, std::nullopt);
   if (paths.target.filename() == "target" && paths.draft.filename() == "draft" &&
       paths.target.parent_path() == paths.draft.parent_path()) {
     const std::filesystem::path root = paths.target.parent_path();
@@ -355,6 +366,9 @@ NativeArguments parseArguments(int argc, char **argv) {
                                 target.parent_path() == draft.parent_path()
                             ? model::ModelPaths::ofRoot(target.parent_path())
                             : model::ModelPaths{target, draft, {}};
+    result.model = inspectModel(result.modelPaths);
+  } else if (isBareTarget(argv[2])) {
+    result.modelPaths = {canonicalDirectory(argv[2], "TARGET_DIRECTORY"), {}, {}};
     result.model = inspectModel(result.modelPaths);
   } else {
     const std::filesystem::path root = requireModelRoot(argv[2]);

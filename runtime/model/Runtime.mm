@@ -297,7 +297,9 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   QwenTarget targetModel;
-  DFlashDraft draftModel;
+  // Null without a DFlash2 draft (ProposalSource::None): proposals then come
+  // from prompt lookup alone.
+  std::unique_ptr<DFlashDraft> draftModel;
   uint32_t prefillRows = kPrefillRows;
   uint32_t decodeLanes = kLaneCount;
   // Read once at startup (SPLASH_DECODE_LADDER and friends); --decode-ladder
@@ -327,8 +329,12 @@ struct Runtime::Impl {
                                             value.backend, operators);
                         },
                         value.package.target)),
-        draftModel(value.package.draft, value.backend, operators),
+        draftModel(value.package.hasDraft()
+                       ? std::make_unique<DFlashDraft>(value.package.draft, value.backend, operators)
+                       : nullptr),
         prefillRows(value.prefillRows), decodeLanes(value.decodeLanes) {
+    if (package.descriptor.proposals == ProposalSource::Mtp)
+      throw std::invalid_argument("MTP proposals are not implemented");
     if (states.layout() != package.stateLayout() ||
         kvPages.layout() != package.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -1246,7 +1252,7 @@ struct Runtime::Impl {
 
   void addPackedDraftContext(CommandGraph &graph,
                              const PackedPrefillBatch &batch) {
-    if (!batch.capturedRows)
+    if (!batch.capturedRows || !draftModel)
       return;
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor); };
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
@@ -1260,7 +1266,7 @@ struct Runtime::Impl {
         span.ring = states.draft(sequence.entry->stateLane);
       }
     }
-    draftModel.addContextPrefill(
+    draftModel->addContextPrefill(
         graph,
         {p(PrefillTensor::Captured), p(PrefillTensor::ProjectionSums),
          p(PrefillTensor::ContextProjected), p(PrefillTensor::ContextHidden),
@@ -1513,7 +1519,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
+    draftModel->addDecode(graph, std::move(buffers),
                          targetModel.vocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
@@ -1525,7 +1531,7 @@ struct Runtime::Impl {
       anchors[lane] = *entry.pendingToken;
       policies[lane] = samplingPolicy(entry);
     }
-    draftModel.addSelection(
+    draftModel->addSelection(
         graph,
         {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
@@ -1647,6 +1653,8 @@ struct Runtime::Impl {
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
     }
+    if (!draftModel)
+      return;
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->packed(tensor, lanes);
@@ -1665,7 +1673,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers),
+    draftModel->addContextCommit(graph, std::move(buffers),
                                 std::span(startPositions).first(lanes));
   }
 
@@ -2493,6 +2501,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     laneResult.currentAnchor = *entry.pendingToken;
     const bool arLane = !constrained && width == 1 &&
                         entry.decodePolicy.mode() == engine::DecodeMode::Ar;
+    const bool noDraft = !impl_->draftModel;
     laneResult.maximumRetained =
         arLane ? 1u : std::min(remaining, kDecodeRows);
 
@@ -2507,10 +2516,24 @@ Runtime::decodeAsync(const BatchPlan &plan,
       laneResult.singleRow = impl_->decodeSingleRow && !laneResult.lookup;
       if (laneResult.singleRow)
         laneResult.maximumRetained = 1;
-      if ((laneResult.singleRow || arLane) && Impl::samplingEnabled(entry))
+      // Without a draft a lookup miss decodes like an AR lane.
+      const bool noProposal = noDraft && !laneResult.lookup;
+      if (noProposal)
+        laneResult.maximumRetained = 1;
+      if ((laneResult.singleRow || arLane || noProposal) &&
+          Impl::samplingEnabled(entry))
         impl_->stageRejectedProposal(lane, lookupTokens);
       laneResult.draftSkipped =
-          arLane || laneResult.lookup || laneResult.singleRow;
+          arLane || laneResult.lookup || laneResult.singleRow || noDraft;
+    } else if (noDraft) {
+      // Valid in-vocabulary ids: a constrained lane's grammar simulation
+      // reads them. Only the anchor's row is retained.
+      laneResult.maximumRetained = 1;
+      laneResult.draftSkipped = true;
+      uint32_t *proposals = impl_->proposedTokens(lane);
+      std::fill_n(proposals, kDraftProposalTokens, *entry.pendingToken);
+      if (Impl::samplingEnabled(entry))
+        impl_->stageLookupSamplingProposal(lane, proposals);
     }
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;

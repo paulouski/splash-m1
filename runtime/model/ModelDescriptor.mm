@@ -501,8 +501,20 @@ ModelDescriptor inspectModelPackage(const std::filesystem::path &root) {
   }
 }
 
+DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize,
+                                  uint32_t capturedHiddenSize) {
+  DFlashDraftLayout layout;
+  layout.layers = 1;
+  layout.hiddenSize = hiddenSize;
+  layout.vocabularySize = vocabularySize;
+  layout.kvHeads = 1;
+  layout.attentionHeadDimension = 8;
+  layout.targetHiddenSize = capturedHiddenSize;
+  return layout;
+}
+
 ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
-                                  const std::filesystem::path &draftDirectory) {
+                                  const std::optional<std::filesystem::path> &draftDirectory) {
   @autoreleasepool {
     NSDictionary *text = textConfigOf(targetDirectory);
     const auto type = requireString(text, @"model_type", "text model type");
@@ -519,10 +531,24 @@ ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
           {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
           {"head_dim", layout.attentionHeadDimension}});
     }, result.target);
+    if (!draftDirectory) {
+      const ModelDescriptor draftless = std::visit(
+          [&](const auto &layout) {
+            return makeModelDescriptor(
+                name, layout,
+                nullDraftLayout(layout.hiddenSize, layout.vocabularySize, layout.capturedHiddenSize()),
+                result.vision);
+          },
+          result.target);
+      result = draftless;
+      result.proposals = ProposalSource::None;
+    }
     result.targetSource = detectTargetFormat(targetDirectory);
 
-    NSDictionary *draft = readObject(draftDirectory / "config.json", "draft config");
-    validateSourceDraft(draft, result);
+    if (draftDirectory) {
+      NSDictionary *draft = readObject(*draftDirectory / "config.json", "draft config");
+      validateSourceDraft(draft, result);
+    }
 
     // Local serving loads no vision tower.
     result.visionSource = VisionSource::None;

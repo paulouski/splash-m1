@@ -65,7 +65,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   std::vector<PreparedWeight> prepared;
   if (vision) prepared.push_back(vision->weight());
   std::optional<DraftCheckpointLoader> draft;
-  if (result.descriptor.draftFromCheckpoint()) {
+  if (result.descriptor.hasDraft() && result.descriptor.draftFromCheckpoint()) {
     draft.emplace(backend, paths.draft, result.descriptor.draft, admitConversion);
     prepared.insert(prepared.end(), draft->weights().begin(), draft->weights().end());
   }
@@ -106,11 +106,14 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(
-      backend,
-      draft ? DraftFiles(std::ref(*draft))
-            : DraftFiles(PackedDraftFiles{backend, paths.draft, result.descriptor.draft}),
-      result.descriptor.draft);
+  if (result.descriptor.hasDraft())
+    result.draft = loadDFlashDraftWeights(
+        backend,
+        draft ? DraftFiles(std::ref(*draft))
+              : DraftFiles(PackedDraftFiles{backend, paths.draft, result.descriptor.draft}),
+        result.descriptor.draft);
+  else
+    result.draft.layout = result.descriptor.draft;
   result.vision = loadVisionWeights(backend, paths, result.descriptor, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
@@ -188,13 +191,13 @@ uint64_t preparedModelWeightBytes(const ModelPaths &paths, const ModelDescriptor
         },
         descriptor.target);
   }
-  if (descriptor.draftFromCheckpoint())
+  if (descriptor.hasDraft() && descriptor.draftFromCheckpoint())
     bytes += PreparedImages<affine::Image>::bytes(draftCheckpointImages(descriptor.draft));
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += preparedVisionBytes(descriptor.vision);
   for (const auto &[directory, packed] :
        {std::pair{&paths.target, descriptor.targetSource == TargetSource::Packed},
-        std::pair{&paths.draft, !descriptor.draftFromCheckpoint()},
+        std::pair{&paths.draft, descriptor.hasDraft() && !descriptor.draftFromCheckpoint()},
         std::pair{&paths.vision, descriptor.visionSource == VisionSource::Packed}}) {
     if (!packed) continue;
     for (const auto &entry : std::filesystem::recursive_directory_iterator(*directory)) {

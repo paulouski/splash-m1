@@ -39,6 +39,9 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
+  // Without a DFlash2 draft, `draft` is a placeholder whose operator
+  // workspaces are never planned.
+  bool hasDraft = true;
 
   [[nodiscard]] static RuntimeGeometry from(const ModelPackage &package,
                                             kv::Format format) {
@@ -48,6 +51,7 @@ struct RuntimeGeometry final {
         package.target);
     result.target.kvLayout = package.targetKvLayout(format);
     result.draft = package.draft.layout;
+    result.hasDraft = package.hasDraft();
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -420,7 +424,7 @@ public:
     // One private gate buffer is reused serially by the target dense FFN (when
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace(
+    const uint64_t draft = !geometry.hasDraft ? 0 : operators.gateUpWorkspace(
         {geometry.draft.intermediateSize, geometry.draft.hiddenSize, ops::WeightLayout::Affine64});
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)

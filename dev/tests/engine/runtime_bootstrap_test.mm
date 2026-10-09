@@ -147,6 +147,37 @@ void testInstalledManifestBindsExecutionGeometry() {
 // The identity reports the loaded model's digests in lowercase hex and the
 // KV layout as loaded; a malformed digest or a missing build id fails before
 // anything is served.
+// A local target directory with no draft is a model that decodes without a
+// DFlash2 draft: it names no draft, and its descriptor stays valid.
+void testLocalTargetWithoutDraftHasNoDraft() {
+  TemporaryModelRoot root;
+  constexpr model::Qwen3_8Layout layout;
+  std::ostringstream config;
+  config << R"({"text_config":{"model_type":"qwen3_5_text")"
+         << ",\"hidden_size\":" << layout.hiddenSize
+         << ",\"num_hidden_layers\":" << layout.layers
+         << ",\"vocab_size\":" << layout.vocabularySize
+         << ",\"max_position_embeddings\":" << layout.maximumContextTokens
+         << ",\"num_attention_heads\":" << layout.attentionQueryHeads
+         << ",\"num_key_value_heads\":" << layout.attentionKvHeads
+         << ",\"head_dim\":" << layout.attentionHeadDimension << "}}";
+  std::ofstream(root.path() / "config.json") << config.str();
+  std::ofstream(root.path() / "model.gguf") << "x";
+  const model::ModelDescriptor descriptor =
+      model::inspectLocalModel(root.path(), std::nullopt);
+  require(!descriptor.hasDraft() && descriptor.proposals == model::ProposalSource::None &&
+              descriptor.valid() &&
+              descriptor.targetSource == model::TargetSource::Gguf &&
+              descriptor.draft == model::nullDraftLayout(layout.hiddenSize, layout.vocabularySize,
+                                                         layout.capturedHiddenSize()),
+          "a local target without a draft was not described as draftless");
+  try {
+    static_cast<void>(model::inspectLocalModel(root.path(), root.path() / "draft"));
+    throw std::runtime_error("a missing draft directory was accepted");
+  } catch (const std::invalid_argument &) {
+  }
+}
+
 void testRuntimeCacheIdentityReportsTheLoadedModel() {
   constexpr kv::Layout int8Layout{16, 4, 256};
   constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
@@ -693,6 +724,7 @@ void testProtocolLimitsFollowTheModel() {
 int main() {
   try {
     testInstalledManifestBindsExecutionGeometry();
+    testLocalTargetWithoutDraftHasNoDraft();
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();

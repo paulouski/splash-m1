@@ -15,7 +15,8 @@ namespace {
 using splash::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
-                      uint64_t stateStagingBytes = 0) {
+                      uint64_t stateStagingBytes = 0,
+                      uint64_t draftBytes = 1 * kGiB) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -28,7 +29,7 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
   ModelMemoryProfile model =
-      test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
+      test::modelMemoryProfile(2 * kGiB, draftBytes, visionBytes);
   model.footprint.stateStagingBytes = stateStagingBytes;
   return test::requireMemoryPlan(device, model);
 }
@@ -85,6 +86,18 @@ void testOptionalVisionAudit() {
   const auto textOnly = plan(0);
   require(auditActualMemory(textOnly, report(textOnly)).valid,
           "text-only warmup requires nonexistent vision weights");
+}
+
+void testOptionalDraftAudit() {
+  const auto draftless = plan(kGiB, 0, 0);
+  require(auditActualMemory(draftless, report(draftless)).valid,
+          "draftless warmup requires nonexistent draft weights");
+  const auto drafted = plan();
+  ActualMemoryReport missing = report(drafted);
+  missing.draftWeightsBytes = 0;
+  require(auditActualMemory(drafted, missing).error ==
+              MemoryAuditError::MissingMeasurement,
+          "a planned draft must report its weights");
 }
 
 // Weights are planned from what loaded, so their rows have no bound of their
@@ -212,6 +225,7 @@ int main() {
   try {
     testUnifiedDynamicAudit();
     testOptionalVisionAudit();
+    testOptionalDraftAudit();
     testUnreportedAllocationsCountAgainstReserves();
     testStateStagingHasItsOwnBound();
     testFixedCategoryAndPeakFailures();

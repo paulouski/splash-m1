@@ -270,6 +270,39 @@ void checkDecodeLanes(const model::ModelPackage &package) {
   }
 }
 
+// A target without a DFlash2 draft keeps a valid composite state and loads
+// and plans with no draft workspace.
+void checkDraftless(const model::ModelPackage &dense) {
+  model::ModelPackage draftless = package<model::Qwen3_8Weights>();
+  const auto &layout = std::get<model::Qwen3_8Weights>(draftless.target).layout;
+  draftless.descriptor = model::makeModelDescriptor(
+      "draftless test", layout,
+      model::nullDraftLayout(layout.hiddenSize, layout.vocabularySize, layout.capturedHiddenSize()),
+      dense.descriptor.vision);
+  draftless.descriptor.proposals = model::ProposalSource::None;
+  draftless.draft.layout = draftless.descriptor.draft;
+  require(dense.hasDraft() && !draftless.hasDraft() && draftless.descriptor.valid(),
+          "a draftless descriptor must be valid and name no draft");
+  model::requireCompatibleModelPackage(draftless);
+  require(draftless.stateLayout().cachedBytes() < dense.stateLayout().cachedBytes(),
+          "a draftless state must not carry a DFlash2 ring");
+  draftless.descriptor.proposals = model::ProposalSource::Mtp;
+  require(!draftless.hasDraft(), "an MTP source must not run a DFlash2 draft");
+  draftless.descriptor.proposals = model::ProposalSource::None;
+  for (const uint32_t family : {7U, 9U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    ops::ExecutionPlans plans(device);
+    const auto geometry = model::RuntimeGeometry::from(draftless, kv::Format::Int8);
+    require(!geometry.hasDraft, "a draftless geometry reached the draft planner");
+    const auto planned = model::plannedRuntimeMemory(device, draftless, plans);
+    const auto reference = model::plannedRuntimeMemory(device, dense, plans);
+    require(planned.sharedDecodePlannedAllocatedBytes < reference.sharedDecodePlannedAllocatedBytes &&
+                planned.laneStatePlannedAllocatedBytes < reference.laneStatePlannedAllocatedBytes,
+            "a draftless plan must shrink the decode arena and lane state");
+  }
+}
+
 int main() {
   try {
     checkUnsizedProjection();
@@ -280,6 +313,7 @@ int main() {
     checkPrefillRowCap(dense);
     checkDecodeLanes(dense);
     checkLaneScratch(dense);
+    checkDraftless(dense);
     checkLaneScratch(sparse);
     std::cout << "model execution plans: PASS (two paired geometries)\n";
   } catch (const std::exception &error) {

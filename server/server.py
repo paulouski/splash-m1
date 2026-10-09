@@ -2022,7 +2022,7 @@ def parse_args(argv=None):
         "draft_root",
         nargs="?",
         metavar="DRAFT_DIRECTORY",
-        help="draft directory when MODEL_DIRECTORY is a local target directory",
+        help="draft directory when MODEL_DIRECTORY is a local target directory; omitted, the model decodes without a draft",
     )
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument(

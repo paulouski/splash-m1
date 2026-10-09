@@ -31,6 +31,7 @@ struct ModelPackage final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
+  [[nodiscard]] bool hasDraft() const noexcept { return descriptor.hasDraft(); }
   [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;

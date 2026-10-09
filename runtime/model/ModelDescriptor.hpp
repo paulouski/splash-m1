@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -22,6 +23,10 @@ using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
 enum class TargetSource : uint8_t { Packed, Mlx, Gguf, PrismMlx };
 enum class VisionSource : uint8_t { Packed, Mlx, Gguf, None };
 
+// What proposes the tokens a verify step checks: a DFlash2 draft, nothing
+// (prompt lookup alone), or the model's own MTP head (not implemented).
+enum class ProposalSource : uint8_t { DFlash2, None, Mtp };
+
 // Package metadata validated before weight buffers are loaded. The engine
 // consumes capabilities; model loading consumes the concrete layouts.
 struct ModelDescriptor final {
@@ -35,6 +40,13 @@ struct ModelDescriptor final {
   // Container selection belongs to loading; runtime dispatch follows each weight.
   TargetSource targetSource = TargetSource::Packed;
   VisionSource visionSource = VisionSource::Packed;
+  // Without a DFlash2 draft, `draft` is nullDraftLayout: no draft runs, but
+  // the composite state keeps its small ring.
+  ProposalSource proposals = ProposalSource::DFlash2;
+
+  [[nodiscard]] bool hasDraft() const noexcept {
+    return proposals == ProposalSource::DFlash2;
+  }
 
   // A source model's draft is a DFlash2 checkpoint; a packed package carries
   // its draft packed.
@@ -59,14 +71,21 @@ struct ModelDescriptor final {
 [[nodiscard]] ModelDescriptor
 inspectModelPackage(const std::filesystem::path &root);
 
+// The draft layout of a target that runs no DFlash2 draft: one tiny ring
+// keeps the composite state and cache bookkeeping those of a draft.
+[[nodiscard]] DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize,
+                                                uint32_t vocabularySize,
+                                                uint32_t capturedHiddenSize);
+
 // A local target and draft directory, read directly with no shared root and
 // no model.json/manifest.json: the target's own config.json (its text_config
 // unwrapped, same as SafetensorsCheckpoint.mm) and the draft's own
 // config.json name the model; target_format is inferred from the target
 // directory's own files (a GGUF file, else safetensors shards). Always
-// language-only: this path serves no vision tower.
+// language-only: this path serves no vision tower. Without a draft directory
+// the model decodes with no DFlash2 draft (ProposalSource::None).
 [[nodiscard]] ModelDescriptor
 inspectLocalModel(const std::filesystem::path &targetDirectory,
-                  const std::filesystem::path &draftDirectory);
+                  const std::optional<std::filesystem::path> &draftDirectory);
 
 } // namespace splash::model
