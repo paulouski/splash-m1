@@ -829,7 +829,9 @@ struct MetalBackend::Impl {
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
                 throw MetalBackendError(
-                    "threadsPerThreadgroup exceeds pipeline capability");
+                    "threadsPerThreadgroup " + std::to_string(item.threadCount) +
+                    " exceeds pipeline '" + item.source->pipelineName + "' capability " +
+                    std::to_string(item.pipeline.maxTotalThreadsPerThreadgroup));
             }
         }
 
