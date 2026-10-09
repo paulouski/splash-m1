@@ -54,8 +54,9 @@ inline MoeQ4Slab moe_q4_slab(device uchar *packed, device uchar *shared,
 
 // A GGUF expert pass's weights for one tile (ops/MoE.cpp, metal/abi/MoE.h):
 // every routed expert of the projection is one image segment of experts *
-// output_size rows, so expert e's planes start at tile e * output_size /
-// QUANT_TILE_ROWS (metal/abi/QuantFormat.h); the shared expert (id `experts`) has a segment
+// output_size rows, so expert e's planes start at row e * output_size, on tile
+// e * output_size / QUANT_TILE_ROWS (metal/abi/QuantFormat.h) when output_size
+// is a multiple of it; the shared expert (id `experts`) has a segment
 // of its own, possibly in another format. w1 is the meta plane for formats
 // without a second plane, as the host binds it.
 struct MoeGgufSegment {
@@ -75,4 +76,23 @@ inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams
   const ulong rows = ulong(expert) * p.output_size, groups = p.input_size / 32;
   return {w0 + rows * groups * f.plane0_bytes, w1 + rows * groups * f.plane1_bytes,
           meta + rows * (groups / f.meta_groups) * f.meta_bytes, p.routed_format};
+}
+
+// moe_gguf_segment for experts of an output_size that is not a multiple of QUANT_TILE_ROWS: their planes do not start
+// on a plane tile, so the routed segment keeps its base and the expert's first row (moe_gguf_first_row) joins the
+// origin of the tile's columns.
+inline uint moe_gguf_first_row(uint expert, constant MoeGgufExpertParams &p) {
+  return expert == p.experts ? 0u : expert * p.output_size;
+}
+
+template <bool Unaligned>
+inline MoeGgufSegment moe_gguf_segment_for(uint expert, constant MoeGgufExpertParams &p, device uchar *w0,
+                                           device uchar *w1, device uchar *meta, device uchar *shared_w0,
+                                           device uchar *shared_w1, device uchar *shared_meta) {
+  if constexpr (Unaligned) {
+    if (expert == p.experts) return {shared_w0, shared_w1, shared_meta, p.shared_format};
+    return {w0, w1, meta, p.routed_format};
+  } else {
+    return moe_gguf_segment(expert, p, w0, w1, meta, shared_w0, shared_w1, shared_meta);
+  }
 }

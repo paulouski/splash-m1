@@ -26,10 +26,18 @@ struct MoeShape final {
   uint32_t expertFormat = GGUF_FMT_COUNT;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return (weightLayout == WeightLayout::Affine64 || weightLayout == WeightLayout::Block32) &&
-           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 256 &&
+    // GGUF blocks route up to 512 experts (Qwen3.8-Flash-Next) whose width
+    // fills 64-column tiles; affine slabs 256 experts of 256-column tiles.
+    const bool gguf = weightLayout == WeightLayout::Block32;
+    return (weightLayout == WeightLayout::Affine64 || gguf) &&
+           hiddenSize && hiddenSize % 256 == 0 && experts && experts <= (gguf ? 512u : 256u) &&
            expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+           expertIntermediateSize && expertIntermediateSize % (gguf ? 64u : 256u) == 0;
+  }
+  // The router's scores per row: one per thread of the select and group
+  // kernels (256, or 512 for more experts).
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return experts > 256 ? 512 : 256;
   }
   // Routed experts followed by the shared expert.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
@@ -39,9 +47,9 @@ struct MoeShape final {
 };
 
 // A GGUF expert projection: every routed expert in one segment of experts *
-// N rows, expert e's planes from tile e * N / 256 on (moe_gguf_segment in
-// kernels/common/moe_expert_slab.h), and the shared expert's segment, whose
-// format may differ.
+// N rows, expert e's planes from row e * N on (moe_gguf_segment in
+// kernels/common/moe_expert_slab.h; a tile when N is a multiple of
+// QUANT_TILE_ROWS), and the shared expert's segment, whose format may differ.
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;

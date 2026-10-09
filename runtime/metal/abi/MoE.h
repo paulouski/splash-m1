@@ -64,8 +64,8 @@ static_assert(sizeof(MoeExpertParams) == 32,
 
 // A GGUF expert pass (ops/MoE.cpp): every routed expert of the projection
 // is one image segment of experts * output_size rows, expert e's planes
-// starting at tile e * output_size / QUANT_TILE_ROWS; the shared expert (id `experts`)
-// has a segment of its own. Formats are GGUF_FMT_* (metal/abi/QuantFormat.h).
+// starting at row e * output_size (a tile when output_size is a multiple of
+// QUANT_TILE_ROWS); the shared expert (id `experts`) has a segment of its own. Formats are GGUF_FMT_* (metal/abi/QuantFormat.h).
 struct MoeGgufExpertParams {
   uint32_t input_size;
   uint32_t output_size; // per expert

@@ -100,10 +100,10 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   const uint64_t groupedRows = uint64_t{tiles} * tileRows;
   const uint32_t widest = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint32_t outputWidth = splitExperts ? widest : shape.hiddenSize;
-  // The router's rows x 256 fp32 scores live in the grouped input until the
-  // gather overwrites them. Register plans also hold the down pass's Table16
-  // tiles there.
-  const uint64_t scoreBytes = uint64_t{rows} * 256 * sizeof(float);
+  // The router's fp32 scores, a row of routerWidth() expert slots per row,
+  // live in the grouped input until the gather overwrites them. Register
+  // plans also hold the down pass's Table16 tiles there.
+  const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
   const bool table16 = ggufTile == MoeGgufTile::Register;
   const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
@@ -225,10 +225,15 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
                      projection.shared.plane1Slot(), projection.shared.meta, output,
                      scratch.expertOutput});
     const bool mma = plan.configuration().ggufTile == MoeGgufTile::Mma;
+    // Experts of a width that is not a whole plane tile start inside one; only
+    // the MMA kernels address those (moe_gguf_first_row).
+    const bool unaligned = n % QUANT_TILE_ROWS != 0;
+    if (unaligned && !mma)
+      throw std::invalid_argument("GGUF experts of this width run on the MMA expert tile only");
     const std::string kernel = table16 ? "moe_expert_gguf_sg"
                                        : (mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") +
                                              std::to_string(plan.tileRows());
-    graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings),
+    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : ""), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
               {n / GGUF_TILE_COLUMNS, tiles, 1}, {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1});
@@ -243,7 +248,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
     graph.add("moe_prepare_table16",
               {scratch.expertIntermediate, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},
-              intermediate, {tiles, intermediate / 256, 1});
+              intermediate, {tiles, (intermediate + 255) / 256, 1});
   pass(weights.down, false,
        table16 ? scratch.groupedInput : scratch.expertIntermediate,
        scratch.expertOutput, hidden, intermediate);
@@ -296,14 +301,16 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                                    shape.expertsPerToken};
   const bool block = weights.layout() == WeightLayout::Block32;
   if (block) {
-    // fp32 scores of the F32 router in rows of 256, as the select kernel reads.
+    // fp32 scores of the F32 router in rows of routerWidth() expert slots, as
+    // the select kernel reads.
+    const uint32_t width = shape.routerWidth();
     addGgufFloat(graph, buffers.input, weights.blocks().router, scratch.groupedInput, rows,
-                 256, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
-    graph.add("moe_route_select_f32",
+                 width, 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
+    graph.add(width > 256 ? "moe_route_select_f32_e512" : "moe_route_select_f32",
               {scratch.groupedInput, buffers.input,
                weights.blocks().sharedScalarGate.plane0, scratch.selectedExperts,
                scratch.routingWeights},
-              routeParams, {rows, 1, 1});
+              routeParams, {rows, 1, 1}, {width, 1, 1});
   } else {
     const AffineMoeWeights &affine = weights.affine();
     const MoeRouteTile route = moeRouteTile(rows, plan.configuration().routeWideRows);
@@ -321,12 +328,12 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.routingWeights},
               routeParams, {rows, 1, 1});
   }
-  graph.add("moe_group_routes",
+  graph.add(shape.routerWidth() > 256 ? "moe_group_routes_e512" : "moe_group_routes",
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
             MoeGroupParams{rows, shape.expertsPerToken, tileRows,
                            shape.experts},
-            {1, 1, 1});
+            {1, 1, 1}, {shape.routerWidth(), 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",

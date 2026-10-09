@@ -599,6 +599,55 @@ void prefill(MetalBackend &backend, const Linear &linear) {
           "chunks and chunks of 8-32 rows (S 1 and 4) within fp64, equal to the 128-row tiles");
 }
 
+// ---------------------------------------------------------------- Qwen3.8-Flash-Next shapes
+// The dense projections whose widths are not multiples of the 256-row plane tile or the 256-input superblock: the
+// hyper-connection pair (K 320 to N 10240, K 10240 to N 320, Q8_0), the shared expert (N 640 gate/up, K 640 down)
+// and one routed expert's widths in each of the checkpoints' formats. The image holds N rounded up to whole plane
+// tiles (zero rows, repack), the matrix is N + 64 columns. The staged tile's decode (1-4 lanes, the fewest and the most
+// K splits whole 32-input groups allow) and the 128-row prefill tile, within fp64.
+void flashNextShapes(MetalBackend &backend, const Linear &linear) {
+  struct Shape {
+    uint32_t N, K;
+    std::vector<Fmt> formats;
+  };
+  constexpr uint32_t kColumnPadding = 64;
+  size_t checks = 0;
+  for (const Shape &shape : {Shape{10240, 320, {Q80}}, Shape{320, 10240, {Q80}},
+                             Shape{640, 2560, {Q5K, IQ1S, IQ2XXS, IQ2XS, IQ3XXS, IQ4NL}},
+                             Shape{2560, 640, {Q80, IQ4NL}}})
+    for (const Fmt f : shape.formats) {
+      const uint32_t N = shape.N, K = shape.K, columns = N + kColumnPadding;
+      const Tensor w = tensor(backend, f, N, K);
+      const Projection p = projection({&w}, columns);
+      const std::vector<float> x = activations(Inputs::Dense, kMaximumRows, K);
+      const std::vector<Dot> dots = products({&w}, columns, x, kMaximumRows);
+      uint32_t most = 1;
+      while (most < LinearConfig::kMaximumSplits && (K / 32) % (2 * most) == 0) most *= 2;
+      for (const uint32_t splits : {1u, most})
+        for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
+          const LinearWorkload wl = decode({columns, K}, lanes, LinearEpilogue::None);
+          const LinearPlan plan = Linear::plan(wl, config(LinearTile::GgufStaged, wl, splits), FloatOutput::BFloat16);
+          const std::string label = std::string(fmtName(f)) + " N=" + std::to_string(N) + " K=" + std::to_string(K) +
+                                    " decode S=" + std::to_string(splits) + " L=" + std::to_string(lanes);
+          const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(x, K, wl.rows, plan.storageRows()), {},
+                                  kPoisonNaN, N, label);
+          checkValues(out, dots, {}, {}, wl, wl.rows, N, true, label);
+          ++checks;
+        }
+      const LinearWorkload chunk{{columns, K}, 77, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32};
+      const LinearPlan plan = Linear::plan(chunk, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+      const std::string label = std::string(fmtName(f)) + " N=" + std::to_string(N) + " K=" + std::to_string(K) +
+                                " prefill 77 rows";
+      const std::vector<float> chunkX = activations(Inputs::Dense, plan.storageRows(), K);
+      const Outcome out = run(backend, linear, plan, p, nullptr, storageRows(chunkX, K, chunk.rows, plan.storageRows()),
+                              {}, kPoisonNaN, N, label);
+      checkValues(out, products({&w}, columns, chunkX, chunk.rows), {}, {}, chunk, chunk.rows, N, true, label);
+      ++checks;
+    }
+  section("Flash-Next shapes: K 320/N 10240, K 10240/N 320, N 640 and K 640 in the checkpoints' formats, " +
+          std::to_string(checks) + " decode and prefill runs within fp64, padding columns untouched");
+}
+
 // ---------------------------------------------------------------- split visibility
 // Two projections of a decode step run back to back and share one split scratch, as every GGUF projection of a step
 // does, at each pair of K splits the tile's policy (Apple9: register, Apple10: staged) picks for 8-80 cores. The
@@ -881,6 +930,7 @@ int main(int argc, char **argv) {
         gateUpPairs(backend, linear, tile);
       }
       prefill(backend, linear);
+      flashNextShapes(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);

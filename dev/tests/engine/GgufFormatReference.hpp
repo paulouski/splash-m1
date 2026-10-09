@@ -375,10 +375,12 @@ inline Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint
                      std::vector<float> *Ws = nullptr) {
   const QuantFormat &fi = kQuantFormats[f];
   const uint32_t G = K / 32, rb = rowBytes(f, K), units = G / fi.meta_groups;
+  // The image holds whole plane tiles: rows past N are zero.
+  const size_t imageRows = (N + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
   Packed p;
-  p.w0.assign((size_t)N * G * fi.plane0_bytes, 0);
-  p.w1.assign(fi.plane1_bytes ? (size_t)N * G * fi.plane1_bytes : 16, 0);
-  p.meta.assign((size_t)N * units * fi.meta_bytes, 0);
+  p.w0.assign(imageRows * G * fi.plane0_bytes, 0);
+  p.w1.assign(fi.plane1_bytes ? imageRows * G * fi.plane1_bytes : 16, 0);
+  p.meta.assign(imageRows * units * fi.meta_bytes, 0);
   if (Wf) Wf->assign((size_t)N * K, 0.f);
   if (Ws) Ws->assign((size_t)N * K, 0.f);
   for (uint32_t n = 0; n < N; ++n) {

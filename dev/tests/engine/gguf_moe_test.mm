@@ -79,10 +79,19 @@ using namespace gguf_reference;
 
 // K = 1024 on the hidden side (16 spans, four 256-input coefficient units)
 // and 512 on the intermediate side, as the 35B's experts.
-constexpr uint32_t kHidden = 1024;
-constexpr uint32_t kIntermediate = 512;
-constexpr uint32_t kExperts = 16;
-constexpr uint32_t kTopK = 4;
+// gguf-moe-e512 builds the test at Qwen3.8-Flash-Next's routing: 512
+// experts, top 10, a 640-wide intermediate (not a multiple of the 256-row
+// plane tile) and its formats.
+#ifndef GGUF_MOE_HIDDEN
+#define GGUF_MOE_HIDDEN 1024
+#define GGUF_MOE_INTERMEDIATE 512
+#define GGUF_MOE_EXPERTS 16
+#define GGUF_MOE_TOP_K 4
+#endif
+constexpr uint32_t kHidden = GGUF_MOE_HIDDEN;
+constexpr uint32_t kIntermediate = GGUF_MOE_INTERMEDIATE;
+constexpr uint32_t kExperts = GGUF_MOE_EXPERTS;
+constexpr uint32_t kTopK = GGUF_MOE_TOP_K;
 constexpr uint32_t kRoutes = kTopK + 1;
 constexpr uint32_t kMaximumRows = 263;
 
@@ -187,7 +196,7 @@ bool inside(float got, double exact, double bound) {
 int floatProjection(MetalBackend &backend) {
   int failures = 0;
   for (const uint32_t K : {512u, 2048u})
-    for (const uint32_t N : {16u, 64u, 256u}) {
+    for (const uint32_t N : {16u, 64u, 256u, 512u}) {
       const Tensor w = floating(backend, N, K, 0.05f);
       for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
         const bool accelerator = tile == FloatTile::NeuralAccelerator;
@@ -396,11 +405,31 @@ struct Model {
   std::array<Fmt, 6> formats{};
 };
 
-// Gate, up and down in formats f, f + 1, f + 2 and the shared expert's in
-// f + 3, f + 4, f + 5.
-Model makeModel(MetalBackend &backend, int f) {
+// The routed gate, up and down formats, then the shared expert's. The 35B-style
+// test rotates through every format (gate, up and down in formats f, f + 1, f + 2
+// and the shared expert's in f + 3, f + 4, f + 5); Flash-Next's has the UD-IQ1_S
+// and UD-Q2_K_XL checkpoints' (each gate/up format of the routed experts, IQ4_NL
+// down, Q5_K gate/up and Q8_0 down of the shared expert).
+#ifdef GGUF_MOE_FLASH_NEXT
+const std::vector<std::array<Fmt, 6>> kFormatSets = {
+    {IQ1S, IQ1S, IQ4NL, Q5K, Q5K, Q80}, {IQ2XXS, IQ2XXS, IQ4NL, Q5K, Q5K, Q80},
+    {IQ2XS, IQ2XS, IQ4NL, Q5K, Q5K, Q80}, {IQ3XXS, IQ3XXS, IQ4NL, Q5K, Q5K, Q80}};
+#else
+std::vector<std::array<Fmt, 6>> rotatingFormats() {
+  std::vector<std::array<Fmt, 6>> sets;
+  for (int f = 0; f < FMT_COUNT; ++f) {
+    std::array<Fmt, 6> set;
+    for (int i = 0; i < 6; ++i) set[i] = Fmt((f + i) % FMT_COUNT);
+    sets.push_back(set);
+  }
+  return sets;
+}
+const std::vector<std::array<Fmt, 6>> kFormatSets = rotatingFormats();
+#endif
+
+Model makeModel(MetalBackend &backend, const std::array<Fmt, 6> &formats) {
   Model m;
-  for (int i = 0; i < 6; ++i) m.formats[i] = Fmt((f + i) % FMT_COUNT);
+  m.formats = formats;
   m.router = floating(backend, kExperts, kHidden, 0.05f);
   m.sharedGate = floating(backend, 1, kHidden, 0.05f);
   const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden}, k[3] = {kHidden, kHidden, kIntermediate};
@@ -593,8 +622,8 @@ int moe(MetalBackend &backend) {
   const auto tileName = [](MoeGgufTile tile) {
     return tile == MoeGgufTile::Register ? "register" : tile == MoeGgufTile::Mma ? "mma     " : "staged  ";
   };
-  for (int f = 0; f < FMT_COUNT; ++f) {
-    const Model m = makeModel(backend, f);
+  for (const std::array<Fmt, 6> &formatSet : kFormatSets) {
+    const Model m = makeModel(backend, formatSet);
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
     std::string formats;
     for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
