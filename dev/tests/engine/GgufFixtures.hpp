@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -318,28 +319,77 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
   return keys;
 }
 
+// Values a model's weights have in place of randomize's: native blocks with
+// realistic scales, F32 tensors scaled by role (norm weights near 1, a
+// negative decay, small gates and taps), so a few layers of them stay finite.
+inline void randomizeRealistic(std::vector<Tensor> &tensors, uint32_t seed, float blockScale = 1.0F) {
+  std::mt19937 rng(seed);
+  for (Tensor &tensor : tensors) {
+    uint64_t rows = 1;
+    for (size_t i = 1; i < tensor.dims.size(); ++i) rows *= tensor.dims[i];
+    const uint32_t format = gguf_format_of(tensor.type);
+    if (format != GGUF_FMT_COUNT) {
+      // The blocks' weights are small beside the token embedding, so the embedding reaches the head through the
+      // residual streams and the logits depend on the prompt.
+      const float shrink = tensor.name.find("token_embd") != std::string::npos || tensor.name == "output.weight" ? 1.0F : blockScale;
+      std::uniform_real_distribution<float> range = gguf_reference::scaleRange(Fmt(format));
+      tensor.data = gguf_reference::makeNative(Fmt(format), uint32_t(rows), uint32_t(tensor.dims[0]), rng,
+                                               [&] { return gguf_reference::f2h(range(rng) * shrink); });
+      continue;
+    }
+    const bool bf16 = tensor.type == model::ggml::kBF16, exact = bf16 || readAsBfloat16(tensor);
+    tensor.data = floatValues(tensor.dims[0] * rows, ++seed);
+    const auto has = [&](const char *part) { return tensor.name.find(part) != std::string::npos; };
+    const bool decay = tensor.name.ends_with("ssm_a");
+    float scale = 1.0F;
+    if (decay || has("ssm_dt")) scale = 0.5F;
+    else if (has("_norm.weight") || has("ple_norm")) scale = 0.0F; // set to 1 + a few percent below
+    else if (has("inject") || has("indexer") || has("ssm_alpha") || has("ssm_beta") || has("ffn_gate_inp"))
+      scale = 0.05F;
+    else if (has("conv1d")) scale = 0.3F;
+    for (uint64_t i = 0; i < tensor.data.size() / 4; ++i) {
+      float value;
+      std::memcpy(&value, tensor.data.data() + i * 4, 4);
+      value = scale == 0.0F ? (1.0F + 0.05F * value) * (has("ple_norm_conv") ? 1000.0F : 1.0F)
+                            : decay ? -std::fabs(value) : value * scale;
+      uint32_t bits;
+      std::memcpy(&bits, &value, 4);
+      if (exact) bits &= 0xFFFF0000u;
+      std::memcpy(tensor.data.data() + i * 4, &bits, 4);
+    }
+    if (bf16) {
+      test_gguf::Bytes half;
+      for (size_t i = 2; i < tensor.data.size(); i += 4) half.insert(half.end(), tensor.data.begin() + i, tensor.data.begin() + i + 2);
+      tensor.data = std::move(half);
+    }
+  }
+}
+
 // A small qwen4exp (Qwen3.8-Flash-Next) target: 4 layers (GDN, PLE GDN, GDN,
 // full attention), 4 experts of width 640 (not a whole 256-row plane tile),
 // hyper rank 320 (not a whole 256-input superblock), 4 PLE heads of 160-value
-// rows and the arrays its metadata carries.
+// rows and the arrays its metadata carries. `gpu` gives it the mixer shapes
+// the compiled kernels run (16 key and 48 value GDN heads of 128, 24 query
+// heads over 2 KV heads), 8 experts and realistic weight values; the default
+// shapes are for the planner and loader only.
 inline constexpr std::array<uint32_t, 4> kPleVocabularies{101, 103, 107, 109};
-inline SmallTarget smallQwen4Target() {
+inline SmallTarget smallQwen4Target(bool gpu = false) {
   SmallTarget target;
   model::gguf::TargetGeometry &g = target.geometry;
   g.layers = 4;
   g.hiddenSize = 256;
   g.vocabularySize = 256;
-  g.gdnKeyHeads = 2;
-  g.gdnValueHeads = 8;
-  g.gdnHeadDimension = 64;
-  g.convolutionDimension = 768; // q and k of 2 heads, v of 8
-  g.attentionWidth = 512;
+  g.gdnKeyHeads = gpu ? 16 : 2;
+  g.gdnValueHeads = gpu ? 48 : 8;
+  g.gdnHeadDimension = gpu ? 128 : 64;
+  g.convolutionDimension = gpu ? 10240 : 768; // q and k of the key heads, v of the value heads
+  g.attentionWidth = gpu ? 6144 : 512;
   g.attentionKvHeads = 2;
   g.attentionHeadDimension = 256;
   g.rotaryPairs = 32;
   g.rotaryTheta = 1e7F;
   g.fullAttentionPeriod = 4;
-  g.experts = 4;
+  g.experts = gpu ? 8 : 4;
   g.expertsPerToken = 2;
   g.expertIntermediateSize = 640;
   g.hyperConnections = 4;
@@ -357,7 +407,7 @@ inline SmallTarget smallQwen4Target() {
   const uint64_t valueRows = uint64_t{g.gdnValueHeads} * g.gdnHeadDimension;
   const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
   const uint64_t pleWidth = uint64_t{g.pleNgram - 1} * g.pleHeadsPerNgram * g.pleHeadDimension;
-  const TensorTypes types{{"hc_attn_down.weight", kQ8_0}, {"hc_attn_up.weight", kQ8_0}, {"hc_ffn_down.weight", kQ8_0},
+  TensorTypes types{{"hc_attn_down.weight", kQ8_0}, {"hc_attn_up.weight", kQ8_0}, {"hc_ffn_down.weight", kQ8_0},
                           {"hc_ffn_up.weight", kQ8_0}, {"output_hc_down.weight", kQ8_0},
                           {"output_hc_up.weight", kQ8_0}, {"attn_qkv.weight", kQ5_K}, {"attn_gate.weight", kQ5_K},
                           {"ssm_out.weight", kQ6_K}, {"attn_q.weight", kQ5_K}, {"attn_k.weight", kQ5_K},
@@ -368,6 +418,9 @@ inline SmallTarget smallQwen4Target() {
                           {"indexer.q_proj.weight", model::ggml::kBF16}, {"indexer.k_proj.weight", model::ggml::kBF16},
                           {"per_layer_token_embd.weight", kIQ4_NL}, {"output.weight", kQ4_K},
                           {"token_embd.weight", kQ4_K}};
+  // Random Q4_K rows all lean one way (the minimum is subtracted); Q8_0's are centered, so the token embedding
+  // and the head tell the tokens apart.
+  if (gpu) types["token_embd.weight"] = types["output.weight"] = kQ8_0;
   std::vector<Tensor> &tensors = target.tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
     const uint32_t type = typeOf(types, name);
@@ -431,6 +484,7 @@ inline SmallTarget smallQwen4Target() {
   for (uint32_t size : kPleVocabularies) pleRows += size;
   add("per_layer_token_embd.weight", {g.pleHeadDimension, pleRows});
   add("token_embd.weight", {hidden, g.vocabularySize});
+  if (gpu) return randomizeRealistic(tensors, 1200), target;
   randomize(tensors, 1200);
   // randomize writes F32 values to every unquantized tensor: keep the bf16 halves of the BF16 ones.
   for (Tensor &tensor : tensors) {
