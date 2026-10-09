@@ -1381,12 +1381,17 @@ class MultiplexedRuntime:
 
         def finish() -> None:
             if not isinstance(failure, (RuntimeClosed, EngineUnloaded)):
-                self._crash_trace.dump(
-                    generation,
-                    failure,
-                    process_returncode=returncode,
-                    last_status=last_status,
-                )
+                try:
+                    self._crash_trace.dump(
+                        generation,
+                        failure,
+                        process_returncode=returncode,
+                        last_status=last_status,
+                    )
+                except Exception:
+                    # A diagnostic: one not written must not keep the failure
+                    # from reaching the listener, the calls and the engine.
+                    pass
                 listener = self.on_engine_failure
                 if served_seconds is not None and listener:
                     # Before the calls end, so their terminals can follow

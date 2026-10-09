@@ -1491,6 +1491,35 @@ class RuntimeTests(unittest.TestCase):
             self.assertTrue(Path(path).is_file())
             runtime.close()
 
+    def test_a_crash_trace_not_written_still_ends_the_generation(self):
+        factory = FakeFactory()
+        failures = []
+        with (
+            TemporaryDirectory() as temporary,
+            mock.patch.dict(os.environ, {"SPLASH_CRASH_TRACE": "1"}),
+            mock.patch.object(crash_trace, "DEFAULT_TRACE_DIRECTORY", Path(temporary)),
+            mock.patch.object(crash_trace.base64, "b64encode", side_effect=MemoryError),
+        ):
+            runtime = engine_runtime.MultiplexedRuntime(
+                command=("fake-native", "serve-native"),
+                process_factory=factory,
+                pending_limit=1,
+            )
+            runtime.on_engine_failure = lambda error, _served: failures.append(
+                str(error)
+            )
+            call = runtime.submit(request(160))
+            factory.processes[0].close_stdout()
+            with self.assertRaisesRegex(engine_runtime.EngineUnhealthy, "reached EOF"):
+                call.result(1.0)
+            runtime._reader_thread.join(1.0)
+            self.assertEqual(failures, ["native protocol reached EOF"])
+            self.assertIsNone(runtime.last_crash_trace)
+            self.assertIsNotNone(factory.processes[0].poll())
+            self.assertTrue(runtime._admission_slots.acquire(blocking=False))
+            runtime._admission_slots.release()
+            runtime.close()
+
     def test_close_callback_can_reenter_without_process_lock_deadlock(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
