@@ -59,22 +59,33 @@ class ReasoningSplitter:
     def __init__(self, thinking):
         self.reasoning = thinking
         self.pending = ""
+        # Whether the newlines after </think>, which set the answer apart in
+        # the chat template's layout of a turn, are still to be dropped.
+        self.separator = False
 
     def put(self, text):
         if not self.reasoning:
-            return [("content", text)]
+            return self._content(text)
         self.pending += text
         end = self.pending.find(THINK_END)
         if end >= 0:
-            output = [("reasoning_content", self.pending[:end])]
+            reasoning = self.pending[:end]
             content = self.pending[end + len(THINK_END) :]
-            if content:
-                output.append(("content", content))
             self.pending = ""
             self.reasoning = False
-            return [(kind, value) for kind, value in output if value]
+            self.separator = True
+            output = [("reasoning_content", reasoning)] if reasoning else []
+            return output + self._content(content)
         ready, self.pending = hold_partial(self.pending, THINK_END)
         return [("reasoning_content", ready)] if ready else []
+
+    def _content(self, text):
+        if self.separator:
+            text = text.lstrip("\n")
+            if not text:
+                return []
+            self.separator = False
+        return [("content", text)]
 
     def finish(self):
         if not self.pending:

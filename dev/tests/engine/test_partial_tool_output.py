@@ -373,6 +373,81 @@ class PartialToolOutputTests(unittest.TestCase):
                         finally:
                             harness.close()
 
+    def test_newlines_after_think_end_do_not_start_the_answer_in_any_protocol(self):
+        # Models write "\n</think>\n\n" before the answer, as their chat
+        # template lays out a turn. Whether each output thinks, and its text:
+        outputs = (
+            (True, "why\n</think>\n\nHi\n\nyou"),
+            (True, "why\n</think>\n \n\tHi"),
+            (True, "why\n</think>\n\n"),
+            (True, "why\n</think>"),
+            (False, "\n\nHi"),
+        )
+        protocols = {
+            "/v1/chat/completions": chat_output,
+            "/v1/responses": responses_output,
+            "/v1/messages": messages_output,
+        }
+        tokenizer, token_ids = character_tokenizer("".join(t for _, t in outputs))
+        for path, parse in protocols.items():
+            for stream in (False, True):
+                for tools in (False, True):
+                    with self.subTest(path=path, stream=stream, tools=tools):
+                        harness = Harness(
+                            FakeRuntime(
+                                *(
+                                    Plan([[token_ids[char]] for char in text])
+                                    for _, text in outputs
+                                )
+                            ),
+                            tokenizer=tokenizer,
+                            max_context=8192,
+                        )
+                        answers = []
+                        try:
+                            for thinking, _ in outputs:
+                                request = weather_request(path, stream, thinking)
+                                if not tools:
+                                    del request["tools"]
+                                status, _, payload = harness.request(
+                                    "POST", path, request
+                                )
+                                self.assertEqual(status, 200, payload)
+                                answers.append(parse(payload, stream)[0])
+                        finally:
+                            harness.close()
+                        self.assertEqual(
+                            answers[0], [("reasoning", "why\n"), ("text", "Hi\n\nyou")]
+                        )
+                        # Only newlines are dropped.
+                        self.assertEqual(
+                            answers[1], [("reasoning", "why\n"), ("text", " \n\tHi")]
+                        )
+                        # Newlines alone after </think> are no answer.
+                        self.assertEqual(answers[2], answers[3])
+                        # Without thinking, leading newlines are the model's own.
+                        self.assertEqual(answers[4], [("text", "\n\nHi")])
+
+    def test_reasoning_splitter_starts_the_answer_however_the_text_is_cut(self):
+        text = "why\n</think>\n\nHi\n\nyou"
+        for size in range(1, len(text) + 1):
+            with self.subTest(size=size):
+                splitter = model_output.ReasoningSplitter(True)
+                parts = [
+                    part
+                    for offset in range(0, len(text), size)
+                    for part in splitter.put(text[offset : offset + size])
+                ]
+                parts += splitter.finish()
+                self.assertTrue(all(value for _, value in parts), parts)
+                self.assertEqual(
+                    [
+                        "".join(value for kind, value in parts if kind == field)
+                        for field in ("reasoning_content", "content")
+                    ],
+                    ["why\n", "Hi\n\nyou"],
+                )
+
     def test_projector_preserves_whitespace_without_a_tool(self):
         for text in (" \n\t", " \nhello \t\n"):
             for incomplete in (False, True):
