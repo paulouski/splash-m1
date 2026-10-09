@@ -296,6 +296,8 @@ struct Runtime::Impl {
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
+  // Null for a family with no per-request host work (FamilyRuntime).
+  std::unique_ptr<FamilyRuntime> family;
   QwenTarget targetModel;
   // Null without a DFlash2 draft (ProposalSource::None): proposals then come
   // from prompt lookup alone.
@@ -996,6 +998,7 @@ struct Runtime::Impl {
       throw std::logic_error("no selected token to commit");
     if (samplingPenalties(entry).active())
       ops::Sampling::countPenaltyTokens(penaltyWords(entry.stateLane), tokens);
+    if (family) family->afterCommit(entry.id, entry.pendingToken, tokens);
     entry.pendingToken = tokens.back();
   }
 
@@ -1228,6 +1231,9 @@ struct Runtime::Impl {
       const ModelBatchItem &item = *sequence.item;
       std::copy(item.inputTokens.begin(), item.inputTokens.end(),
                 input + sequence.rowBegin);
+      if (family)
+        family->beforePrefillSequence(sequence.entry->id, item.logicalPosition,
+                                      item.inputTokens, sequence.rowBegin);
       for (uint32_t localRow = 0; localRow < item.tokenCount; ++localRow) {
         const uint32_t row = sequence.rowBegin + localRow;
         if (input[row] >= geometry.target.vocabularySize) {
@@ -1432,6 +1438,9 @@ struct Runtime::Impl {
       throw std::logic_error("decode state length is not exact");
     }
     static_cast<void>(synchronizedPageTable(entry, item));
+    if (family)
+      family->beforeDecodeLane(entry.id, lane, entry.stateLane,
+                               item.logicalPosition, *entry.pendingToken);
     auto *draftInput = contents<uint32_t>(
         decodeArena->get(lane, DecodeTensor::DraftInputTokens),
         "draft input tokens");
@@ -2094,6 +2103,10 @@ Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
+void Runtime::installFamily(std::unique_ptr<FamilyRuntime> family) {
+  impl_->family = std::move(family);
+}
+
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
   if (const StateAdmission admission = beginAt(request, stateLane); !admission.granted()) {
@@ -2157,6 +2170,8 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);
+    if (impl_->family)
+      impl_->family->onActivate(entry.id, entry.stateLane, request.prompt);
   }
   rollback.committed = admission.granted();
   return admission;
@@ -2204,6 +2219,8 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   if (!inserted) {
     throw std::logic_error("request insertion lost uniqueness");
   }
+  if (impl_->family)
+    impl_->family->onActivate(request.id, stateLane, request.prompt);
   return admission;
 }
 
@@ -2666,6 +2683,8 @@ void Runtime::end(uint64_t requestId) {
   auto found = impl_->requests.find(requestId);
   if (found == impl_->requests.end())
     return;
+  if (impl_->family)
+    impl_->family->onEnd(requestId);
   impl_->releaseImages(found->second);
   if (found->second.resident) {
     impl_->states.releaseLane(found->second.stateLane, requestId);

@@ -4,6 +4,7 @@
 #include "engine/MemoryPlan.hpp"
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
+#include "model/FamilyRuntime.hpp"
 #include "model/Runtime.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
@@ -1345,6 +1346,72 @@ void requireReplayPointKeepsItsImageRows(model::Runtime &executor,
   std::cout << "replay_point_keeps_its_image_rows=PASS\n";
 }
 
+// Logs the hook calls of a FamilyRuntime in order.
+class RecordingFamily final : public model::FamilyRuntime {
+public:
+  struct Event final {
+    std::string name;
+    uint64_t requestId = 0;
+    uint32_t lane = 0;
+    uint64_t position = 0;
+    std::vector<uint32_t> tokens;
+    std::optional<uint32_t> anchor;
+  };
+  std::vector<Event> events;
+
+  void onActivate(uint64_t id, uint32_t lane, std::span<const uint32_t> prompt) override {
+    events.push_back({"activate", id, lane, 0, {prompt.begin(), prompt.end()}, {}});
+  }
+  void onEnd(uint64_t id) override { events.push_back({"end", id, 0, 0, {}, {}}); }
+  void beforePrefillSequence(uint64_t id, uint64_t position, std::span<const uint32_t> input,
+                             uint32_t rowBegin) override {
+    events.push_back({"prefill", id, rowBegin, position, {input.begin(), input.end()}, {}});
+  }
+  void beforeDecodeLane(uint64_t id, uint32_t lane, uint32_t stateLane, uint64_t position,
+                        uint32_t anchor) override {
+    events.push_back({"decode", id, lane * 100 + stateLane, position, {}, anchor});
+  }
+  void afterCommit(uint64_t id, std::optional<uint32_t> previous,
+                   std::span<const uint32_t> selected) override {
+    events.push_back({"commit", id, 0, 0, {selected.begin(), selected.end()}, previous});
+  }
+};
+
+void requireFamilyHooks(model::Runtime &executor, uint64_t requestId,
+                        const std::vector<uint32_t> &prompt,
+                        const std::vector<uint32_t> &pageTable, uint32_t stateLane) {
+  auto owned = std::make_unique<RecordingFamily>();
+  RecordingFamily &family = *owned;
+  executor.installFamily(std::move(owned));
+  beginCold(executor, makeRequest(requestId, prompt, 16), stateLane);
+  const ModelStepResult prefilled = prefillChunk(executor, requestId, 0, prompt, pageTable);
+  requireOpen(prefilled, "family hooks");
+  const ModelStepResult decoded = decodeOne(executor, requestId, prompt.size(), pageTable);
+  const auto &e = family.events;
+  require(e.size() == 5 && e[0].name == "activate" && e[1].name == "prefill" &&
+              e[2].name == "commit" && e[3].name == "decode" && e[4].name == "commit",
+          "family hooks were not called in activate, prefill, commit, decode, commit order");
+  for (const auto &event : e)
+    require(event.requestId == requestId, "a family hook named another request");
+  require(e[0].lane == stateLane && e[0].tokens == prompt, "activate hook lost the lane or prompt");
+  require(e[1].position == 0 && e[1].tokens == prompt, "prefill hook lost the position or input");
+  require(!e[2].anchor && e[2].tokens.size() == 1, "prefill commit did not select one first anchor");
+  const uint32_t anchor = e[2].tokens[0];
+  require(e[3].position == prompt.size() && e[3].anchor == anchor && e[3].lane == stateLane,
+          "decode hook lost the position, anchor or lane");
+  require(e[4].anchor == anchor, "decode commit did not name the previous anchor");
+  // The history a family rebuilds: the old anchor and the selections before the new one.
+  std::vector<uint32_t> emitted{anchor};
+  emitted.insert(emitted.end(), e[4].tokens.begin(), e[4].tokens.end() - 1);
+  require(emitted == decoded.outputTokens, "decode commit selections do not match the step's output");
+  executor.end(requestId);
+  require(e.size() == 6 && e[5].name == "end" && e[5].requestId == requestId,
+          "end hook was not called");
+  const size_t count = e.size();
+  executor.installFamily(nullptr);
+  std::cout << "family_hooks=PASS events=" << count << '\n';
+}
+
 void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -1411,13 +1478,14 @@ void warmupEos(model::RuntimeContext context, model::ModelPackage &package) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, familyHooksOnly = false;
     kv::Format format = kv::Format::Int8;
     if (argc < 3) fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
+      else if (option == "--family-hooks-only") familyHooksOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
@@ -1457,7 +1525,7 @@ int main(int argc, char **argv) {
         model.vision.actualAllocatedBytes,
         executorPlan, 0};
     ModelMemoryProfile profile{
-        model.name(), model.maximumContextTokens(), 0,
+        model.name(), model.maximumContextTokens(),
         model.targetKvLayout(format), footprint};
     EngineMemoryPlan memoryPlan =
         test::requireMemoryPlan(backend.capabilities(), profile);
@@ -1605,6 +1673,8 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> prompt129 = prompt128;
     prompt129.push_back(samplingSeedTokens[128 % samplingSeedTokens.size()]);
     const std::vector<uint32_t> pageTable = pageRange(0, 8);
+    requireFamilyHooks(executor, 900, prompt128, pageTable, 0);
+    if (familyHooksOnly) return 0;
     EngineRequest request = makeRequest(1, prompt128, 16);
     beginCold(executor, request, 0);
     prefillChunk(executor, 1, 0, prompt128, pageTable);

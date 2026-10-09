@@ -1,5 +1,6 @@
 #pragma once
 
+#include "model/FamilyRuntime.hpp"
 #include "model/ModelFactory.hpp"
 
 #include <cstdint>
@@ -23,6 +24,8 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
+  // Installs (or with null removes) the model family's per-request hooks.
+  void installFamily(std::unique_ptr<FamilyRuntime> family);
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
 
   Runtime(const Runtime &) = delete;
