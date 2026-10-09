@@ -1,4 +1,5 @@
 #include "model/PreparedWeights.hpp"
+#include "AwakeClock.hpp"
 #include "StderrLine.hpp"
 
 #include <CommonCrypto/CommonDigest.h>
@@ -612,7 +613,7 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
   }
   run(guards.check);
   run(guards.admitConversion);
-  const auto started = std::chrono::steady_clock::now();
+  const auto started = AwakeClock::now();
   writeStderrLine("Preparing weights: " + weight.component);
   // This name belongs only to this key under the converter lock, and
   // reclaimAbandoned removed any earlier writer's.
@@ -628,7 +629,7 @@ std::filesystem::path PreparedWeights::prepare(const PreparedWeight &weight, con
     throw;
   }
   evictSuperseded(root_, weight);
-  const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+  const auto seconds = std::chrono::duration<double>(AwakeClock::now() - started).count();
   std::ostringstream prepared;
   prepared << "Prepared " << weight.component << " in " << seconds << " s";
   writeStderrLine(prepared.str());

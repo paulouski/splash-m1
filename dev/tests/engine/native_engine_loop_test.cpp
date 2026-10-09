@@ -235,7 +235,7 @@ struct PoolShape {
 };
 
 // A native loop over the fake model, collecting the bytes it writes. Its
-// clocks come from the test seam: the unix clock stands still and the steady
+// clocks come from the test seam: the unix clock stands still and the awake
 // clock reads `monotonic`, advanced by `clockStep` on every read.
 struct LoopFixture {
   explicit LoopFixture(NativeLoopConfig config = {}, PoolShape shape = {},

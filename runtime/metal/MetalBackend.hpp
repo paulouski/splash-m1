@@ -199,8 +199,9 @@ private:
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
 // How long a command may run before the backend gives up on it, and how long
-// every buffer stays wired after the last command (see allocateBuffer). Tests
-// substitute shorter ones through TestConfig.
+// every buffer stays wired after the last command (see allocateBuffer), both in
+// time the Mac is awake (AwakeClock). Tests substitute shorter ones through
+// TestConfig.
 inline constexpr double kCommandTimeoutSeconds = 120.0;
 inline constexpr double kResidencyKeepAliveSeconds = 600.0;
 static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);

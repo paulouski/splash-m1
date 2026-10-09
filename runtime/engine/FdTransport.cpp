@@ -1,4 +1,5 @@
 #include "engine/FdTransport.hpp"
+#include "AwakeClock.hpp"
 #include "TestConfig.hpp"
 
 #include <algorithm>
@@ -326,15 +327,14 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
       }
     } // What was taken is freed before control, tick and poll.
 
-    const auto stepStarted = std::chrono::steady_clock::now();
+    const auto stepStarted = AwakeClock::now();
     deferredControl = wake->takeControl() || deferredControl;
     if (deferredControl && !loop.commandInFlight()) {
       deferredControl = loop.runControl(controlHandler_);
     }
 
     const bool progressed = loop.tick();
-    const double tickMilliseconds = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - stepStarted).count();
+    const double tickMilliseconds = millisecondsSince(stepStarted);
     if (tickMilliseconds > maxTickMilliseconds_)
       maxTickMilliseconds_ = tickMilliseconds;
     if (progressed)
