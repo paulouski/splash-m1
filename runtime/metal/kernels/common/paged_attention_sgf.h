@@ -3,14 +3,15 @@
 #include "metal/kernels/common/paged_attention_tile.h"
 #include "metal/kernels/common/sgmatrix.h"
 
-// Apple7/8 (M1/M2) register-matrix paged attention over INT8 KV (the
+// Apple7/8 (M1/M2) register-matrix paged attention over INT8 or BF16 KV (the
 // Register tile), for prefill and verify. These GPUs have no bfloat
 // arithmetic, and the MPP tensor path spends most of a long-context prefill
 // chunk or verify cycle here. Operands:
-//   K, V  the INT8 cache as exact half: byte ^ 0x80 is the value plus 128,
+//   K, V  INT8: the cache as exact half: byte ^ 0x80 is the value plus 128,
 //         0x6400 | v is 1024 + v, and subtracting 1152 leaves the value;
+//         BF16: the stored values widened to exact fp32;
 //   Q     bfloat widened to exact fp32;
-//   P     the value-scaled probability rounded to bfloat exactly as the MPP
+//   P     the (value-scaled) probability rounded to bfloat exactly as the MPP
 //         tile rounds it, then widened to fp32;
 //   C     fp32, so every product is exact and only summation order differs.
 // Each simdgroup owns eight fused rows (one query row group of the tile) and
@@ -20,7 +21,7 @@
 // the same K/V page. Partials and statistics use the MPP tile's layout, so
 // the shared prefill and verify reduces are unchanged. Both scale placements
 // of the MPP tile compute score x key scale x 1/sqrt(D) in that order, as
-// this tile does.
+// this tile does; BF16 has no scales, as in the MPP tile.
 namespace q8sgf {
 using sgmatrix::Lane;
 using sgmatrix::lane_map;
@@ -30,6 +31,16 @@ using sgmatrix::te;
 __attribute__((always_inline)) inline void mma(thread float2 &c, half2 a, float2 b) {
   simdgroup_half8x8 A;
   simdgroup_float8x8 B, C, D;
+  te(A) = a;
+  te(B) = b;
+  te(C) = c;
+  simdgroup_multiply_accumulate(D, A, B, C);
+  c = te(D);
+}
+
+// c += a x b for exact fp32 (widened bfloat) cache values.
+__attribute__((always_inline)) inline void mma(thread float2 &c, float2 a, float2 b) {
+  simdgroup_float8x8 A, B, C, D;
   te(A) = a;
   te(B) = b;
   te(C) = c;
@@ -48,10 +59,17 @@ __attribute__((always_inline)) inline float2 bfloat_pair(uint p) {
   return float2(as_type<float>(p << 16), as_type<float>(p & 0xFFFF0000u));
 }
 
+// The low (high = false) or high bfloat of words a and b, widened to fp32.
+__attribute__((always_inline)) inline float2 bfloat_halves(uint a, uint b, bool high) {
+  return high ? float2(as_type<float>(a & 0xFFFF0000u), as_type<float>(b & 0xFFFF0000u))
+              : float2(as_type<float>(a << 16), as_type<float>(b << 16));
+}
+
 // The reduction index k of an MMA may name any element, as long as A and B
 // agree. Both products permute theirs so that a lane's two k columns (fn and
 // fn + 1) over consecutive steps are one contiguous load, with the pair for a
-// step in bytes 0 and 2 (even step) or 1 and 3 (odd step) of a word.
+// step in elements 0 and 2 (even step) or 1 and 3 (odd step) of a group of
+// four.
 // Token of k row k at PV step s (four steps span a page), which is also the
 // token of score row k in S^T tile s.
 inline uint page_token(uint k, uint s) {
@@ -62,15 +80,62 @@ inline uint block_dimension(uint k, uint t) {
   return 16 * (k >> 1) + 4 * (t >> 1) + (t & 1) + 2 * (k & 1);
 }
 
+// A lane's sixteen key elements of one 64-dimension block: dimensions
+// 8 fn .. 8 fn + 15, consumed two per QK step.
+template <typename CacheElement> struct KeyRun;
+template <> struct KeyRun<int8_t> {
+  uint4 words;
+  void load(device const int8_t *keys) {
+    words = *reinterpret_cast<device const uint4 *>(keys);
+  }
+  half2 step(uint t) const { return int8_pair(words[t >> 1] >> (8 * (t & 1))); }
+};
+template <> struct KeyRun<bfloat> {
+  uint4 low, high;
+  void load(device const bfloat *keys) {
+    low = reinterpret_cast<device const uint4 *>(keys)[0];
+    high = reinterpret_cast<device const uint4 *>(keys)[1];
+  }
+  float2 step(uint t) const {
+    const uint4 words = t < 4 ? low : high;
+    const uint j = 2 * ((t >> 1) & 1);
+    return bfloat_halves(words[j], words[j + 1], t & 1);
+  }
+};
+
+// A lane's eight value elements of one dimension: tokens 4 fn .. 4 fn + 7 of
+// the page, consumed two per PV step.
+template <typename CacheElement> struct ValueRun;
+template <> struct ValueRun<int8_t> {
+  uint2 words;
+  void load(device const int8_t *values) {
+    words = *reinterpret_cast<device const uint2 *>(values);
+  }
+  half2 step(uint s) const {
+    return int8_pair((s < 2 ? words.x : words.y) >> (8 * (s & 1)));
+  }
+};
+template <> struct ValueRun<bfloat> {
+  uint4 words;
+  void load(device const bfloat *values) {
+    words = *reinterpret_cast<device const uint4 *>(values);
+  }
+  float2 step(uint s) const {
+    return s < 2 ? bfloat_halves(words.x, words.y, s & 1)
+                 : bfloat_halves(words.z, words.w, s & 1);
+  }
+};
+
 // One tile of eight query rows x G heads over its split's pages, as
 // splash_paged_attention_tile: row r of the tile sees committed_tokens + r + 1
 // tokens, and rows past active_rows repeat the last active row's mask.
-template <uint KVHeads, uint QueryHeadsPerKVHead>
+template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     uint sg, uint lane, threadgroup uint *query_words) {
+  constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint Rows = 8;
   constexpr uint M = Rows * G;
@@ -119,20 +184,25 @@ __attribute__((always_inline)) inline void tile(
   float2 row_max(-INFINITY), row_sum(0.0f);
   // The four tokens of this lane's score rows: base + {0, 1, 4, 5}.
   const uint scale_base = page_token(fm, 0);
-  const SplashKvAddressing<KVHeads, int8_t> addressing(kv, kv_head);
+  const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
 
   for (uint page = page_begin; page < page_end; ++page) {
-    const SplashKvPageTensors<int8_t> tensors = addressing.page(page_table[page]);
-    device const int8_t *keys = tensors.keys;
-    device const int8_t *values = tensors.values;
-    device const float *key_scales = tensors.key_scales + scale_base;
-    device const float *value_scales = tensors.value_scales + scale_base;
-    const float2 k01 = *reinterpret_cast<device const float2 *>(key_scales);
-    const float2 k45 = *reinterpret_cast<device const float2 *>(key_scales + 4);
-    const float2 v01 = *reinterpret_cast<device const float2 *>(value_scales);
-    const float2 v45 = *reinterpret_cast<device const float2 *>(value_scales + 4);
-    const float key_scale[4] = {k01.x, k01.y, k45.x, k45.y};
-    const float value_scale[4] = {v01.x, v01.y, v45.x, v45.y};
+    const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
+    device const CacheElement *keys = tensors.keys;
+    device const CacheElement *values = tensors.values;
+    float key_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    float value_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    if constexpr (Quantized) {
+      device const float *key_scales = tensors.key_scales + scale_base;
+      device const float *value_scales = tensors.value_scales + scale_base;
+      const float2 k01 = *reinterpret_cast<device const float2 *>(key_scales);
+      const float2 k45 = *reinterpret_cast<device const float2 *>(key_scales + 4);
+      const float2 v01 = *reinterpret_cast<device const float2 *>(value_scales);
+      const float2 v45 = *reinterpret_cast<device const float2 *>(value_scales + 4);
+      key_scale[0] = k01.x, key_scale[1] = k01.y, key_scale[2] = k45.x, key_scale[3] = k45.y;
+      value_scale[0] = v01.x, value_scale[1] = v01.y, value_scale[2] = v45.x,
+      value_scale[3] = v45.y;
+    }
 
     // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1).
     float2 scores[4];
@@ -143,12 +213,11 @@ __attribute__((always_inline)) inline void tile(
     for (uint b = 0; b < 4; ++b)
 #pragma unroll
       for (uint s = 0; s < 4; ++s) {
-        const uint4 words = *reinterpret_cast<device const uint4 *>(
-            keys + page_token(fm, s) * D + 64 * b + 8 * fn);
+        KeyRun<CacheElement> run;
+        run.load(keys + page_token(fm, s) * D + 64 * b + 8 * fn);
 #pragma unroll
         for (uint t = 0; t < 8; ++t)
-          mma(scores[s], int8_pair(words[t >> 1] >> (8 * (t & 1))),
-              bfloat_pair(queries[(b * 8 + t) * 32]));
+          mma(scores[s], run.step(t), bfloat_pair(queries[(b * 8 + t) * 32]));
       }
 
     // Online softmax, as splash_attention_page_softmax: key scale, then
@@ -158,7 +227,9 @@ __attribute__((always_inline)) inline void tile(
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
       const uint token = token_start + page_token(fm, s);
-      float2 score = scores[s] * key_scale[s];
+      float2 score = scores[s];
+      if constexpr (Quantized)
+        score *= key_scale[s];
       score *= 0.0625f;
       scores[s] = float2(token < limit.x ? score.x : -INFINITY,
                          token < limit.y ? score.y : -INFINITY);
@@ -204,16 +275,17 @@ __attribute__((always_inline)) inline void tile(
           token < limit.y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
     }
 
-    // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T.
-    device const int8_t *value_row = values + fm * N + 4 * fn;
+    // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
+    // summing its four token steps in order.
+    device const CacheElement *value_row = values + fm * N + 4 * fn;
 #pragma unroll
     for (uint d = 0; d < 32; ++d) {
-      const uint2 words =
-          *reinterpret_cast<device const uint2 *>(value_row + d * 8 * N);
-      mma(output[d], int8_pair(words.x), weights[0]);
-      mma(output[d], int8_pair(words.x >> 8), weights[1]);
-      mma(output[d], int8_pair(words.y), weights[2]);
-      mma(output[d], int8_pair(words.y >> 8), weights[3]);
+      ValueRun<CacheElement> run;
+      run.load(value_row + d * 8 * N);
+      mma(output[d], run.step(0), weights[0]);
+      mma(output[d], run.step(1), weights[1]);
+      mma(output[d], run.step(2), weights[2]);
+      mma(output[d], run.step(3), weights[3]);
     }
   }
 

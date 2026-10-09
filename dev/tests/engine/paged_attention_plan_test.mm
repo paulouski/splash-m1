@@ -109,10 +109,10 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
     // The register tile changes only the split entry and its width.
     const auto registerPlan = ops::PagedAttention::prefillPlan(
         rows, queryHeads, layout, ops::AttentionTile::Register);
-    const bool int8 = layout.format == kv::Format::Int8;
-    require(registerPlan.splitPipeline ==
-                    (int8 ? "prefill_attention_q8_split_sgf" + geometrySuffix : prefillSplit) &&
-                registerPlan.splitThreads.x == (int8 ? 32 * queryHeads / layout.kvHeads : 256) &&
+    const std::string registerName = std::string(layout.format == kv::Format::Int8
+        ? "prefill_attention_q8_split_sgf" : "prefill_attention_bf16_split_sgf") + geometrySuffix;
+    require(registerPlan.splitPipeline == registerName &&
+                registerPlan.splitThreads.x == 32 * queryHeads / layout.kvHeads &&
                 registerPlan.reducePipeline == plan.reducePipeline &&
                 registerPlan.splits == plan.splits &&
                 registerPlan.workspace.partialsBytes == plan.workspace.partialsBytes &&
@@ -163,10 +163,10 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
             "MPP verify tile left its 256-thread threadgroup");
     const auto registerPlan = ops::PagedAttention::verifyPlan(
         lanes, queryHeads, layout, std::span(histories).first(lanes), ops::AttentionTile::Register);
-    const bool int8 = layout.format == kv::Format::Int8;
-    require(registerPlan.splitPipeline ==
-                    (int8 ? "verify_attention_q8_split_sgf" + geometrySuffix : verifySplit) &&
-                registerPlan.splitThreads.x == (int8 ? 32 * queryHeads / layout.kvHeads : 256) &&
+    const std::string registerName = std::string(layout.format == kv::Format::Int8
+        ? "verify_attention_q8_split_sgf" : "verify_attention_bf16_split_sgf") + geometrySuffix;
+    require(registerPlan.splitPipeline == registerName &&
+                registerPlan.splitThreads.x == 32 * queryHeads / layout.kvHeads &&
                 registerPlan.reducePipeline == plan.reducePipeline &&
                 registerPlan.laneSplits == plan.laneSplits &&
                 registerPlan.splits == plan.splits &&
@@ -819,11 +819,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     require(argc == 2, "usage: paged-attention-plan [METALLIB [--long]]");
-#ifdef SPLASH_MACOS15_BUILD
-    for (auto format : {kv::Format::Int8})
-#else
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
-#endif
     for (uint32_t heads : {24U, 16U}) {
       const kv::Layout layout{1, heads == 24 ? 4U : 2U, 256, format};
       for (const auto [history, rows] :

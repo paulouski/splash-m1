@@ -1,10 +1,11 @@
 #include "metal/kernels/common/paged_attention_sgf.h"
 
-// Same bindings and grid as prefill_attention_q8_split (KV heads, query
-// tiles, history splits) with 32 x G threads, one simdgroup per eight fused
-// rows. Slots, partials and statistics are the MPP tile's, so
-// prefill_attention_reduce combines them unchanged.
-#define Q8_SGF_PREFILL_SPLIT(Name, Heads, Group)                               \
+// Same bindings and grid as prefill_attention_q8_split and
+// prefill_attention_bf16_split (KV heads, query tiles, history splits) with
+// 32 x G threads, one simdgroup per eight fused rows. Slots, partials and
+// statistics are the MPP tile's, so prefill_attention_reduce combines them
+// unchanged.
+#define SGF_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                    \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -28,12 +29,14 @@
         (ulong(kv_head) * params.chunk_stride + tile_start) * Group * D;       \
     const ulong slot =                                                         \
         (ulong(tile) * Heads + kv_head) * params.split_count + split;          \
-    q8sgf::tile<Heads, Group>(                                                 \
+    q8sgf::tile<Heads, Group, CacheElement>(                                   \
         queries + tile_offset, page_table, params.kv, kv_head,                 \
         params.committed_tokens + tile_start, active_rows, params.split_count, \
         split, partials, statistics, slot, sg, lane, query_words);             \
   }
 
-Q8_SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf, 4, 6)
-Q8_SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv2_g8, 2, 8)
-#undef Q8_SGF_PREFILL_SPLIT
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf, 4, 6, int8_t)
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv2_g8, 2, 8, int8_t)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf, 4, 6, bfloat)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat)
+#undef SGF_PREFILL_SPLIT

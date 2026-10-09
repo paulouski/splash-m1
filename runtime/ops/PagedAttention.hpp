@@ -95,8 +95,8 @@ chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
 namespace splash::ops {
 
 // Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
-// (exact half INT8 cache, fp32 queries and probabilities, one simdgroup per
-// eight fused rows) for prefill and verify; it applies to INT8 KV only.
+// (exact half INT8 or exact fp32 BF16 cache, fp32 queries and probabilities,
+// one simdgroup per eight fused rows) for prefill and verify.
 enum class AttentionTile : uint8_t { Mpp = 0, Register = 1 };
 
 struct AttentionWorkspace final {

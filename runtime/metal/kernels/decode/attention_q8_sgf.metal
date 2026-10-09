@@ -1,9 +1,10 @@
 #include "metal/kernels/common/paged_attention_sgf.h"
 #include "metal/kernels/common/paged_verify_tile.h"
 
-// Same bindings as verify_attention_q8_split; the grid is (KV heads, splits,
-// lanes) with 32 x G threads, one simdgroup per eight fused rows.
-#define Q8_SGF_VERIFY_SPLIT(Name, Heads, Group)                                \
+// Same bindings as verify_attention_q8_split and verify_attention_bf16_split;
+// the grid is (KV heads, splits, lanes) with 32 x G threads, one simdgroup per
+// eight fused rows.
+#define SGF_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -23,12 +24,14 @@
             params, group);                                                    \
     if (!tile.active || sg >= Group)                                           \
       return;                                                                  \
-    q8sgf::tile<Heads, Group>(                                                 \
+    q8sgf::tile<Heads, Group, CacheElement>(                                   \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
         tile.committed_tokens, SPLASH_TARGET_VERIFY_ROWS, tile.splits,         \
         tile.split, partials, statistics, tile.slot, sg, lane, query_words);   \
   }
 
-Q8_SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf, 4, 6)
-Q8_SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g8, 2, 8)
-#undef Q8_SGF_VERIFY_SPLIT
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf, 4, 6, int8_t)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g8, 2, 8, int8_t)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf, 4, 6, bfloat)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat)
+#undef SGF_VERIFY_SPLIT

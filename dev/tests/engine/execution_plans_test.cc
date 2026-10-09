@@ -170,9 +170,9 @@ void moeDeviceTiles() {
   }
 }
 
-// Apple7/8 prefill and verify attention run the register tile over INT8 KV;
-// BF16 KV and newer families keep MPP. The draft's context attention follows
-// the family too.
+// Apple7/8 prefill and verify attention run the register tile over INT8 and
+// BF16 KV; newer families keep MPP. The draft's context attention follows the
+// family too.
 void attentionDeviceTiles() {
   for (uint32_t family : {7U, 8U, 9U, 10U}) {
     const auto expected = family < 9 ? AttentionTile::Register : AttentionTile::Mpp;
@@ -196,11 +196,13 @@ void attentionDeviceTiles() {
                   (family < 9),
               "the register verify kernel is not the Apple7/8 one");
       const kv::Layout bf16{1, shape.layout.kvHeads, 256, kv::Format::BFloat16};
-      require(plans.verifyAttention(3, shape.queryHeads, bf16, histories)
-                      .splitPipeline.find("_sgf") == std::string_view::npos &&
-                  plans.prefillAttention(2048, shape.queryHeads, bf16)
-                      .splitPipeline.find("_sgf") == std::string_view::npos,
-              "BF16 KV left the MPP attention tiles");
+      require((plans.verifyAttention(3, shape.queryHeads, bf16, histories)
+                       .splitPipeline.find("_sgf") != std::string_view::npos) ==
+                      (family < 9) &&
+                  (plans.prefillAttention(2048, shape.queryHeads, bf16)
+                       .splitPipeline.find("_sgf") != std::string_view::npos) ==
+                      (family < 9),
+              "BF16 KV does not follow the device attention tile");
     }
     for (auto shape : draftShapes)
       require(plans.draftAttention(shape, 2).registerTile() == (family < 9),
