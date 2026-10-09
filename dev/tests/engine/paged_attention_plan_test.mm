@@ -1,5 +1,6 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
+#include "metal/abi/Qwen4.h"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "tuning/LinearNumerics.hpp"
@@ -538,10 +539,11 @@ template <Phase phase>
 std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBounds,
 
 #ifdef SPLASH_MACOS15_BUILD
-                          ops::AttentionTile tile = ops::AttentionTile::Register) {
+                          ops::AttentionTile tile = ops::AttentionTile::Register,
 #else
-                          ops::AttentionTile tile = ops::AttentionTile::Mpp) {
+                          ops::AttentionTile tile = ops::AttentionTile::Mpp,
 #endif
+                          ops::QsaMask mask = {}) {
   constexpr bool prefill = phase == Phase::Prefill;
   const auto plan = [&] {
     if constexpr (prefill)
@@ -570,13 +572,29 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     if constexpr (prefill) {
       ops::PagedAttention::addPrefill(graph, data.layer, data.queries, output,
                                       partialBuffer, statisticsBuffer, data.tables[0],
-                                      data.stores[0], plan);
+                                      data.stores[0], plan, mask);
     } else {
       ops::PagedVerifyBuffers buffers{data.keys, data.values, data.queries,
                                       partialBuffer, statisticsBuffer, output, data.tables};
       ops::PagedAttention::addVerify(graph, data.layer, buffers,
-                                     std::span(data.stores).first(plan.lanes), plan);
+                                     std::span(data.stores).first(plan.lanes), plan, mask);
     }
+  };
+  // The group-of-twelve split kernels bind their bitmaps after the parameters:
+  // buffer and tail at the indices after the ABI struct's.
+  const bool masked = plan.splitPipeline.ends_with("_kv2_g12");
+  const auto checkMaskBinding = [&](const auto &split, uint32_t maskIndex) {
+    const auto &last = split.buffers.back();
+    require(split.bytes.size() == 2 && split.bytes[0].index == maskIndex - 1 &&
+                split.bytes[1].index == maskIndex + 1 && last.index == maskIndex &&
+                split.buffers.size() == maskIndex &&
+                split.bytes[1].sizeBytes == sizeof(Qwen4QsaMaskParams),
+            "group-of-twelve split bound its bitmaps at the wrong indices");
+    Qwen4QsaMaskParams params;
+    std::memcpy(&params, split.bytes[1].data, sizeof(params));
+    require(params.mask_words == mask.words && params.row0 == mask.row0 &&
+                (mask.words == 0 || last.buffer.sizeBytes() == mask.bits.sizeBytes()),
+            "group-of-twelve split recorded other bitmaps than it was given");
   };
   if (testBounds) {
     metal::CommandGraph shortGraph;
@@ -611,7 +629,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
     const auto checkDispatch = [&](const auto &dispatch, auto groups, std::string_view pipeline) {
       require(dispatch.pipelineName == pipeline && dispatch.threadgroups.x == groups.x &&
                   dispatch.threadgroups.y == groups.y && dispatch.threadgroups.z == groups.z &&
-                  dispatch.bytes.size() == 1 &&
+                  dispatch.bytes.size() == (masked && pipeline == plan.splitPipeline ? 2 : 1) &&
                   dispatch.bytes[0].sizeBytes == sizeof(kv::PrefillAttentionParams),
               "production prefill dispatch departed from its plan");
       kv::PrefillAttentionParams params;
@@ -626,6 +644,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
               "recorded prefill ABI does not describe the actual split plan");
     };
     checkDispatch(graph.dispatches()[1], plan.splitGroups, plan.splitPipeline);
+    if (masked) checkMaskBinding(graph.dispatches()[1], 5);
     require(sameGrid(graph.dispatches()[1].threadsPerThreadgroup, plan.splitThreads),
             "production prefill split left its planned threadgroup width");
     checkDispatch(graph.dispatches()[2], plan.reduceGroups, plan.reducePipeline);
@@ -639,6 +658,8 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, bool testBou
                 reduce.threadgroups.y == plan.reduceGroups.y &&
                 reduce.threadgroups.z == plan.reduceGroups.z,
             "production verify encoding departed from its plan");
+    require(split.threadgroups.x == plan.splitGroups.x, "production verify split grid departed from its plan");
+    if (masked) checkMaskBinding(split, 8);
   }
   const auto expected = data.layout.format == kv::Format::BFloat16
                             ? expectedBf16Store(data)
@@ -714,6 +735,38 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
           "verify attention over extents differs from one extent of the same pages");
   std::cout << "paged verify: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " lanes=" << lanes << " PASS\n";
+}
+
+// Qwen3.8-Flash-Next's 24 query heads over two KV heads on the register tile,
+// through the plan's graph: dense (no bitmaps) against the oracle, and bitmaps
+// with every block set, bound after junk rows, to the same bytes.
+void checkGroup12(metal::MetalBackend &backend, kv::Format format) {
+  const kv::Layout layout{1, 2, 256, format};
+  const auto allOnes = [&](uint32_t committed, uint32_t rows, uint32_t lanes) {
+    constexpr uint32_t junk = 2;
+    const uint32_t pages = (committed + lanes * 649 + rows + 31) / 32;
+    const uint32_t words = (pages * 8 + 31) / 32;
+    auto bits = allocate(backend, uint64_t{junk + lanes * rows} * words * 4);
+    std::memset(bits.contents(), 0xff, bits.sizeBytes());
+    return ops::QsaMask{bits, words, junk};
+  };
+  for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 3>{{{33, 7}, {1023, 8}, {4093, 257}}}) {
+    auto data = makeCase(backend, 24, layout, 1, rows, history, false);
+    const auto dense = run<Phase::Prefill>(backend, data, true, ops::AttentionTile::Register);
+    checkReference(data, dense);
+    require(run<Phase::Prefill>(backend, data, false, ops::AttentionTile::Register,
+                                allOnes(history, rows, 1)) == dense,
+            "all-ones bitmaps changed the group-of-twelve prefill through its graph");
+  }
+  for (const uint32_t lanes : {1U, 4U}) {
+    auto data = makeCase(backend, 24, layout, lanes, 8, 1023, true);
+    const auto dense = run<Phase::Verify>(backend, data, true, ops::AttentionTile::Register);
+    checkReference(data, dense);
+    require(run<Phase::Verify>(backend, data, false, ops::AttentionTile::Register,
+                               allOnes(1023, 8, lanes)) == dense,
+            "all-ones bitmaps changed the group-of-twelve verify through its graph");
+  }
+  std::cout << "paged group of twelve: format=" << kv::formatName(format) << " PASS\n";
 }
 
 // The q/k RMS norms, RoPE and V copy of the attention prepare, prefill and
@@ -835,6 +888,8 @@ int main(int argc, char **argv) {
     }
     metal::MetalBackend backend(argv[1]);
     checkBf16StoreEdges(backend);
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+      checkGroup12(backend, format);
     // The prepare kernels do not depend on the KV format.
     for (uint32_t heads : {24U, 16U})
       for (bool float32 : {false, true})
