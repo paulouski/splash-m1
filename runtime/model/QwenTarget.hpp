@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Model.hpp"
+#include "Qwen4ExpBuffers.hpp"
 #include "QwenHybridLayout.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -27,6 +29,7 @@ struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
 struct Qwen4ExpWeights;
+class Qwen4ExpTarget;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -104,6 +107,8 @@ struct QwenTargetGeometry final {
   uint32_t captureLayerCount = 0;
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
+  // Qwen3.8-Flash-Next's; empty (false) for the other families.
+  Qwen4Geometry qwen4;
   // Distinct operator requirements, collected from the loaded weights.
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
@@ -177,6 +182,10 @@ struct QwenTargetPrefillSequence final {
   std::span<const metal::MetalBuffer> recurrentOut;
   std::array<QwenTargetPrefillCapture, 2> captures{};
   uint32_t captureCount = 0;
+  // Qwen3.8-Flash-Next: the state cell's auxiliary state (the PLE
+  // convolution's history) before and after the sequence's rows.
+  metal::MetalBuffer pleHistoryIn;
+  metal::MetalBuffer pleHistoryOut;
 };
 
 struct QwenTargetPrefillBuffers final {
@@ -210,6 +219,7 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
   ops::MoeScratch moe;
+  Qwen4Buffers qwen4;
 };
 
 struct QwenTargetVerifyBuffers final {
@@ -245,6 +255,10 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
   ops::MoeScratch moe;
+  Qwen4Buffers qwen4;
+  // Qwen3.8-Flash-Next: each lane's PLE history before the step (the
+  // commit writes the one after it).
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistories;
 };
 
 struct QwenTargetCommitBuffers final {
@@ -259,11 +273,18 @@ struct QwenTargetCommitBuffers final {
   metal::MetalBuffer retainedCounts;
   // Lanes per layer of the replay tensors above.
   uint32_t layerLanes = ExecutionLimits::maximumBatchWidth;
+  // Qwen3.8-Flash-Next: the step's PLE convolution inputs and each lane's
+  // history before and after it.
+  metal::MetalBuffer pleConvolution;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistoriesIn;
+  std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistoriesOut;
 };
 
 template <class Layout, class Layer>
 [[nodiscard]] QwenTargetGeometry
 qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
+// With Qwen3.8-Flash-Next's own projections (its mixes, indexer and PLE).
+[[nodiscard]] QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the package tensors.
@@ -272,8 +293,7 @@ public:
   template <class Layout, class Layer>
   QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
              metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
-  // Qwen3.8-Flash-Next: its weights load and plan, but this graph does not
-  // run them yet; throws std::logic_error.
+  // Qwen3.8-Flash-Next: its graphs are Qwen4ExpTarget's, which this calls.
   QwenTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
              const ops::ExecutionPlans &operators);
 
@@ -349,6 +369,9 @@ private:
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
+  // Non-null for Qwen3.8-Flash-Next, whose prefill, verify, head and state
+  // commit it builds.
+  std::shared_ptr<const Qwen4ExpTarget> qwen4_;
 };
 
 } // namespace splash::model

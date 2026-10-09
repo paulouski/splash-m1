@@ -298,6 +298,9 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   // Null for a family with no per-request host work (FamilyRuntime).
   std::unique_ptr<FamilyRuntime> family;
+  // Where each full-attention layer's QSA index tensors sit in the KV
+  // extents; empty without index regions.
+  std::vector<ops::QsaIndex> qsaIndex;
   QwenTarget targetModel;
   // Null without a DFlash2 draft (ProposalSource::None): proposals then come
   // from prompt lookup alone.
@@ -358,7 +361,42 @@ struct Runtime::Impl {
     decodeArena =
         std::make_unique<DecodeArena>(backend, geometry, operators, decodeLanes);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, decodeArena->laneCount());
+    if (kvPages.layout().indexDimension)
+      for (uint32_t layer = 0; layer < kvPages.layout().attentionLayers; ++layer) {
+        const kv::PageStorage::IndexPlacement placement = kvPages.indexPlacement(layer);
+        qsaIndex.push_back({placement.keysOffset, placement.pooledOffset});
+      }
+    installFamily(makeFamilyRuntime(package));
     preparePolicyPipelines();
+  }
+
+  // The family's hooks stage into the arenas' CPU-visible tensors.
+  void installFamily(std::unique_ptr<FamilyRuntime> value) {
+    family = std::move(value);
+    if (!family)
+      return;
+    FamilyScratch scratch;
+    const auto lane = [&](DecodeTensor tensor) {
+      std::vector<MetalBuffer> buffers;
+      for (uint32_t index = 0; index < decodeArena->laneCount(); ++index)
+        buffers.push_back(decodeArena->get(index, tensor));
+      return buffers;
+    };
+    scratch.prefillRows = prefillArena->get(PrefillTensor::PleStaging);
+    scratch.prefillSlots = prefillArena->get(PrefillTensor::PleSlots);
+    scratch.prefillBlocks = prefillArena->get(PrefillTensor::QsaBlocks);
+    scratch.decodeRows = lane(DecodeTensor::PleStaging);
+    scratch.decodeSlots = lane(DecodeTensor::PleSlots);
+    scratch.decodeBlocks = lane(DecodeTensor::QsaBlocks);
+    family->attach(scratch);
+  }
+
+  // The QSA scratch every step's graph shares.
+  void bindQsa(Qwen4Buffers &qwen4, uint32_t scoreRows) const {
+    qwen4.inverseFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
+    qwen4.qsaIndex = qsaIndex;
+    qwen4.qsaScoreRows = scoreRows;
+    qwen4.qsaMaskWords = geometry.target.qwen4.qsaMaskWords();
   }
 
   // Warmup selects greedily, so the first sampled, penalized or constrained
@@ -1338,6 +1376,8 @@ struct Runtime::Impl {
         recurrentIn[stateBegin + layer] = in.recurrentLayers[layer];
         recurrentOut[stateBegin + layer] = out.recurrentLayers[layer];
       }
+      destination.pleHistoryIn = in.auxiliary;
+      destination.pleHistoryOut = out.auxiliary;
       destination.captureCount = sequence.captures.size();
       for (uint32_t index = 0; index < sequence.captures.size(); ++index) {
         const DispatchDraftCaptureSpan &capture = sequence.captures[index];
@@ -1382,6 +1422,8 @@ struct Runtime::Impl {
     buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
     buffers.chunkValues = p(PrefillTensor::ChunkValues);
     buffers.moe = prefillArena->moeScratch();
+    buffers.qwen4 = prefillArena->qwen4();
+    bindQsa(buffers.qwen4, kQsaPrefillScoreRows);
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1605,6 +1647,8 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    buffers.qwen4 = decodeArena->qwen4(storage);
+    bindQsa(buffers.qwen4, kDecodeRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -1615,6 +1659,7 @@ struct Runtime::Impl {
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
+      buffers.pleHistories[lane] = states.current(entry.stateLane).auxiliary;
     }
     for (uint32_t layer = 0; layer < gdnLayers; ++layer) {
       gdnPacked[layer] = decodeArena->gdnBatchSlice(
@@ -1739,24 +1784,24 @@ struct Runtime::Impl {
     if (lanes.empty() || lanes.size() > kLaneCount)
       throw std::invalid_argument("invalid GDN commit batch");
     const uint32_t width = static_cast<uint32_t>(lanes.size());
-    std::array<MetalBuffer, kLaneCount> currentStates;
-    std::array<MetalBuffer, kLaneCount> nextStates;
+    QwenTargetCommitBuffers buffers;
+    buffers.packed = decodeArena->gdnStorage(DecodeTensor::VerifyPackedBase);
+    buffers.mixed = decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase);
+    buffers.decay = decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase);
+    buffers.beta = decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase);
+    buffers.retainedCounts = decodeArena->packed(DecodeTensor::RetainedCount, width);
+    buffers.layerLanes = decodeArena->laneCount();
+    buffers.pleConvolution = decodeArena->packed(DecodeTensor::PleConvolution, width);
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request *entry = lanes[std::min(lane, width - 1)];
       if (!entry)
         throw std::invalid_argument("empty GDN commit lane");
-      currentStates[lane] = states.current(entry->stateLane).stateBase;
-      nextStates[lane] = states.next(entry->stateLane).stateBase;
+      buffers.currentStates[lane] = states.current(entry->stateLane).stateBase;
+      buffers.nextStates[lane] = states.next(entry->stateLane).stateBase;
+      buffers.pleHistoriesIn[lane] = states.current(entry->stateLane).auxiliary;
+      buffers.pleHistoriesOut[lane] = states.next(entry->stateLane).auxiliary;
     }
-    targetModel.addStateCommit(
-        graph,
-        {decodeArena->gdnStorage(DecodeTensor::VerifyPackedBase),
-         decodeArena->gdnStorage(DecodeTensor::VerifyMixedBase),
-         decodeArena->gdnStorage(DecodeTensor::VerifyDecayBase),
-         decodeArena->gdnStorage(DecodeTensor::VerifyBetaBase), currentStates,
-         nextStates, decodeArena->packed(DecodeTensor::RetainedCount, width),
-         decodeArena->laneCount()},
-        width);
+    targetModel.addStateCommit(graph, std::move(buffers), width);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -2104,7 +2149,7 @@ Runtime::~Runtime() = default;
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
 void Runtime::installFamily(std::unique_ptr<FamilyRuntime> family) {
-  impl_->family = std::move(family);
+  impl_->installFamily(std::move(family));
 }
 
 void Runtime::beginColdRequest(const ModelRequest &request,
@@ -2552,6 +2597,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
       if (Impl::samplingEnabled(entry))
         impl_->stageLookupSamplingProposal(lane, proposals);
     }
+    if (impl_->family) {
+      // The rows' tokens as verify_input_tokens reads them.
+      std::array<uint32_t, kDecodeRows> rowTokens;
+      const uint32_t *proposals = impl_->proposedTokens(lane);
+      const uint32_t last = impl_->geometry.target.vocabularySize - 1;
+      rowTokens[0] = std::min(*entry.pendingToken, last);
+      for (uint32_t row = 1; row < kDecodeRows; ++row)
+        rowTokens[row] = std::min(proposals[row - 1], last);
+      impl_->family->beforeVerifyLane(entry.id, lane, item.logicalPosition, rowTokens);
+    }
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
     maximumRetained[lane] = laneResult.maximumRetained;
@@ -2975,7 +3030,7 @@ ModelMemoryPlan plannedRuntimeMemory(const DeviceCapabilities &device,
   const RuntimeGeometry geometry = RuntimeGeometry::from(package, format);
   return {package.stateLayout().laneBytes(),
           plannedPrefillBytes(geometry, operators, prefillRows),
-          plannedDecodeBytes(geometry, operators, decodeLanes)};
+          plannedDecodeBytes(geometry, operators, decodeLanes), familyHostBytes(package)};
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

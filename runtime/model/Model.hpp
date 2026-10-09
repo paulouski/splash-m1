@@ -419,6 +419,9 @@ struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  // Host RAM the family's runtime keeps outside Metal (Flash-Next's PLE row
+  // cache): not part of the Metal budget the engine plans.
+  uint64_t hostResidentBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal

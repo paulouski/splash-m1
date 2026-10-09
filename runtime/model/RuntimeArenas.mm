@@ -1,9 +1,45 @@
 #include "model/RuntimeArenas.hpp"
 
+#include "metal/abi/Qwen4.h"
+#include "model/PleStore.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
+namespace {
+
+// Qwen3.8-Flash-Next's scratch of `rows` rows (Qwen4Buffers) and the block
+// records of `blockRecords` blocks; nothing for the other families. The score
+// scratch holds `scoreRows` rows of every block of the context's tokens.
+template <class Tensor, class Put>
+void putQwen4(const RuntimeGeometry &geometry, uint64_t rows, uint64_t scoreRows, uint64_t blockRecords, Put put) {
+  const QwenTargetGeometry &g = geometry.target;
+  if (!g.qwen4) return;
+  const Qwen4Geometry &q = g.qwen4;
+  put(Tensor::HyperStreams, bytesFor<float>(rows * q.streamWidth()));
+  put(Tensor::HyperNormalized, bytesFor<uint16_t>(rows * q.streamWidth()));
+  put(Tensor::HyperLow, bytesFor<uint16_t>(rows * q.hyperRank));
+  put(Tensor::HyperGate, bytesFor<uint16_t>(rows * q.streamWidth()));
+  put(Tensor::HyperWeights, bytesFor<float>(rows * q.hyperConnections));
+  put(Tensor::HyperBranch, bytesFor<uint16_t>(rows * g.hiddenSize));
+  put(Tensor::HyperZeros, bytesFor<uint16_t>(rows * g.hiddenSize));
+  // The unique PLE rows a step gathers are at most one per (row, head).
+  put(Tensor::PleStaging, rows * q.pleHeads() * pleRowBytes);
+  put(Tensor::PleSlots, bytesFor<uint32_t>(rows * q.pleHeads()));
+  put(Tensor::PleRows, bytesFor<uint16_t>(rows * q.pleWidth()));
+  put(Tensor::PleValue, bytesFor<uint16_t>(rows * g.hiddenSize));
+  put(Tensor::PleGated, bytesFor<float>(rows * q.streamWidth()));
+  put(Tensor::PleConvolution, bytesFor<uint16_t>(rows * q.streamWidth()));
+  put(Tensor::IndexerQuery, bytesFor<float>(rows * QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION));
+  put(Tensor::IndexerKey, bytesFor<float>(rows * QWEN4_QSA_DIMENSION));
+  put(Tensor::QsaQueries, bytesFor<float>(rows * QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION));
+  put(Tensor::QsaScores, bytesFor<float>(scoreRows * q.qsaMaskWords() * 32));
+  put(Tensor::QsaMask, bytesFor<uint32_t>(rows * q.qsaMaskWords()));
+  put(Tensor::QsaBlocks, blockRecords * sizeof(Qwen4QsaBlock));
+}
+
+} // namespace
+
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators, uint32_t rows) {
@@ -115,6 +151,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          packedAttentionRows(rows) *
                          geometry.target.attentionHeadDimension));
+  // A sequence's block records start at its first row's record.
+  putQwen4<PrefillTensor>(geometry, rows, std::min<uint64_t>(rows, kQsaPrefillScoreRows), rows, put);
   // The split partials and counters and the rotated rows of the largest
   // prefill plan.
   for (const auto &projection : geometry.target.prefillProjections) {
@@ -178,6 +216,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
+  putQwen4<DecodeTensor>(geometry, r, r, r / 4 + 1, put);
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,

@@ -3,6 +3,7 @@
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen4Exp.hpp"
+#include "model/Qwen4ExpTarget.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/WeightStore.hpp"
 #include "ops/Embedding.hpp"
@@ -65,7 +66,13 @@ template <class Layout> QwenTargetGeometry moeGeometry(const Layout &layout) {
   return result;
 }
 QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) { return moeGeometry(layout); }
-QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) { return moeGeometry(layout); }
+QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) {
+  QwenTargetGeometry result = moeGeometry(layout);
+  result.qwen4 = {layout.hyperConnections, layout.hyperRank,        layout.pleLayer,  layout.pleNgram,
+                  layout.pleHeadsPerNgram, layout.pleHeadDimension, layout.pleConvolutionTaps,
+                  layout.indexerTopBlocks, layout.hiddenSize, layout.maximumContextTokens};
+  return result;
+}
 
 template <class Weights>
 void requireWeights(const Weights &weights,
@@ -98,12 +105,11 @@ template QwenTarget::QwenTarget(const Qwen3_8Weights &, const QwenTargetGeometry
 template QwenTarget::QwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 
-// ponytail: Flash-Next executes through its own target (hyper-connections, QSA, PLE); until it exists
-// its weights load and plan and a runtime built on them stops here.
 QwenTarget::QwenTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
-    : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
-  throw std::logic_error("Qwen3.8-Flash-Next execution is not implemented");
+    : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators),
+      qwen4_(std::make_shared<Qwen4ExpTarget>(weights, geometry, backend, operators)) {
+  requireWeights(weights, geometry_);
 }
 
 namespace {
@@ -136,6 +142,26 @@ void includeFfn(QwenTargetGeometry &geometry, const Qwen4ExpLayerWeights &layer,
 
 // The format of most routed expert weights of a GGUF target's MoE blocks,
 // GGUF_FMT_COUNT for none (ops::MoeShape::expertFormat).
+// The projections beside the FFN's a family's layer dispatches.
+void includeLayerExtras(QwenTargetGeometry &, const Qwen3_8LayerWeights &) {}
+void includeLayerExtras(QwenTargetGeometry &, const Qwen3_6MoeLayerWeights &) {}
+void includeHyper(QwenTargetGeometry &geometry, const Qwen4HyperWeights &mix) {
+  includeProjection(geometry, mix.down);
+  includeProjection(geometry, mix.up);
+}
+void includeLayerExtras(QwenTargetGeometry &geometry, const Qwen4ExpLayerWeights &layer) {
+  includeHyper(geometry, layer.mixerHyper);
+  includeHyper(geometry, layer.ffnHyper);
+  if (layer.indexer) {
+    includeProjection(geometry, layer.indexer->query);
+    includeProjection(geometry, layer.indexer->key);
+  }
+  if (layer.ple) {
+    includeProjection(geometry, layer.ple->key);
+    includeProjection(geometry, layer.ple->value);
+  }
+}
+
 uint32_t routedExpertFormat(std::span<const Qwen3_8LayerWeights>) { return GGUF_FMT_COUNT; }
 template <class Layer> uint32_t routedMoeExpertFormat(std::span<const Layer> layers) {
   std::array<uint64_t, GGUF_FMT_COUNT> weights{};
@@ -165,6 +191,7 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
       includeProjection(geometry, mixer.outputProjection);
     }, layer.mixer);
     includeFfn(geometry, layer, &layer == &weights.layers.front());
+    includeLayerExtras(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
   geometry.prefillProjections = geometry.decodeProjections;
@@ -180,6 +207,19 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
 template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &);
 template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &);
 template QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Qwen4ExpLayout, Qwen4ExpLayerWeights> &);
+
+QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights) {
+  QwenTargetGeometry geometry =
+      qwenTargetGeometry(static_cast<const QwenTargetWeights<Qwen4ExpLayout, Qwen4ExpLayerWeights> &>(weights));
+  QwenTargetGeometry head;
+  includeHyper(head, weights.finalHyper);
+  for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections}) {
+    shapes->insert(shapes->end(), head.decodeProjections.begin(), head.decodeProjections.end());
+    std::sort(shapes->begin(), shapes->end());
+    shapes->erase(std::unique(shapes->begin(), shapes->end()), shapes->end());
+  }
+  return geometry;
+}
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
@@ -202,7 +242,7 @@ void QwenTarget::requireSingleRowDecode() const {
         throw std::invalid_argument(std::string("single-row decode needs a PQ2_0 (Bonsai) target, found ") + s.name());
   };
   const auto *const *dense = std::get_if<const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> *>(&weights_);
-  if (!dense) throw std::invalid_argument("single-row decode does not support MoE targets");
+  if (!dense || qwen4_) throw std::invalid_argument("single-row decode does not support MoE targets");
   for (const Qwen3_8LayerWeights &layer : (*dense)->layers) {
     std::visit([&](const auto &mixer) { check(mixer.inputProjection); check(mixer.outputProjection); }, layer.mixer);
     for (const ops::Projection *p : {&layer.gateProjection, &layer.upProjection, &layer.downProjection}) check(*p);
@@ -276,6 +316,7 @@ metal::MetalBuffer QwenTarget::addPrefill(
       kvLayers.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen packed prefill batch");
   }
+  if (qwen4_) return qwen4_->addPrefill(graph, buffers, sequences, rows, kvLayers);
   for (const QwenTargetPrefillSequence &sequence : sequences) {
     if (sequence.convolutionIn.size() != geometry_.stateLayout.layers ||
         sequence.convolutionOut.size() != geometry_.stateLayout.layers ||
@@ -443,6 +484,7 @@ void QwenTarget::addVerify(
       buffers.chunkValues.size() != geometry_.kvLayout.attentionLayers) {
     throw std::invalid_argument("invalid Qwen verify batch");
   }
+  if (qwen4_) return qwen4_->addVerify(graph, buffers, kvLayers, chunks, lanes);
   const uint32_t rows = lanes * ExecutionLimits::targetVerifyRows;
   std::array<uint32_t, ExecutionLimits::maximumBatchWidth> histories{};
   for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -560,6 +602,7 @@ void QwenTarget::addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &la
 void QwenTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                               metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
                               ops::LinearScratch scratch) const {
+  if (qwen4_) return qwen4_->addHead(graph, std::move(hidden), std::move(logits), lanes, scratch);
   const ops::Linear &linear = operators_.linear();
   const ops::LinearPlan logitsPlan = linear.decodePlan(vocabularyProjection(), lanes);
   const ops::PreparedInput normalized = ops::Normalization::addRms(
@@ -594,6 +637,7 @@ void QwenTarget::addStateCommit(metal::CommandGraph &graph,
                                 uint32_t lanes) const {
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid Qwen state commit batch");
+  if (qwen4_) qwen4_->addPleCommit(graph, buffers, lanes);
   ops::GDN::addCommit(
       graph,
       {std::move(buffers.packed), std::move(buffers.mixed),
