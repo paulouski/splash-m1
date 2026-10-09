@@ -1287,7 +1287,8 @@ MetalBuffer MetalBackend::wrapSharedMemory(
             (void)lifetime;
         }];
     if (!buffer) {
-        throw MetalBackendError("zero-copy Metal buffer creation failed");
+        // The checks above passed, so the driver refused the mapping.
+        throw MetalAllocationError("zero-copy Metal buffer creation failed");
     }
     if (!label.empty()) buffer.label = checkedNSString(label, "buffer label");
     return impl_->registerBuffer(buffer, BufferStorage::Shared,
