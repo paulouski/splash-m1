@@ -870,7 +870,7 @@ class ModelArtifactTest(unittest.TestCase):
         installer.link_selection(destination, snapshot)
         ref = hub.pin(snapshot, self.MODEL_ID, destination)
         with mock.patch.object(
-            hub.os, "link", side_effect=AssertionError("cache write")
+            hub.os, "replace", side_effect=AssertionError("cache write")
         ):
             with contextlib.redirect_stdout(io.StringIO()):
                 legacy.prepare(installer.Selection.of(models, self.MODEL_ID))
@@ -885,7 +885,7 @@ class ModelArtifactTest(unittest.TestCase):
             with self.subTest(errno=code):
                 errors = io.StringIO()
                 with mock.patch.object(
-                    hub.os, "link", side_effect=OSError(code, "read only")
+                    hub.os, "replace", side_effect=OSError(code, "read only")
                 ):
                     with (
                         contextlib.redirect_stdout(io.StringIO()),
