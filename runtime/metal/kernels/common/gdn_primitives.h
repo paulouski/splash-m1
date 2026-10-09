@@ -75,7 +75,7 @@ inline uint gdn_output_head(uint head, bool tiled) {
 // reproduces these rows bitwise. The norm weights are read in their stored
 // type W: bfloat in the packed formats, float for a GGUF's F32 norms.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint PackedWidth, class W>
+          uint PackedWidth, class W, bool Sigmoid = false>
 inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
                device const W *norm_weight, device bfloat *hidden, uint task,
@@ -97,6 +97,7 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       bfloat(value * inverse * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
-  float silu = splash_silu(gate);
-  hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
+  // Qwen3.5 gates by silu(z), Qwen3.8-Flash-Next by sigmoid(z).
+  float gated = Sigmoid ? splash_sigmoid(gate) : splash_silu(gate);
+  hidden[hidden_base + thread_index] = bfloat(float(normalized) * gated);
 }

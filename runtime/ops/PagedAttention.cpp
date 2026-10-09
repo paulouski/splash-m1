@@ -5,12 +5,13 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace splash::ops {
 namespace {
 
-enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8 };
+enum class KernelLayout : uint8_t { Kv4Group6, Kv2Group8, Kv2Group12 };
 
 // One thread per gate element, across rows x query heads x head dimension.
 uint64_t gateGroups(uint64_t rows, uint32_t queryHeads, uint32_t headDimension) {
@@ -36,12 +37,34 @@ KernelLayout attentionKernelLayout(uint32_t queryHeads, kv::Layout layout) {
   if ((result == KernelLayout::Kv4Group6 && queryHeads == 24) ||
       (result == KernelLayout::Kv2Group8 && queryHeads == 16))
     return result;
+  // Qwen3.8-Flash-Next: 24 query heads over two KV heads; its KV storage is
+  // the two-head layout's.
+  if (result == KernelLayout::Kv2Group8 && queryHeads == 24) return KernelLayout::Kv2Group12;
   throw std::invalid_argument("no paged-attention kernel for layout");
 }
 
+// The group-of-twelve kernels (kernels/*/attention_*.metal, paged_attention.metal),
+// by their group-of-eight name; the split kernels have no such variant yet.
+constexpr std::pair<std::string_view, std::string_view> kGroup12Kernels[] = {
+    {"prefill_attention_reduce_kv2_g8", "prefill_attention_reduce_kv2_g12"},
+    {"prefill_attention_qkv_kv2_g8", "prefill_attention_qkv_kv2_g12"},
+    {"prefill_attention_gate_kv2_g8", "prefill_attention_gate_kv2_g12"},
+    {"verify_attention_reduce_kv2_g8", "verify_attention_reduce_kv2_g12"},
+    {"verify_attention_qkv_kv2_g8", "verify_attention_qkv_kv2_g12"},
+    {"verify_attention_gate_kv2_g8", "verify_attention_gate_kv2_g12"},
+    // The table gates' suffix (verify_attention_gate_table16_kv2_g12, ...).
+    {"_kv2_g8", "_kv2_g12"},
+};
+
 std::string_view pipeline(KernelLayout layout, std::string_view kv4Group6,
-                          std::string_view kv2Group8) noexcept {
-  return layout == KernelLayout::Kv4Group6 ? kv4Group6 : kv2Group8;
+                          std::string_view kv2Group8) {
+  if (layout == KernelLayout::Kv4Group6) return kv4Group6;
+  if (layout == KernelLayout::Kv2Group12) {
+    for (const auto &[group8, group12] : kGroup12Kernels)
+      if (group8 == kv2Group8) return group12;
+    throw std::invalid_argument("no group-of-twelve paged-attention kernel");
+  }
+  return kv2Group8;
 }
 
 // One dispatch normalizes both the queries and the keys, so their norms must

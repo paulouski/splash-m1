@@ -309,7 +309,7 @@ inline void gdn_decode_scan(device const float *state_in,
 // differently. Leaves the gated row in shared.rows for the out-projection
 // table.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
-          uint PackedWidth, class W>
+          uint PackedWidth, class W, bool Sigmoid = false>
 inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
                             device const bfloat *packed,
                             device const W *norm_weight, device bfloat *hidden,
@@ -339,8 +339,12 @@ inline void gdn_decode_gate(threadgroup GdnDecodeShared<HeadDim> &shared,
     const uint dim = 32 * g + lane;
     const bfloat normalized = bfloat((value[g] * inverse) * float(weight[g]));
     const float z = float(gate[g]);
-    const bfloat gated = bfloat((float(normalized) * z) /
-                                (1.0f + fast::exp2(-1.44269504089f * z)));
+    bfloat gated;
+    if constexpr (Sigmoid)
+      gated = bfloat(float(normalized) * splash_sigmoid(z));
+    else
+      gated = bfloat((float(normalized) * z) /
+                     (1.0f + fast::exp2(-1.44269504089f * z)));
     hidden[hidden_base + dim] = gated;
     shared.rows[token * HeadDim + dim] = gated;
   }
@@ -483,12 +487,13 @@ inline void gdn_commit_prefix_batch_phase(
 
 GDN_COMMIT_ENTRY(verify_gdn_commit, 16, 48, 128, 10240, 16640)
 GDN_COMMIT_ENTRY(verify_gdn_commit_vh32, 16, 32, 128, 8192, 12544)
+GDN_COMMIT_ENTRY(verify_gdn_commit_p16512, 16, 48, 128, 10240, 16512)
 #undef GDN_COMMIT_ENTRY
 
 // Grid {value heads, lanes}.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, uint RowsInFlight, class Table, class W,
-          bool QkPrepared = false>
+          bool QkPrepared = false, bool Sigmoid = false>
 inline void gdn_decode_batch_phase(
     device const bfloat *packed, device const bfloat *conv_weights,
     device const uchar *current0, device const uchar *current1,
@@ -536,7 +541,8 @@ inline void gdn_decode_batch_phase(
                                          lane, simd_group);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const bool tiled = params.tiled_heads != 0;
-  gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(
+  gdn_decode_gate<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W,
+                  Sigmoid>(
       shared, packed, gdn_norm_weight, lane_hidden, tiled, group.x, lane,
       simd_group);
   if (table) {
@@ -569,9 +575,9 @@ inline void gdn_decode_batch_phase(
 #define GDN_DECODE_THREADS \
     uint2 group [[threadgroup_position_in_grid]], \
     uint lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]
-#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
+#define GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, Sigmoid) \
     threadgroup GdnDecodeShared<HeadDim> shared; \
-    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout>( \
+    gdn_decode_batch_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, 2, Layout, W, false, Sigmoid>( \
         packed, conv_weights, current0, current1, current2, current3, next0, \
         next1, next2, next3, mixed, a_scale, dt_bias, decay, beta, \
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
@@ -584,17 +590,17 @@ inline void gdn_decode_batch_phase(
         gdn_norm_weight, gdn_hidden, params, group, lane, simd_group, shared, \
         table, sums);
 // Entries without a table pass null pointers, which skip the write; their Layout only completes the template.
-#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W) \
+#define GDN_DECODE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W, Sigmoid) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       constant GDNDecodeBatchParams &params [[buffer(17)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, q4sg::Table64) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, nullptr, nullptr, q4sg::Table64, W, Sigmoid) \
   }
 // The out-projection's table (Layout: q4sg::Table64 affine, gguf_sg::Table16 GGUF).
-#define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W) \
+#define GDN_DECODE_TABLE_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, Layout, W, Sigmoid) \
   kernel void Name(GDN_DECODE_BUFFERS(W), \
       device bfloat *table [[buffer(17)]], device float *sums [[buffer(18)]], \
       constant GDNDecodeBatchParams &params [[buffer(19)]], GDN_DECODE_THREADS) { \
-    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout) \
+    GDN_DECODE_BODY(KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, table, sums, Layout, W, Sigmoid) \
   }
 
 // The out-projection's table of the affine 8 x 16 x 48 layout, with the q/k
@@ -607,16 +613,21 @@ inline void gdn_decode_batch_phase(
   }
 
 // Two rows overlap reductions and arithmetic without the register cost of four.
-GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, 16640, bfloat)
-GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192, 12544, bfloat)
+GDN_DECODE_ENTRY(verify_gdn_fused, 16, 48, 128, 10240, 16640, bfloat, false)
+GDN_DECODE_ENTRY(verify_gdn_fused_vh32, 16, 32, 128, 8192, 12544, bfloat, false)
 // Table64 feeds the affine models, whose norms are bf16; Table16 a GGUF's, whose norms are F32.
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64, 16, 48, 128, 10240, 16640, q4sg::Table64, bfloat)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64, 16, 48, 128, 10240, 16640, q4sg::Table64, bfloat, false)
 GDN_DECODE_QK_ONCE_TABLE_ENTRY(verify_gdn_fused_table64_qk_once, 16, 48, 128, 10240, 16640, q4sg::Table64, bfloat)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64_vh32, 16, 32, 128, 8192, 12544, q4sg::Table64, bfloat)
-GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, 16640, float)
-GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, 12544, float)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float)
-GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64_vh32, 16, 32, 128, 8192, 12544, q4sg::Table64, bfloat, false)
+GDN_DECODE_ENTRY(verify_gdn_fused_f32, 16, 48, 128, 10240, 16640, float, false)
+GDN_DECODE_ENTRY(verify_gdn_fused_vh32_f32, 16, 32, 128, 8192, 12544, float, false)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_f32, 16, 48, 128, 10240, 16640, gguf_sg::Table16, float, false)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_vh32_f32, 16, 32, 128, 8192, 12544, gguf_sg::Table16, float, false)
+// Qwen3.8-Flash-Next: 16512-column rows, sigmoid output gate.
+GDN_DECODE_ENTRY(verify_gdn_fused_p16512, 16, 48, 128, 10240, 16512, bfloat, true)
+GDN_DECODE_ENTRY(verify_gdn_fused_p16512_f32, 16, 48, 128, 10240, 16512, float, true)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table64_p16512, 16, 48, 128, 10240, 16512, q4sg::Table64, bfloat, true)
+GDN_DECODE_TABLE_ENTRY(verify_gdn_fused_table16_p16512_f32, 16, 48, 128, 10240, 16512, gguf_sg::Table16, float, true)
 #undef GDN_DECODE_ENTRY
 #undef GDN_DECODE_QK_ONCE_TABLE_ENTRY
 #undef GDN_DECODE_TABLE_ENTRY

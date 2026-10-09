@@ -801,6 +801,10 @@ int main(int argc, char **argv) {
         for (bool verify : {false, true})
           checkProjection(backend, heads, {1, heads == 24 ? 4U : 2U, 256, kv::Format::Int8}, float32,
                           verify);
+    // Qwen3.8-Flash-Next: 24 query heads over two KV heads.
+    for (bool float32 : {false, true})
+      for (bool verify : {false, true})
+        checkProjection(backend, 24, {1, 2, 256, kv::Format::Int8}, float32, verify);
     if (argc == 3 && std::string_view(argv[2]) == "--long") {
       for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
         for (uint32_t heads : {24U, 16U})

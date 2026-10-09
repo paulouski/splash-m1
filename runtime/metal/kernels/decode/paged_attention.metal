@@ -116,3 +116,16 @@ kernel void verify_attention_reduce_kv2_g8(
   splash_verify_attention_reduce_phase<2, 8>(
       partials, statistics, output, params, group, thread_index, weights, group_values);
 }
+
+kernel void verify_attention_reduce_kv2_g12(
+    device const float *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant SplashVerifyAttentionParams *params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[SplashVerifyMaximumSplits];
+  threadgroup float group_values[8];
+  splash_verify_attention_reduce_phase<2, 12>(
+      partials, statistics, output, params, group, thread_index, weights, group_values);
+}

@@ -402,6 +402,7 @@ int main(int argc,char **argv) {
       for (uint32_t lanes : {1U,2U,3U,4U}) {
         fusedAttentionGate(backend, 24, 4, lanes, layout);
         fusedAttentionGate(backend, 16, 2, lanes, layout);
+        fusedAttentionGate(backend, 24, 2, lanes, layout);
       }
     // The bf16 Simdgroup tile needs Apple family 9.
     std::vector<LinearTile> tiles{LinearTile::SimdgroupF32};

@@ -47,7 +47,8 @@ constexpr uint32_t kLayers = 2;
 // The scales of the normalized q and k rows.
 constexpr double kQueryScale = 0.0078125, kKeyScale = 0.08838834765;
 constexpr std::array kShapes{GdnShape{16, 48, 128, 10240, 16640},
-                             GdnShape{16, 32, 128, 8192, 12544}};
+                             GdnShape{16, 32, 128, 8192, 12544},
+                             GdnShape{16, 48, 128, 10240, 16512}};
 
 template <class Function> void rejects(Function function) {
   try {
@@ -469,7 +470,9 @@ void checkDecode(const Fixture &fixture, uint32_t layer, uint32_t lane) {
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double normalized = roundBfloat(exact[dim]);
         const double gate = bf16ToFloat(packed[zOffset + head * kHeadDim + dim]);
-        const double reference = normalized * gate * sigmoid(gate);
+        // The 16512-column rows are Qwen3.8-Flash-Next's, gated by sigmoid.
+        const double reference =
+            normalized * (shape.packedWidth == 16512 ? 1.0 : gate) * sigmoid(gate);
         require(closeBfloat(hidden[dim], reference, 3.0, 1e-6),
                 where + ": hidden mismatch");
         inexact += bf16ToFloat(hidden[dim]) != roundBfloat(reference);

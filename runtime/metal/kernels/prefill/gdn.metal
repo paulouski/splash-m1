@@ -308,11 +308,12 @@ inline void gdn_prepare_prefill_phase(
 
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare, 16, 48, 128, 10240, 16640)
 GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192, 12544)
+GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_p16512, 16, 48, 128, 10240, 16512)
 #undef GDN_PREPARE_PREFILL_ENTRY
 
 // W: the norm weights' stored type (float: a GGUF's F32 norms, _f32).
 #define GDN_GATE_PREFILL_ENTRY(Name, KeyHeads, ValueHeads, HeadDim, ConvDim,  \
-                               PackedWidth, W)                                \
+                               PackedWidth, W, Sigmoid)                       \
   kernel void Name(                                                           \
       device const bfloat *recurrent [[buffer(0)]],                           \
       device const bfloat *packed [[buffer(1)]],                              \
@@ -324,14 +325,18 @@ GDN_PREPARE_PREFILL_ENTRY(prefill_gdn_prepare_vh32, 16, 32, 128, 8192, 12544)
       uint lane [[thread_index_in_simdgroup]],                                \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
     threadgroup float reductions[4];                                          \
-    gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth>(      \
+    gdn_gate_phase<KeyHeads, ValueHeads, HeadDim, ConvDim, PackedWidth, W,    \
+                   Sigmoid>(                                                  \
         recurrent, packed, norm_weight, hidden, task,                         \
         params.tiled_heads != 0, reductions, thread_index, lane, simd_group); \
   }
 
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240, 16640, bfloat)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192, 12544, bfloat)
-GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_f32, 16, 48, 128, 10240, 16640, float)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate, 16, 48, 128, 10240, 16640, bfloat, false)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32, 16, 32, 128, 8192, 12544, bfloat, false)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_f32, 16, 48, 128, 10240, 16640, float, false)
 GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_vh32_f32, 16, 32, 128, 8192, 12544,
-                       float)
+                       float, false)
+// Qwen3.8-Flash-Next: 16512-column rows, sigmoid output gate.
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_p16512, 16, 48, 128, 10240, 16512, bfloat, true)
+GDN_GATE_PREFILL_ENTRY(prefill_gdn_gate_p16512_f32, 16, 48, 128, 10240, 16512, float, true)
 #undef GDN_GATE_PREFILL_ENTRY

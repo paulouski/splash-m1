@@ -76,6 +76,7 @@ double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
 }
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
+double sigmoid(double value) { return 1.0 / (1.0 + std::exp(-value)); }
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
@@ -229,7 +230,9 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
   double prepareUlps = 0.0;
   auto checkPrepare = [&](double got, double ref) {
     worstPrepare.add(got, ref);
-    prepareUlps = std::max(prepareUlps, std::fabs(got - ref) / bf16Ulp(ref));
+    // Below 1e-6 a convolution that cancels differs by fp32 rounding, not ulps.
+    prepareUlps = std::max(prepareUlps, std::fabs(got - ref) /
+                                           bf16Ulp(std::max(std::fabs(ref), 1e-6)));
   };
   std::vector<double> row(kHeadDim);
   for (uint32_t token = 0; token < tokens; ++token) {
@@ -366,7 +369,8 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
-        const double ref = roundBf16(roundBf16(normalized[dim]) * silu(z));
+        const double ref = roundBf16(roundBf16(normalized[dim]) *
+                                     (packedWidth == 16512 ? sigmoid(z) : silu(z)));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));
@@ -493,7 +497,8 @@ void runTiledCase(MetalBackend &backend, const GdnShape &shape,
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
-       {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
+       {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544},
+        GdnShape{16, 48, 128, 10240, 16512}}) {
     for (uint32_t tokens : {1u, 37u, 1000u, 2048u})
       runCase(backend, shape, tokens);
     for (uint32_t tokens : {1u, 37u})

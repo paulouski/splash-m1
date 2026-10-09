@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -14,7 +16,9 @@ namespace {
 
 static_assert(offsetof(GDNDecodeBatchParams, conv_layer_bytes) == 8);
 
-enum class KernelLayout : uint8_t { Value48, Value32 };
+// Value48P16512: Qwen3.8-Flash-Next's 48 value heads, whose packed rows are
+// 16512 columns wide and whose output gate is sigmoid(z), not silu(z).
+enum class KernelLayout : uint8_t { Value48, Value32, Value48P16512 };
 
 [[nodiscard]] KernelLayout kernelShape(const GdnShape &shape) {
   if (!shape.valid())
@@ -23,13 +27,20 @@ enum class KernelLayout : uint8_t { Value48, Value32 };
     return KernelLayout::Value48;
   if (shape == GdnShape{16, 32, 128, 8192, 12544})
     return KernelLayout::Value32;
+  if (shape == GdnShape{16, 48, 128, 10240, 16512})
+    return KernelLayout::Value48P16512;
   throw std::invalid_argument("unsupported compiled GDN shape");
 }
 
-[[nodiscard]] const char *kernelName(KernelLayout shape,
-                                     const char *value48,
-                                     const char *value32) noexcept {
-  return shape == KernelLayout::Value48 ? value48 : value32;
+// A kernel's variant: the scan reads no packed rows, so all 48-head layouts
+// share it (`packed` false).
+[[nodiscard]] std::string kernelName(KernelLayout shape, std::string_view value48,
+                                     std::string_view value32, bool packed = true) {
+  if (shape == KernelLayout::Value32)
+    return std::string(value32);
+  if (shape == KernelLayout::Value48P16512 && packed)
+    return std::string(value48) + "_p16512";
+  return std::string(value48);
 }
 
 } // namespace
@@ -51,10 +62,10 @@ void GDN::addPrefill(metal::CommandGraph &graph, GdnPrefillBuffers buffers,
              buffers.timeBias, buffers.decay, buffers.beta},
             params, {uint64_t{tokens} * shape.keyHeads, 1, 1},
             {shape.headDimension, 1, 1});
-  const char *scan = bf16Staging && kernel == KernelLayout::Value48
-                         ? "prefill_gdn_scan_bf16_block16"
-                         : kernelName(kernel, "prefill_gdn_scan",
-                                      "prefill_gdn_scan_vh32");
+  const std::string scan = bf16Staging && kernel != KernelLayout::Value32
+                               ? "prefill_gdn_scan_bf16_block16"
+                               : kernelName(kernel, "prefill_gdn_scan",
+                                            "prefill_gdn_scan_vh32", false);
   graph.add(scan,
             {buffers.queries, buffers.keys, buffers.values, buffers.decay,
              buffers.beta, buffers.recurrentIn, buffers.recurrentOut,
