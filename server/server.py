@@ -59,7 +59,6 @@ from .output import (
     ReasoningSplitter,
     StreamingToolCallProjector,
     validate_response_content,
-    validate_tool_calls,
 )
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 from .user_settings import (
@@ -965,25 +964,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return True
 
     def _finalize_content(self, content, job, incomplete, projector):
-        """The content and calls of the output, validated unless it was cut,
-        and the content the stream still owes. `content` is read only without
-        tools: with tools, the projector holds the content."""
+        """The content and calls of the output, and the events the stream
+        still owes. An answer without calls is validated against the response
+        format unless it was cut. `content` is read only without tools: with
+        tools, the projector holds the content."""
         if job.tool_policy is None:
             if not incomplete:
                 validate_response_content(content, job.response_validator)
-            return content, [], ""
-        content, tool_calls, unsent = projector.finish(incomplete)
-        if not incomplete:
-            validate_tool_calls(tool_calls, job.tool_policy)
-            if not tool_calls:
-                validate_response_content(content, job.response_validator)
-            elif job.response_validator is not None and content.strip():
-                raise APIError(
-                    500,
-                    "structured tool output contains text outside tool calls",
-                    "invalid_model_output",
-                )
-        return content, tool_calls, unsent
+            return content, [], []
+        content, tool_calls, events = projector.finish(incomplete)
+        if not incomplete and not tool_calls:
+            validate_response_content(content, job.response_validator)
+        return content, tool_calls, events
 
     def _collect(
         self,
@@ -999,23 +991,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
-        splitter = ReasoningSplitter(job.thinking)
+        policy = job.tool_policy
+        splitter = ReasoningSplitter(job.thinking, job.may_call_tools)
         # Output with tools is parsed as it arrives whether it streams or not.
         projector = (
             StreamingToolCallProjector(
-                job.tool_policy, job.public_id, job.response_validator is not None
+                policy, job.public_id, job.response_validator is not None
             )
-            if job.tool_policy is not None
+            if policy is not None
             else None
         )
         reasoning, content, result = [], [], None
 
-        def append(field, text):
-            if field == "content" and projector is not None:
-                events = projector.put(text)
-            else:
-                (reasoning if field == "reasoning_content" else content).append(text)
-                events = [(field, text)]
+        def publish(events):
             if on_text is None:
                 return
             for kind, value in events:
@@ -1023,6 +1011,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     on_tool_delta(value)
                 else:
                     on_text(kind, value)
+
+        def append(field, text):
+            if field == "content" and projector is not None:
+                publish(projector.put(text))
+            else:
+                (reasoning if field == "reasoning_content" else content).append(text)
+                publish([(field, text)])
 
         while result is None:
             kind, value = self._next_event(job, on_idle)
@@ -1037,11 +1032,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 result = value
         for field, text in splitter.finish():
             append(field, text)
-        content_text, tool_calls, unsent = self._finalize_content(
+        content_text, tool_calls, events = self._finalize_content(
             "".join(content), job, result.reason == "length", projector
         )
-        if unsent and on_text is not None:
-            on_text("content", unsent)
+        publish(events)
         return Collected(
             "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
         )

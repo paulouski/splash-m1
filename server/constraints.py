@@ -14,7 +14,12 @@ from llguidance.numpy import (
 
 from . import runtime as engine_runtime
 from .errors import APIError, ConstraintError
-from .tool_schema import THINK_END, THINK_END_TOKEN_ID
+from .tool_schema import (
+    THINK_END,
+    THINK_END_TOKEN_ID,
+    TOOL_CALL_OPEN,
+    TOOL_CALL_OPEN_TOKEN_ID,
+)
 
 
 class TokenConstraint:
@@ -113,6 +118,7 @@ def validate_tokenizer(tokenizer):
         "<|endoftext|>": TokenConstraint.EOS_TOKENS[0],
         "<|im_end|>": TokenConstraint.EOS_TOKENS[1],
         THINK_END: THINK_END_TOKEN_ID,
+        TOOL_CALL_OPEN: TOOL_CALL_OPEN_TOKEN_ID,
     }
     for token, token_id in expected.items():
         if vocabulary.get(token) != token_id or tokenizer.encode(
