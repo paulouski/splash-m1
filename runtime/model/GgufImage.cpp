@@ -144,6 +144,27 @@ public:
     copiedRows(*tensor);
   }
 
+  // An F32, BF16 or Q8_0 tensor [rows, columns] as F32 rows: as stored, or the
+  // F32 values BF16 or Q8_0 (d * q) equal exactly. With `withDescriptor` it is
+  // a float tensor a projection runs (the QSA indexer's projections, which
+  // are BF16), else its rows alone (the hyper-connections' injection
+  // weights; the MTP head's are Q8_0).
+  void floatRows(const std::string &name, uint64_t rows, uint64_t columns, bool withDescriptor) {
+    const GgufTensor *tensor = find(name, [](uint32_t type) {
+      return type == ggml::kF32 || type == ggml::kBF16 || type == ggml::kQ8_0;
+    });
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("expected an F32, BF16 or Q8_0 [" + std::to_string(rows) + ", " + std::to_string(columns) +
+                      "] tensor: " + name);
+    const uint64_t bytes = rows * columns * sizeof(float);
+    if (withDescriptor) descriptor(ggml::kF32, rows, columns, {}, {bytes, 0, 0}, name);
+    image_.copies.push_back({section(bytes), tensorRows(*tensor, rows, tensor->bytes / rows),
+                             tensor->type == ggml::kBF16   ? Conversion::WidenToFloat32
+                             : tensor->type == ggml::kQ8_0 ? Conversion::DequantizeQ80
+                                                           : Conversion::None});
+  }
+
   // Value heads of headRows rows from row `from` on, in grouped order.
   RowOrder grouped(uint64_t from, uint32_t headRows) const {
     if (file_.valueRowsGrouped()) return {};
@@ -183,7 +204,7 @@ private:
 
   static TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) {
     if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
-    return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order};
+    return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, tensor.file};
   }
 
   // Rows written as stored, or narrowed to bf16, into their own section.
@@ -198,15 +219,18 @@ private:
     copy(tensorRows(tensor, tensor.rows(), tensor.bytes / tensor.rows()));
   }
 
-  // The descriptor and planes of a [rows, columns] quantized tensor.
+  // The descriptor and planes of a [rows, columns] quantized tensor: rows of
+  // whole 64-column tiles, held in whole plane tiles (the rows past the
+  // tensor zero), columns of the format's unit.
   Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
-    if (rows % QUANT_TILE_ROWS || columns % kGgufBlockColumns) throw GgufError("tensor is not tile aligned: " + name);
     const QuantFormat &layout = kQuantFormats[format];
-    const GgufPlaneBytes bytes = ggufPlaneBytes(layout, rows, columns);
+    if (rows % GGUF_TILE_COLUMNS || columns % ggufColumnUnit(layout)) throw GgufError("tensor is not tile aligned: " + name);
+    const uint64_t stored = ggufStorageRows(rows);
+    const GgufPlaneBytes bytes = ggufPlaneBytes(layout, stored, columns);
     descriptor(layout.ggml_type, rows, columns, layout, bytes, name);
     Repack repack;
     repack.format = format;
-    repack.rows = rows;
+    repack.rows = stored;
     repack.columns = columns;
     repack.plane0 = section(bytes.plane0);
     repack.plane1 = bytes.plane1 ? section(bytes.plane1) : 0;
@@ -287,6 +311,19 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   expect("ssm.time_step_rank", geometry.gdnValueHeads);
   expect("ssm.state_size", geometry.gdnHeadDimension);
   expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
+  if (geometry.qwen4()) {
+    expect("hyper_connection.count", geometry.hyperConnections);
+    expect("hyper_connection.low_rank", geometry.hyperRank);
+    expect("attention.indexer.head_count", geometry.indexerHeads);
+    expect("attention.indexer.key_length", geometry.indexerHeadDimension);
+    expect("attention.indexer.top_k", uint64_t{geometry.indexerTopBlocks} * geometry.indexerBlockTokens);
+    if (geometry.hasPle()) {
+      expect("ple.ngram_size", geometry.pleNgram);
+      expect("ple.heads_per_ngram", geometry.pleHeadsPerNgram);
+      expect("ple.conv_kernel", geometry.pleConvolutionTaps);
+      expect("embedding_length_per_layer_input", geometry.pleHeadDimension);
+    }
+  }
   if (geometry.sparseMoe()) {
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
@@ -298,12 +335,24 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
-Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std::string> &problems,
-                 uint32_t index) {
-  const std::string p = prefix(index);
-  const bool full = g.isFullAttentionLayer(index);
-  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
-  b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+// One hyper-connection mix (model/Qwen4Exp.hpp Qwen4HyperWeights): its norm,
+// down and up projections and, when it injects, its injection weights.
+void hyperImage(Builder &b, const TargetGeometry &g, const std::string &stem, bool inject) {
+  const uint64_t streams = g.streamWidth();
+  b.floatNorm(stem + "_norm.weight", streams);
+  b.quantized(stem + "_down.weight", g.hyperRank, streams);
+  b.quantized(stem + "_up.weight", streams, g.hyperRank);
+  if (inject) b.floatRows(stem + "_inject.weight", g.hyperConnections, streams, false);
+}
+
+void indexerImage(Builder &b, const TargetGeometry &g, const std::string &p) {
+  b.floatRows(p + "indexer.q_proj.weight", uint64_t{g.indexerHeads} * g.indexerHeadDimension, g.hiddenSize, true);
+  b.floatRows(p + "indexer.k_proj.weight", g.indexerHeadDimension, g.hiddenSize, true);
+  b.floatNorm(p + "indexer.q_norm.weight", g.indexerHeadDimension);
+  b.floatNorm(p + "indexer.k_norm.weight", g.indexerHeadDimension);
+}
+
+void mixerImage(Builder &b, const TargetGeometry &g, const std::string &p, bool full) {
   if (full) {
     b.quantized(p + "attn_q.weight", 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension),
                 g.hiddenSize);
@@ -325,7 +374,9 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.floatNorm(p + "ssm_norm.weight", g.gdnHeadDimension);
     b.quantized(p + "ssm_out.weight", g.hiddenSize, valueRows);
   }
-  b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+}
+
+void ffnImage(Builder &b, const TargetGeometry &g, const std::string &p) {
   if (g.sparseMoe()) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
@@ -341,6 +392,67 @@ Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std:
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
   }
+}
+
+// The PLE layer's projections, norms and dilated convolution taps.
+void pleImage(Builder &b, const TargetGeometry &g, const std::string &p) {
+  const uint64_t width = uint64_t{g.pleNgram - 1} * g.pleHeadsPerNgram * g.pleHeadDimension;
+  b.quantized(p + "ple_key.weight", g.streamWidth(), width);
+  b.quantized(p + "ple_value.weight", g.hiddenSize, width);
+  b.floatNorm(p + "ple_norm_key.weight", g.streamWidth());
+  b.floatNorm(p + "ple_norm_query.weight", g.streamWidth());
+  b.floatNorm(p + "ple_norm_conv.weight", g.streamWidth());
+  b.floatNorm(p + "ple_conv1d.weight", g.streamWidth() * g.pleConvolutionTaps);
+}
+
+Image qwen4LayerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std::string> &problems,
+                      uint32_t index) {
+  const std::string p = prefix(index);
+  const bool full = g.isFullAttentionLayer(index);
+  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
+  hyperImage(b, g, p + "hc_attn", true);
+  mixerImage(b, g, p, full);
+  if (full) indexerImage(b, g, p);
+  hyperImage(b, g, p + "hc_ffn", true);
+  ffnImage(b, g, p);
+  if (g.hasPle() && index == g.pleLayer) pleImage(b, g, p);
+  return b.finish();
+}
+
+// The arrays a qwen4exp GGUF declares, which requireMetadata's scalars leave
+// out: each layer's QSA compress ratio (the target's layers, and an MTP
+// file's block when it carries one), the multimodal RoPE sections the kernels
+// hardcode and the PLE layer. One error names every mismatch.
+void requireQwen4Arrays(const GgufFile &file, const TargetGeometry &g) {
+  const std::string arch = g.architecture();
+  std::string mismatched;
+  const auto ratios = file.numericArray(arch + ".attention.compress_ratios");
+  bool ratiosMatch = ratios && ratios->size() >= g.layers;
+  for (uint32_t layer = 0; ratiosMatch && layer < g.layers; ++layer)
+    ratiosMatch = (*ratios)[layer] == (g.isFullAttentionLayer(layer) ? g.indexerBlockTokens : 0);
+  if (!ratiosMatch) mismatched += "attention.compress_ratios";
+  const auto sections = file.numericArray(arch + ".rope.dimension_sections");
+  if (!sections || sections->size() != 4 || (*sections)[0] != 11 || (*sections)[1] != 11 || (*sections)[2] != 10 ||
+      (*sections)[3] != 0)
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.dimension_sections (expected 11, 11, 10, 0)");
+  if (g.hasPle()) {
+    const auto layers = file.numericArray(arch + ".ple.layers");
+    if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
+  }
+  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+}
+
+Image layerImage(const GgufFile &file, const TargetGeometry &g, std::vector<std::string> &problems,
+                 uint32_t index) {
+  if (g.qwen4()) return qwen4LayerImage(file, g, problems, index);
+  const std::string p = prefix(index);
+  const bool full = g.isFullAttentionLayer(index);
+  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
+  b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+  mixerImage(b, g, p, full);
+  b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+  ffnImage(b, g, p);
   return b.finish();
 }
 
@@ -369,12 +481,14 @@ void requireRotation(const GgufFile &file, const TargetGeometry &g, const std::v
 
 std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geometry) {
   requireMetadata(file, geometry);
+  if (geometry.qwen4()) requireQwen4Arrays(file, geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)
     images.push_back(layerImage(file, geometry, problems, layer));
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
-  head.floatNorm("output_norm.weight", geometry.hiddenSize);
+  if (geometry.qwen4()) hyperImage(head, geometry, "output_hc", false);
+  else head.floatNorm("output_norm.weight", geometry.hiddenSize);
   head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);
   images.push_back(head.finish());
   Builder embedding(file, geometry, problems, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
@@ -387,6 +501,76 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
   }
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+Image planMtpImage(const GgufFile &file, const TargetGeometry &target) {
+  if (!target.qwen4()) throw GgufError("only a qwen4exp target has an MTP head");
+  TargetGeometry g = target;
+  g.pleNgram = 0; // the MTP file carries no PLE metadata
+  requireMetadata(file, g);
+  requireQwen4Arrays(file, g);
+  if (file.unsignedValue(g.architecture() + std::string(".nextn_predict_layers")) != 1)
+    throw GgufError("the MTP GGUF must hold one nextn layer");
+  std::vector<std::string> problems;
+  const std::string p = prefix(g.layers);
+  Builder b(file, g, problems, "mtp.bin", g.layers, 4);
+  hyperImage(b, g, p + "hc_attn", true);
+  mixerImage(b, g, p, true);
+  indexerImage(b, g, p);
+  hyperImage(b, g, p + "hc_ffn", true);
+  ffnImage(b, g, p);
+  b.quantized(p + "nextn.eh_proj.weight", g.hiddenSize, 2ull * g.hiddenSize);
+  b.floatNorm(p + "nextn.enorm.weight", g.hiddenSize);
+  b.floatNorm(p + "nextn.hnorm.weight", g.streamWidth());
+  hyperImage(b, g, p + "nextn.hc_head", false);
+  if (!problems.empty()) {
+    std::string names;
+    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
+    throw GgufError("MTP GGUF tensors this build cannot load: " + names);
+  }
+  return b.finish();
+}
+
+std::optional<PleTable> readPleTable(const GgufFile &file, const TargetGeometry &g) {
+  if (!g.hasPle()) return std::nullopt;
+  const std::string arch = g.architecture();
+  const uint32_t heads = (g.pleNgram - 1) * g.pleHeadsPerNgram;
+  if (g.pleNgram > 4 || heads > pleMaximumHeads) throw GgufError("unsupported PLE n-gram shape");
+  const auto array = [&](const char *key, size_t count) {
+    const auto values = file.numericArray(arch + ".ple." + key);
+    if (!values || values->size() < count) throw GgufError("GGUF PLE metadata is missing: ple." + std::string(key));
+    return *values;
+  };
+  // Every value is an integer below 2^53, which the parser's doubles hold exactly.
+  const auto exact = [](double value, double limit) {
+    if (!(value >= 0 && value <= limit) || value != std::floor(value))
+      throw GgufError("GGUF PLE metadata holds an invalid value");
+    return static_cast<uint64_t>(value);
+  };
+  const GgufTensor &table = file.require("per_layer_token_embd.weight");
+  if (table.type != ggml::kIQ4_NL || table.dims.size() != 2 || table.columns() != g.pleHeadDimension ||
+      table.bytes != table.rows() * pleRowBytes)
+    throw GgufError("per_layer_token_embd must be IQ4_NL rows of " + std::to_string(pleRowBytes) + " bytes");
+  PleTable result;
+  result.rows = table.rows();
+  result.hash.ngram = g.pleNgram;
+  result.hash.headsPerNgram = g.pleHeadsPerNgram;
+  const auto multipliers = array("layer_multipliers", g.pleNgram);
+  for (uint32_t i = 0; i < g.pleNgram; ++i) result.hash.multipliers[i] = exact(multipliers[i], 9007199254740992.0);
+  const auto offsets = array("head_offsets", heads), sizes = array("head_vocab_sizes", heads);
+  for (uint32_t h = 0; h < heads; ++h) {
+    const uint64_t offset = exact(offsets[h], 4294967295.0), size = exact(sizes[h], 4294967295.0);
+    if (!size || offset + size > result.rows) throw GgufError("a PLE head's rows lie outside per_layer_token_embd");
+    result.hash.offsets.push_back(static_cast<uint32_t>(offset));
+    result.hash.vocabularies.push_back(static_cast<uint32_t>(size));
+  }
+  result.hash.eos = static_cast<uint32_t>(file.unsignedValue(arch + ".ple.eos_token_id").value_or(0));
+  if (!result.hash.eos) throw GgufError("GGUF PLE metadata is missing: ple.eos_token_id");
+  if (result.rows > UINT32_MAX) throw GgufError("per_layer_token_embd has more rows than a row id holds");
+  const WeightSource &source = file.source(table.file);
+  result.path = source.path();
+  result.dataOffset = source.dataOffset() + table.offset;
+  return result;
 }
 
 } // namespace splash::model::gguf

@@ -5,6 +5,7 @@
 #include "model/QwenTargetLoader.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 
+#include <deque>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -40,6 +41,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layo
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
                          const QwenTargetFiles<Qwen3_6MoeLayout> &files) {
   return loadQwen3_6MoeWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
+                         const QwenTargetFiles<Qwen4ExpLayout> &files) {
+  return loadQwen4ExpWeights(backend, layout, files);
 }
 
 } // namespace
@@ -85,25 +91,33 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
           prepareTarget();
           return readTarget(backend, layout, files);
         };
-        switch (result.descriptor.targetSource) {
-        case TargetSource::Packed:
-          return read(PackedTargetFiles<Layout>{backend, directory, layout}, {}, [] {});
-        case TargetSource::Mlx: {
-          AffineTargetLoader loader(backend, directory, layout, admitConversion);
-          return read(loader, loader.weights(), [&] { loader.prepare(); });
-        }
-        case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, findTargetGguf(directory), ggufTargetGeometry(layout),
+        if constexpr (Layout::ggufOnly) {
+          if (result.descriptor.targetSource != TargetSource::Gguf)
+            throw std::invalid_argument("this model's weights load from a GGUF only");
+          GgufTargetLoader loader(backend, findTargetGgufs(directory), ggufTargetGeometry(layout),
                                   admitConversion);
           return read(loader, loader.weights(), [&] { loader.prepare(); });
+        } else {
+          switch (result.descriptor.targetSource) {
+          case TargetSource::Packed:
+            return read(PackedTargetFiles<Layout>{backend, directory, layout}, {}, [] {});
+          case TargetSource::Mlx: {
+            AffineTargetLoader loader(backend, directory, layout, admitConversion);
+            return read(loader, loader.weights(), [&] { loader.prepare(); });
+          }
+          case TargetSource::Gguf: {
+            GgufTargetLoader loader(backend, findTargetGgufs(directory), ggufTargetGeometry(layout),
+                                    admitConversion);
+            return read(loader, loader.weights(), [&] { loader.prepare(); });
+          }
+          case TargetSource::PrismMlx: {
+            GgufTargetLoader loader(backend, PrismMlxDirectory{directory}, ggufTargetGeometry(layout),
+                                    admitConversion);
+            return read(loader, loader.weights(), [&] { loader.prepare(); });
+          }
+          }
+          throw std::invalid_argument("unknown target source");
         }
-        case TargetSource::PrismMlx: {
-          GgufTargetLoader loader(backend, PrismMlxDirectory{directory}, ggufTargetGeometry(layout),
-                                  admitConversion);
-          return read(loader, loader.weights(), [&] { loader.prepare(); });
-        }
-        }
-        throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
   if (result.descriptor.hasDraft())
@@ -163,8 +177,10 @@ uint64_t preparedModelWeightBytes(const std::filesystem::path &root, const Model
 uint64_t preparedModelWeightBytes(const ModelPaths &paths, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
-    WeightSource source(findTargetGguf(paths.target));
-    const GgufFile file(source);
+    std::deque<WeightSource> sources;
+    std::vector<WeightSource *> parts;
+    for (const std::filesystem::path &path : findTargetGgufs(paths.target)) parts.push_back(&sources.emplace_back(path));
+    const GgufFile file(parts);
     bytes = std::visit(
         [&](const auto &layout) {
           return PreparedImages<gguf::Image>::bytes(gguf::planImages(file, ggufTargetGeometry(layout)));
@@ -186,8 +202,11 @@ uint64_t preparedModelWeightBytes(const ModelPaths &paths, const ModelDescriptor
     // values over the default-4-bit estimate): metadata only, no backend.
     const SafetensorsCheckpoint source(paths.target, PreparationCheck{});
     bytes = std::visit(
-        [&source](const auto &layout) {
-          return PreparedImages<affine::Image>::bytes(affineTargetImages(layout, source));
+        [&source](const auto &layout) -> uint64_t {
+          if constexpr (std::remove_cvref_t<decltype(layout)>::ggufOnly)
+            throw std::invalid_argument("this model's weights load from a GGUF only");
+          else
+            return PreparedImages<affine::Image>::bytes(affineTargetImages(layout, source));
         },
         descriptor.target);
   }

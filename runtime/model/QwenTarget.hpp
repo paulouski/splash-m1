@@ -26,6 +26,7 @@ struct Qwen3_8Layout;
 struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
+struct Qwen4ExpWeights;
 
 // Both supported targets bind the same mixer tensors per hybrid layer; only
 // the FFN differs between them.
@@ -62,7 +63,7 @@ struct QwenTargetWeightsBase {
 };
 
 // The weights of a target of Layout, whose layers the family keeps in Layer.
-template <class Layout, class Layer> struct QwenTargetWeights final : QwenTargetWeightsBase {
+template <class Layout, class Layer> struct QwenTargetWeights : QwenTargetWeightsBase {
   Layout layout;
   std::vector<Layer> layers;
 };
@@ -271,6 +272,10 @@ public:
   template <class Layout, class Layer>
   QwenTarget(const QwenTargetWeights<Layout, Layer> &weights, const QwenTargetGeometry &geometry,
              metal::MetalBackend &backend, const ops::ExecutionPlans &operators);
+  // Qwen3.8-Flash-Next: its weights load and plan, but this graph does not
+  // run them yet; throws std::logic_error.
+  QwenTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
+             const ops::ExecutionPlans &operators);
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;

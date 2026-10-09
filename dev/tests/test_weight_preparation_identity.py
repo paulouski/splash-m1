@@ -21,6 +21,7 @@ REVIEWED = {
     "runtime/model/AffinePreparation.hpp": "the affine plan, which keys record whole",
     "runtime/model/SafetensorsCheckpoint.hpp": "the parser; preparation binds and identifies its tensors",
     "runtime/model/GgufPreparation.hpp": "the executor's declarations",
+    "runtime/model/PleStore.hpp": "the PLE hash parameters of a table that is read in place, never prepared",
     "runtime/model/PrismMlx.hpp": "the binder's declarations",
     "runtime/model/VisionPreparation.hpp": "the vision plan, which keys record whole",
     "runtime/model/WeightStore.hpp": "the reader; preparation uses its error type",

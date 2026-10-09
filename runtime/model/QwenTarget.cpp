@@ -2,6 +2,7 @@
 
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
+#include "model/Qwen4Exp.hpp"
 #include "metal/abi/Gguf.h"
 #include "model/WeightStore.hpp"
 #include "ops/Embedding.hpp"
@@ -56,13 +57,15 @@ QwenTargetGeometry geometryFor(const Qwen3_8Layout &layout) {
   return result;
 }
 
-QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) {
+template <class Layout> QwenTargetGeometry moeGeometry(const Layout &layout) {
   QwenTargetGeometry result = commonGeometry(layout);
   result.experts = layout.experts;
   result.expertsPerToken = layout.expertsPerToken;
   result.expertIntermediateSize = layout.expertIntermediateSize;
   return result;
 }
+QwenTargetGeometry geometryFor(const Qwen3_6MoeLayout &layout) { return moeGeometry(layout); }
+QwenTargetGeometry geometryFor(const Qwen4ExpLayout &layout) { return moeGeometry(layout); }
 
 template <class Weights>
 void requireWeights(const Weights &weights,
@@ -95,6 +98,14 @@ template QwenTarget::QwenTarget(const Qwen3_8Weights &, const QwenTargetGeometry
 template QwenTarget::QwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &, metal::MetalBackend &,
                                 const ops::ExecutionPlans &);
 
+// ponytail: Flash-Next executes through its own target (hyper-connections, QSA, PLE); until it exists
+// its weights load and plan and a runtime built on them stops here.
+QwenTarget::QwenTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
+                       metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
+    : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
+  throw std::logic_error("Qwen3.8-Flash-Next execution is not implemented");
+}
+
 namespace {
 
 void includeProjection(QwenTargetGeometry &geometry, const ops::Projection &projection) {
@@ -111,18 +122,24 @@ void includeFfn(QwenTargetGeometry &geometry, const Qwen3_8LayerWeights &layer, 
   geometry.gateUpProjections.push_back(layer.upProjection.shape());
 }
 // No source mixes MoE layouts, so one plan runs every block of a step.
-void includeFfn(QwenTargetGeometry &geometry, const Qwen3_6MoeLayerWeights &layer, bool first) {
+template <class Layer> void includeMoeFfn(QwenTargetGeometry &geometry, const Layer &layer, bool first) {
   if (first) geometry.moeLayout = layer.ffn.layout();
   if (layer.ffn.layout() != geometry.moeLayout)
     throw WeightStoreError("the MoE blocks of a target must share one weight layout");
+}
+void includeFfn(QwenTargetGeometry &geometry, const Qwen3_6MoeLayerWeights &layer, bool first) {
+  includeMoeFfn(geometry, layer, first);
+}
+void includeFfn(QwenTargetGeometry &geometry, const Qwen4ExpLayerWeights &layer, bool first) {
+  includeMoeFfn(geometry, layer, first);
 }
 
 // The format of most routed expert weights of a GGUF target's MoE blocks,
 // GGUF_FMT_COUNT for none (ops::MoeShape::expertFormat).
 uint32_t routedExpertFormat(std::span<const Qwen3_8LayerWeights>) { return GGUF_FMT_COUNT; }
-uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
+template <class Layer> uint32_t routedMoeExpertFormat(std::span<const Layer> layers) {
   std::array<uint64_t, GGUF_FMT_COUNT> weights{};
-  for (const Qwen3_6MoeLayerWeights &layer : layers) {
+  for (const Layer &layer : layers) {
     if (layer.ffn.layout() != ops::WeightLayout::Block32) return GGUF_FMT_COUNT;
     const ops::BlockMoeWeights &block = layer.ffn.blocks();
     for (const ops::BlockExpertProjection *projection : {&block.gate, &block.up, &block.down})
@@ -132,6 +149,10 @@ uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
   const auto most = std::max_element(weights.begin(), weights.end());
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
 }
+uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
+  return routedMoeExpertFormat(layers);
+}
+uint32_t routedExpertFormat(std::span<const Qwen4ExpLayerWeights> layers) { return routedMoeExpertFormat(layers); }
 
 } // namespace
 
@@ -158,6 +179,7 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
 
 template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &);
 template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &);
+template QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Qwen4ExpLayout, Qwen4ExpLayerWeights> &);
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;

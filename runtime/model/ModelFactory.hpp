@@ -5,6 +5,7 @@
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "Qwen4Exp.hpp"
 #include "QwenVision.hpp"
 #include "VisionLoader.hpp"
 #include "ops/PageStorage.hpp"
@@ -19,7 +20,7 @@ namespace splash::model {
 
 class QwenStateStorage;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 struct ModelPackage final {
   ModelDescriptor descriptor;

@@ -4,7 +4,12 @@
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/GgufTarget.hpp"
+#include "model/Qwen4Exp.hpp"
 
+#include <deque>
+#include <functional>
+#include <map>
 #include <optional>
 
 using namespace gguf_fixtures;
@@ -282,6 +287,188 @@ void checkRotation(const std::filesystem::path &directory) {
   }
 }
 
+// Qwen3.8-Flash-Next (qwen4exp): widths that are no whole plane tile (640-row
+// shared expert, 320-row hyper-connection gate) or superblock (K 320, 640), a
+// PLE table that gets no image, F32/BF16/Q8_0 float tensors, and a split GGUF.
+void checkQwen4(const std::filesystem::path &directory) {
+  SmallTarget target = smallQwen4Target();
+  const model::gguf::TargetGeometry &g = target.geometry;
+  const auto path = directory / "qwen4.gguf";
+  writeGguf(path, target.tensors, g);
+  const Plan plan4 = plan(path, g);
+  check(!plan4.error, "planner plans the qwen4exp target" + (plan4.error ? ": " + *plan4.error : ""));
+  if (plan4.error) return;
+  check(plan4.images.size() == g.layers + 2, "planner plans the layers, head and embedding: the PLE table has no image");
+  check(copyIn(plan4, "per_layer_token_embd.weight") == nullptr, "planner copies no PLE table rows");
+  const auto &layer0 = plan4.images[0];
+  // Rows to whole plane tiles, the source keeping its own rows.
+  const auto *shared = repackOf(layer0, "blk.0.ffn_gate_shexp.weight");
+  check(shared && shared->rows == 768 && shared->columns == g.hiddenSize && shared->sources.size() == 1 &&
+            shared->sources[0].rows == 640 && shared->format == GGUF_FMT_Q5K,
+        "planner pads the 640-row shared expert to 768 image rows");
+  const auto *down = repackOf(layer0, "blk.0.ffn_down_shexp.weight");
+  check(down && down->rows == QUANT_TILE_ROWS && down->columns == 640 && down->format == GGUF_FMT_Q80,
+        "planner takes K 640 of Q8_0 as a 64-column unit");
+  const auto *gate = repackOf(layer0, "blk.0.hc_attn_down.weight");
+  const auto *up = repackOf(layer0, "blk.0.hc_attn_up.weight");
+  check(gate && gate->rows == 512 && gate->sources[0].rows == 320 && gate->columns == g.streamWidth(),
+        "planner pads the 320-row hyper-connection gate to 512 image rows");
+  check(up && up->rows == g.streamWidth() && up->columns == 320, "planner takes K 320 of Q8_0 as a 64-column unit");
+  const auto *experts = repackOf(layer0, "blk.0.ffn_down_exps.weight");
+  check(experts && experts->rows == uint64_t{g.hiddenSize} * g.experts && experts->columns == 640 &&
+            experts->format == GGUF_FMT_IQ4NL,
+        "planner keeps the experts' image rows whole (640-wide experts)");
+  const auto *inject = copyIn(plan4, "blk.0.hc_attn_inject.weight");
+  check(inject && inject->conversion == model::gguf::Conversion::None && inject->source.rows == g.hyperConnections,
+        "planner keeps the F32 injection weights as stored");
+  const auto *indexer = copyOf(plan4.images[g.layers - 1], "blk.3.indexer.q_proj.weight");
+  check(indexer && indexer->conversion == model::gguf::Conversion::WidenToFloat32 &&
+            indexer->source.rows == uint64_t{g.indexerHeads} * g.indexerHeadDimension,
+        "planner widens the BF16 indexer projection to F32");
+  const auto &layer1 = plan4.images[1];
+  check(repackOf(layer1, "blk.1.ple_key.weight") && copyOf(layer1, "blk.1.ple_conv1d.weight") &&
+            !repackOf(plan4.images[0], "blk.0.ple_key.weight"),
+        "planner puts the PLE layer's projections and taps in that layer");
+  check(plan4.images[g.layers].name == "head.bin" && repackOf(plan4.images[g.layers], "output_hc_up.weight"),
+        "planner builds the head from the final hyper-connection mix, with no output norm");
+
+  // The PLE table is read in place: where its rows are and the hash that picks them.
+  model::WeightSource source(path);
+  const model::GgufFile file(source);
+  const auto table = model::gguf::readPleTable(file, g);
+  check(table && table->path == path && table->dataOffset == source.dataOffset() + file.require("per_layer_token_embd.weight").offset &&
+            table->rows == 420 && table->hash.ngram == 3 && table->hash.headsPerNgram == 2 && table->hash.eos == 248044 &&
+            table->hash.multipliers[0] == 23703573157769ull && table->hash.multipliers[2] == 8052911324071ull &&
+            table->hash.heads() == 4 && table->hash.vocabularies[3] == 109 && table->hash.offsets[3] == 311,
+        "planner reads the PLE table's place and hash");
+  check(!model::gguf::readPleTable(file, smallTarget(false).geometry), "a target without PLE has no PLE table");
+
+  // Metadata a qwen4exp GGUF must carry.
+  const auto refuses = [&](const char *what, const std::function<void(std::vector<test_gguf::Key> &)> &edit,
+                           std::initializer_list<std::string_view> parts) {
+    std::vector<test_gguf::Key> keys = metadata(g);
+    qwen4Metadata(keys, g);
+    edit(keys);
+    splash::test::writeFile(path, test_gguf::file(keys, target.tensors));
+    check(names(plan(path, g), parts), std::string("planner refuses qwen4exp metadata: ") + what);
+  };
+  const auto replace = [&](std::vector<test_gguf::Key> &keys, const std::string &name, test_gguf::Key key) {
+    for (test_gguf::Key &k : keys)
+      if (k.name == "qwen4exp." + name) k = std::move(key);
+  };
+  refuses("hyper rank", [&](auto &keys) { replace(keys, "hyper_connection.low_rank", test_gguf::uint32Key("qwen4exp.hyper_connection.low_rank", 64)); },
+          {"hyper_connection.low_rank 64", "expected 320"});
+  refuses("compress ratios", [&](auto &keys) { replace(keys, "attention.compress_ratios", test_gguf::int32ArrayKey("qwen4exp.attention.compress_ratios", {0, 0, 4, 0})); },
+          {"attention.compress_ratios"});
+  refuses("rope sections", [&](auto &keys) { replace(keys, "rope.dimension_sections", test_gguf::int32ArrayKey("qwen4exp.rope.dimension_sections", {16, 8, 8, 0})); },
+          {"rope.dimension_sections"});
+  refuses("PLE layer", [&](auto &keys) { replace(keys, "ple.layers", test_gguf::int32ArrayKey("qwen4exp.ple.layers", {2})); },
+          {"ple.layers"});
+  refuses("indexer top k", [&](auto &keys) { replace(keys, "attention.indexer.top_k", test_gguf::uint32Key("qwen4exp.attention.indexer.top_k", 4)); },
+          {"indexer.top_k 4"});
+  {
+    std::vector<test_gguf::Key> keys = metadata(g);
+    qwen4Metadata(keys, g);
+    replace(keys, "ple.head_vocab_sizes", test_gguf::uint64ArrayKey("qwen4exp.ple.head_vocab_sizes", {101, 103, 107, 1000}));
+    splash::test::writeFile(path, test_gguf::file(keys, target.tensors));
+    model::WeightSource bad(path);
+    std::string error;
+    try {
+      static_cast<void>(model::gguf::readPleTable(model::GgufFile(bad), g));
+    } catch (const model::GgufError &e) {
+      error = e.what();
+    }
+    check(error.find("rows lie outside") != std::string::npos,
+          "planner refuses a PLE head whose rows leave the table");
+  }
+
+  // The same target as a two-file split GGUF plans the same images, its second
+  // file's tensors read from it.
+  std::vector<Tensor> first(target.tensors.begin(), target.tensors.begin() + 40), second(target.tensors.begin() + 40, target.tensors.end());
+  std::vector<test_gguf::Key> keys = metadata(g);
+  qwen4Metadata(keys, g);
+  const auto split = [&](uint32_t no) {
+    std::vector<test_gguf::Key> k = no == 0 ? keys : std::vector<test_gguf::Key>{};
+    k.push_back(test_gguf::uint32Key("split.no", no));
+    k.push_back(test_gguf::uint32Key("split.count", 2));
+    k.push_back(test_gguf::uint32Key("split.tensors.count", uint32_t(target.tensors.size())));
+    return k;
+  };
+  const auto part0 = directory / "qwen4-00001-of-00002.gguf", part1 = directory / "qwen4-00002-of-00002.gguf";
+  splash::test::writeFile(part0, test_gguf::file(split(0), first));
+  splash::test::writeFile(part1, test_gguf::file(split(1), second));
+  model::WeightSource s0(part0), s1(part1);
+  model::WeightSource *parts[] = {&s0, &s1};
+  const model::GgufFile splitFile(parts);
+  const std::vector<model::gguf::Image> images = model::gguf::planImages(splitFile, g);
+  bool same = images.size() == plan4.images.size();
+  for (size_t i = 0; same && i < images.size(); ++i)
+    same = images[i].bytes == plan4.images[i].bytes && images[i].repacks.size() == plan4.images[i].repacks.size() &&
+           images[i].copies.size() == plan4.images[i].copies.size();
+  check(same, "planner plans a split GGUF like the whole one");
+  const auto *fromSecond = repackOf(images[3], "blk.3.ffn_down_exps.weight");
+  const auto *fromFirst = repackOf(images[0], "blk.0.ffn_down_exps.weight");
+  check(fromFirst && fromSecond && fromFirst->sources[0].file == 0 && fromSecond->sources[0].file == 1,
+        "planner names the file each tensor is read from");
+  const auto pleSplit = model::gguf::readPleTable(splitFile, g);
+  check(pleSplit && pleSplit->path == part1, "planner finds the PLE table in its shard of a split GGUF");
+}
+
+// With SPLASH_FLASH_NEXT_GGUF_DIR naming a Qwen3.8-Flash-Next GGUF directory (its split parts, and mtp/*.gguf for
+// the MTP head): plans every image of the real shards from their headers alone, reads no weight, and prints the
+// planned bytes against the Metal working set.
+void checkRealShards() {
+  const char *root = std::getenv("SPLASH_FLASH_NEXT_GGUF_DIR");
+  if (!root) return;
+  const model::Qwen4ExpLayout layout;
+  const model::gguf::TargetGeometry g = model::ggufTargetGeometry(layout);
+  std::deque<model::WeightSource> sources;
+  std::vector<model::WeightSource *> parts;
+  const std::vector<std::filesystem::path> paths = model::findTargetGgufs(root);
+  for (const auto &path : paths) parts.push_back(&sources.emplace_back(path));
+  const model::GgufFile file(parts);
+  const std::vector<model::gguf::Image> images = model::gguf::planImages(file, g);
+  check(images.size() == layout.layers + 2, "real shards: planned " + std::to_string(paths.size()) + " files, " +
+                                                std::to_string(file.tensors().size()) + " tensors, " +
+                                                std::to_string(images.size()) + " images");
+  const auto table = model::gguf::readPleTable(file, g);
+  check(table && table->rows == 320001536 && table->hash.heads() == 16 && table->hash.eos == layout.pleEosToken,
+        "real shards: the PLE table's place and hash");
+  std::map<std::string, uint64_t> planes; // planned plane bytes by ggml type
+  uint64_t layersBytes = 0, padding = 0, total = 0;
+  for (size_t i = 0; i < images.size(); ++i) {
+    total += images[i].bytes;
+    if (i < layout.layers) layersBytes += images[i].bytes;
+    for (const auto &repack : images[i].repacks) {
+      const model::GgufPlaneBytes bytes = model::ggufPlaneBytes(kQuantFormats[repack.format], repack.rows, repack.columns);
+      const uint64_t all = bytes.plane0 + bytes.plane1 + bytes.meta;
+      planes[model::ggmlTypeName(kQuantFormats[repack.format].ggml_type)] += all;
+      uint64_t sourceRows = 0;
+      for (const auto &source : repack.sources) sourceRows += source.rows;
+      padding += all / repack.rows * (repack.rows - sourceRows);
+    }
+  }
+  const auto gib = [](uint64_t bytes) { return double(bytes) / (1ull << 30); };
+  std::printf("  %-40s %9s\n", "planned image bytes", "GiB");
+  std::printf("  %-40s %9.3f\n", "layers 0-47", gib(layersBytes));
+  std::printf("  %-40s %9.3f\n", "head (lm head and final mix)", gib(images[layout.layers].bytes));
+  std::printf("  %-40s %9.3f\n", "embedding (native Q4_K rows)", gib(images[layout.layers + 1].bytes));
+  std::printf("  %-40s %9.3f\n", "GPU-resident total, without PLE", gib(total));
+  for (const auto &[type, bytes] : planes) std::printf("    plane bytes of %-22s %9.3f\n", type.c_str(), gib(bytes));
+  std::printf("    zero rows padding the image tiles      %9.3f\n", gib(padding));
+  std::printf("  %-40s %9.3f  (read in place from its shard)\n", "PLE table",
+              gib(file.require("per_layer_token_embd.weight").bytes));
+  std::printf("  %-40s %9.3f  (48 GiB Metal working set of the M1 Max reference)\n", "headroom", 48.0 - gib(total));
+  check(total < (48ull << 30), "real shards: the planned images fit the 48 GiB Metal working set");
+  const std::filesystem::path mtpDirectory = std::filesystem::path(root) / "mtp";
+  if (!std::filesystem::exists(mtpDirectory)) return;
+  model::WeightSource mtpSource(model::findTargetGgufs(mtpDirectory).front());
+  const model::GgufFile mtpFile(mtpSource);
+  const model::gguf::Image mtp = model::gguf::planMtpImage(mtpFile, g);
+  std::printf("  %-40s %9.3f  (extra image, loaded with ProposalSource Mtp)\n", "MTP head", gib(mtp.bytes));
+  check(total + mtp.bytes < (48ull << 30), "real shards: the target and the MTP head fit the 48 GiB Metal working set");
+}
+
 } // namespace
 
 int main() {
@@ -291,6 +478,8 @@ int main() {
     guarded("planner on the MoE target", [&] { checkMoe(directory.path()); });
     guarded("planner on quantized alpha/beta", [&] { checkQuantizedAlphaBeta(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
+    guarded("planner on the qwen4exp target", [&] { checkQwen4(directory.path()); });
+    guarded("planner on the real Flash-Next shards", [&] { checkRealShards(); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;

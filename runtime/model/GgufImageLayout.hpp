@@ -21,8 +21,22 @@ namespace splash::model {
 
 inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
 
-// Columns of a superblock, the unit a quantized tensor's width is a multiple of.
+// Columns of a superblock: a staging unit wide enough for every format.
 inline constexpr uint64_t kGgufBlockColumns = 256;
+
+// The columns a quantized tensor's width in `format` is a multiple of: one
+// 64-input span for formats of blocks of up to 64 elements, else the 256-input
+// superblock (the register decode tiles decode four spans of a format of
+// several groups per meta unit together, and PQ2_0's 128-input blocks too).
+[[nodiscard]] inline constexpr uint64_t ggufColumnUnit(const QuantFormat &format) {
+  return format.block_elements > 64 ? kGgufBlockColumns : 64;
+}
+
+// The rows an image holds for a tensor of `rows`: whole plane tiles, the rows
+// past the tensor's zero. The descriptor keeps the tensor's own rows.
+[[nodiscard]] inline constexpr uint64_t ggufStorageRows(uint64_t rows) {
+  return (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+}
 
 // A tensor's descriptor section, little-endian.
 struct GgufTensorDescriptor {
@@ -43,7 +57,8 @@ struct GgufPlaneBytes {
   uint64_t plane0, plane1, meta;
 };
 
-// The planes of a [rows, columns] tensor in format.
+// The planes of a [rows, columns] tensor in format; rows are the image's
+// (ggufStorageRows).
 [[nodiscard]] inline constexpr GgufPlaneBytes ggufPlaneBytes(const QuantFormat &format, uint64_t rows,
                                                              uint64_t columns) {
   const uint64_t groups = columns / 32;

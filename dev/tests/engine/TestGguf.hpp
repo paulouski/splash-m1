@@ -68,6 +68,14 @@ inline Key int32ArrayKey(std::string name, const std::vector<int32_t> &values) {
   return key;
 }
 
+inline Key uint64ArrayKey(std::string name, const std::vector<uint64_t> &values) {
+  Key key{std::move(name), kArray, {}};
+  append(key.value, kUint64);
+  append<uint64_t>(key.value, values.size());
+  for (uint64_t value : values) append(key.value, value);
+  return key;
+}
+
 inline Key stringArrayKey(std::string name, const std::vector<std::string> &values) {
   Key key{std::move(name), kArray, {}};
   append(key.value, kString);

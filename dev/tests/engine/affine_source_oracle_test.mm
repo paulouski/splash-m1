@@ -75,21 +75,25 @@ int main(int argc, char **argv) {
       const std::filesystem::path package(argv[3]);
       const auto descriptor = model::inspectModelPackage(package);
       std::visit([&](const auto &layout) {
-        model::AffineTargetLoader loader(backend, argv[2], layout, {});
-        const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
-        const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
-        const std::vector<model::affine::Image> images = model::affineTargetImages(layout);
-        for (uint32_t layer = begin; layer < end; ++layer) {
-          const auto &sections = images.at(layer).sections;
-          const auto decay = std::ranges::find(sections, model::affine::SectionKind::Decay,
-                                               &model::affine::Section::kind);
-          const bool gdn = decay != sections.end();
-          compare(loader.layer(layer), package / "target", loadOnly, gdn ? decay->offset : 0,
-                  gdn ? uint32_t(decay->bytes / sizeof(float)) : 0);
-        }
-        if (argc != 5 || loadOnly) {
-          compare(loader.head(), package / "target", loadOnly);
-          compare(loader.embedding(), package / "target", loadOnly);
+        if constexpr (std::remove_cvref_t<decltype(layout)>::ggufOnly) {
+          throw std::runtime_error("this model has no MLX source");
+        } else {
+          model::AffineTargetLoader loader(backend, argv[2], layout, {});
+          const uint32_t begin = argc == 5 && !loadOnly ? std::stoul(argv[4]) : 0;
+          const uint32_t end = argc == 5 && !loadOnly ? begin + 1 : layout.layers;
+          const std::vector<model::affine::Image> images = model::affineTargetImages(layout);
+          for (uint32_t layer = begin; layer < end; ++layer) {
+            const auto &sections = images.at(layer).sections;
+            const auto decay = std::ranges::find(sections, model::affine::SectionKind::Decay,
+                                                 &model::affine::Section::kind);
+            const bool gdn = decay != sections.end();
+            compare(loader.layer(layer), package / "target", loadOnly, gdn ? decay->offset : 0,
+                    gdn ? uint32_t(decay->bytes / sizeof(float)) : 0);
+          }
+          if (argc != 5 || loadOnly) {
+            compare(loader.head(), package / "target", loadOnly);
+            compare(loader.embedding(), package / "target", loadOnly);
+          }
         }
       }, descriptor.target);
       std::cout << "affine source oracle PASS seconds="

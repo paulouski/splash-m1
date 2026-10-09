@@ -4,6 +4,7 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "Qwen4Exp.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -14,7 +15,7 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout>;
 
 // Where a model's weights come from: files already in the packed layout, or
 // an MLX, Prism Hadamard MLX or GGUF checkpoint prepared into cached files

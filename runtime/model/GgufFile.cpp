@@ -160,7 +160,25 @@ uint64_t GgufTensor::elements() const {
   return elements;
 }
 
-GgufFile::GgufFile(WeightSource &source) : source_(source) {
+GgufFile::GgufFile(WeightSource &source) : sources_{&source} {
+  parse(source, 0);
+  rotation_ = readRotation();
+}
+
+GgufFile::GgufFile(std::span<WeightSource *const> sources) : sources_(sources.begin(), sources.end()) {
+  if (sources_.empty()) throw GgufError("a GGUF needs at least one file");
+  for (uint32_t file = 0; file < sources_.size(); ++file) parse(*sources[file], file);
+  if (unsignedValue("split.count").value_or(1) != sources_.size())
+    throw GgufError("the GGUF's split.count does not match its " + std::to_string(sources_.size()) + " files");
+  if (sources_.size() > 1 && unsignedValue("split.tensors.count") != tensors_.size())
+    throw GgufError("the GGUF's split files hold another number of tensors than split.tensors.count");
+  rotation_ = readRotation();
+}
+
+void GgufFile::parse(WeightSource &source, uint32_t file) {
+  // Only the first file's metadata is kept: a later split file repeats
+  // split.* alone, whose split.no must be its place.
+  const bool first = file == 0;
   Reader reader(source);
   char magic[4];
   reader.bytes(magic, 4);
@@ -176,6 +194,16 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     const std::string key = reader.string();
     if (!keys.insert(key).second) throw GgufError("duplicate GGUF metadata key: " + key);
     const uint32_t type = reader.scalar<uint32_t>();
+    if (!first) {
+      if (key == "split.no") {
+        if (type != kUint16 && type != kUint32) throw GgufError("invalid split.no");
+        const uint64_t number = type == kUint16 ? reader.scalar<uint16_t>() : reader.scalar<uint32_t>();
+        if (number != file) throw GgufError("GGUF split file " + source.path().string() + " is out of order");
+      } else {
+        skipValue(reader, type, 0);
+      }
+      continue;
+    }
     switch (type) {
     case kUint8: unsigned_[key] = reader.scalar<uint8_t>(); break;
     case kUint16: unsigned_[key] = reader.scalar<uint16_t>(); break;
@@ -223,10 +251,12 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   const uint64_t alignment = unsignedValue("general.alignment").value_or(32);
   if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)))
     throw GgufError("invalid GGUF alignment");
-  architecture_ = stringValue("general.architecture").value_or("");
-  tensors_.reserve(tensorCount);
+  if (first) architecture_ = stringValue("general.architecture").value_or("");
+  const size_t firstTensor = tensors_.size();
+  tensors_.reserve(firstTensor + tensorCount);
   for (uint64_t i = 0; i < tensorCount; ++i) {
     GgufTensor tensor;
+    tensor.file = file;
     tensor.name = reader.string();
     const uint32_t dimensions = reader.scalar<uint32_t>();
     if (dimensions == 0 || dimensions > 4) throw GgufError("invalid tensor rank for " + tensor.name);
@@ -248,16 +278,16 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   if (padding > source.bytes() - headerEnd) throw GgufError("GGUF data section is truncated");
   source.setDataOffset(headerEnd + padding);
   const uint64_t dataBytes = source.bytes() - source.dataOffset();
-  for (const GgufTensor &tensor : tensors_) {
+  for (size_t i = firstTensor; i < tensors_.size(); ++i) {
+    const GgufTensor &tensor = tensors_[i];
     if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
-  rotation_ = readRotation();
 }
 
 GgufFile::GgufFile(WeightSource &source, GgufMemoryHeader header)
-    : source_(source), unsigned_(std::move(header.unsignedValues)), strings_(std::move(header.stringValues)),
+    : sources_{&source}, unsigned_(std::move(header.unsignedValues)), strings_(std::move(header.stringValues)),
       floats_(std::move(header.floatValues)), arrays_(std::move(header.arrays)), names_(std::move(header.names)),
       valueRowsGrouped_(header.valueRowsGrouped) {
   architecture_ = stringValue("general.architecture").value_or("");

@@ -303,6 +303,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/PreparedWeights.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
+	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Qwen3_8.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \

@@ -17,6 +17,7 @@
 #include "model/StateLayout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -317,10 +318,177 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
   return keys;
 }
 
+// A small qwen4exp (Qwen3.8-Flash-Next) target: 4 layers (GDN, PLE GDN, GDN,
+// full attention), 4 experts of width 640 (not a whole 256-row plane tile),
+// hyper rank 320 (not a whole 256-input superblock), 4 PLE heads of 160-value
+// rows and the arrays its metadata carries.
+inline constexpr std::array<uint32_t, 4> kPleVocabularies{101, 103, 107, 109};
+inline SmallTarget smallQwen4Target() {
+  SmallTarget target;
+  model::gguf::TargetGeometry &g = target.geometry;
+  g.layers = 4;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.gdnKeyHeads = 2;
+  g.gdnValueHeads = 8;
+  g.gdnHeadDimension = 64;
+  g.convolutionDimension = 768; // q and k of 2 heads, v of 8
+  g.attentionWidth = 512;
+  g.attentionKvHeads = 2;
+  g.attentionHeadDimension = 256;
+  g.rotaryPairs = 32;
+  g.rotaryTheta = 1e7F;
+  g.fullAttentionPeriod = 4;
+  g.experts = 4;
+  g.expertsPerToken = 2;
+  g.expertIntermediateSize = 640;
+  g.hyperConnections = 4;
+  g.hyperRank = 320;
+  g.indexerHeads = 4;
+  g.indexerHeadDimension = 128;
+  g.indexerBlockTokens = 4;
+  g.indexerTopBlocks = 8;
+  g.pleLayer = 1;
+  g.pleNgram = 3;
+  g.pleHeadsPerNgram = 2;
+  g.pleHeadDimension = 160;
+  g.pleConvolutionTaps = 4;
+  const uint64_t hidden = g.hiddenSize, streams = g.streamWidth(), rank = g.hyperRank;
+  const uint64_t valueRows = uint64_t{g.gdnValueHeads} * g.gdnHeadDimension;
+  const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+  const uint64_t pleWidth = uint64_t{g.pleNgram - 1} * g.pleHeadsPerNgram * g.pleHeadDimension;
+  const TensorTypes types{{"hc_attn_down.weight", kQ8_0}, {"hc_attn_up.weight", kQ8_0}, {"hc_ffn_down.weight", kQ8_0},
+                          {"hc_ffn_up.weight", kQ8_0}, {"output_hc_down.weight", kQ8_0},
+                          {"output_hc_up.weight", kQ8_0}, {"attn_qkv.weight", kQ5_K}, {"attn_gate.weight", kQ5_K},
+                          {"ssm_out.weight", kQ6_K}, {"attn_q.weight", kQ5_K}, {"attn_k.weight", kQ5_K},
+                          {"attn_v.weight", kQ5_K}, {"attn_output.weight", kQ5_K}, {"ffn_gate_exps.weight", kIQ4_NL},
+                          {"ffn_up_exps.weight", kIQ4_NL}, {"ffn_down_exps.weight", kIQ4_NL},
+                          {"ffn_gate_shexp.weight", kQ5_K}, {"ffn_up_shexp.weight", kQ5_K},
+                          {"ffn_down_shexp.weight", kQ8_0}, {"ple_key.weight", kQ8_0}, {"ple_value.weight", kQ8_0},
+                          {"indexer.q_proj.weight", model::ggml::kBF16}, {"indexer.k_proj.weight", model::ggml::kBF16},
+                          {"per_layer_token_embd.weight", kIQ4_NL}, {"output.weight", kQ4_K},
+                          {"token_embd.weight", kQ4_K}};
+  std::vector<Tensor> &tensors = target.tensors;
+  const auto add = [&](std::string name, std::vector<uint64_t> dims) {
+    const uint32_t type = typeOf(types, name);
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    uint64_t elements = 1;
+    for (uint64_t dim : dims) elements *= dim;
+    tensors.push_back({name, std::move(dims), type, test_gguf::Bytes(elements / traits.blockElements * traits.blockBytes)});
+  };
+  const auto hyper = [&](const std::string &stem, bool inject) {
+    add(stem + "_norm.weight", {streams});
+    add(stem + "_down.weight", {streams, rank});
+    add(stem + "_up.weight", {rank, streams});
+    if (inject) add(stem + "_inject.weight", {streams, g.hyperConnections});
+  };
+  for (uint32_t layer = 0; layer < g.layers; ++layer) {
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    hyper(p + "hc_attn", true);
+    if (g.isFullAttentionLayer(layer)) {
+      add(p + "attn_q.weight", {hidden, 2ull * g.attentionWidth});
+      add(p + "attn_k.weight", {hidden, kvRows});
+      add(p + "attn_v.weight", {hidden, kvRows});
+      add(p + "attn_q_norm.weight", {g.attentionHeadDimension});
+      add(p + "attn_k_norm.weight", {g.attentionHeadDimension});
+      add(p + "attn_output.weight", {g.attentionWidth, hidden});
+      add(p + "indexer.q_proj.weight", {hidden, uint64_t{g.indexerHeads} * g.indexerHeadDimension});
+      add(p + "indexer.k_proj.weight", {hidden, g.indexerHeadDimension});
+      add(p + "indexer.q_norm.weight", {g.indexerHeadDimension});
+      add(p + "indexer.k_norm.weight", {g.indexerHeadDimension});
+    } else {
+      add(p + "attn_qkv.weight", {hidden, g.convolutionDimension});
+      add(p + "attn_gate.weight", {hidden, valueRows});
+      add(p + "ssm_beta.weight", {hidden, g.gdnValueHeads});
+      add(p + "ssm_alpha.weight", {hidden, g.gdnValueHeads});
+      add(p + "ssm_conv1d.weight", {model::kGdnConvolutionTaps, g.convolutionDimension});
+      add(p + "ssm_a", {g.gdnValueHeads});
+      add(p + "ssm_dt.bias", {g.gdnValueHeads});
+      add(p + "ssm_norm.weight", {g.gdnHeadDimension});
+      add(p + "ssm_out.weight", {valueRows, hidden});
+    }
+    hyper(p + "hc_ffn", true);
+    add(p + "ffn_gate_inp.weight", {hidden, g.experts});
+    add(p + "ffn_gate_exps.weight", {hidden, g.expertIntermediateSize, g.experts});
+    add(p + "ffn_up_exps.weight", {hidden, g.expertIntermediateSize, g.experts});
+    add(p + "ffn_down_exps.weight", {g.expertIntermediateSize, hidden, g.experts});
+    add(p + "ffn_gate_shexp.weight", {hidden, g.expertIntermediateSize});
+    add(p + "ffn_up_shexp.weight", {hidden, g.expertIntermediateSize});
+    add(p + "ffn_down_shexp.weight", {g.expertIntermediateSize, hidden});
+    add(p + "ffn_gate_inp_shexp.weight", {hidden});
+    if (layer == g.pleLayer) {
+      add(p + "ple_key.weight", {pleWidth, streams});
+      add(p + "ple_value.weight", {pleWidth, hidden});
+      add(p + "ple_norm_key.weight", {streams});
+      add(p + "ple_norm_query.weight", {streams});
+      add(p + "ple_norm_conv.weight", {streams});
+      add(p + "ple_conv1d.weight", {g.pleConvolutionTaps, streams});
+    }
+  }
+  hyper("output_hc", false);
+  add("output.weight", {hidden, g.vocabularySize});
+  uint64_t pleRows = 0;
+  for (uint32_t size : kPleVocabularies) pleRows += size;
+  add("per_layer_token_embd.weight", {g.pleHeadDimension, pleRows});
+  add("token_embd.weight", {hidden, g.vocabularySize});
+  randomize(tensors, 1200);
+  // randomize writes F32 values to every unquantized tensor: keep the bf16 halves of the BF16 ones.
+  for (Tensor &tensor : tensors) {
+    if (tensor.type != model::ggml::kBF16) continue;
+    test_gguf::Bytes bf16;
+    for (size_t i = 2; i < tensor.data.size(); i += 4) bf16.insert(bf16.end(), tensor.data.begin() + i, tensor.data.begin() + i + 2);
+    bf16.resize(tensor.data.size() / 2);
+    tensor.data = std::move(bf16);
+  }
+  return target;
+}
+
+// The cumulative row offsets of the PLE heads of smallQwen4Target.
+inline std::vector<uint64_t> pleOffsets() {
+  std::vector<uint64_t> offsets;
+  uint64_t at = 0;
+  for (uint32_t size : kPleVocabularies) {
+    offsets.push_back(at);
+    at += size;
+  }
+  return offsets;
+}
+
+// The keys a qwen4exp GGUF of the geometry declares beyond metadata()'s.
+inline void qwen4Metadata(std::vector<test_gguf::Key> &keys, const model::gguf::TargetGeometry &g, uint32_t nextn = 0) {
+  const std::string arch = g.architecture();
+  const auto key = [&](const char *name, uint32_t value) {
+    keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
+  };
+  key("hyper_connection.count", g.hyperConnections);
+  key("hyper_connection.low_rank", g.hyperRank);
+  key("attention.indexer.head_count", g.indexerHeads);
+  key("attention.indexer.key_length", g.indexerHeadDimension);
+  key("attention.indexer.top_k", g.indexerTopBlocks * g.indexerBlockTokens);
+  if (nextn) key("nextn_predict_layers", nextn);
+  std::vector<int32_t> ratios;
+  for (uint32_t layer = 0; layer < g.layers + nextn; ++layer)
+    ratios.push_back(layer % g.fullAttentionPeriod == g.fullAttentionPeriod - 1 ? int32_t(g.indexerBlockTokens) : 0);
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.compress_ratios", ratios));
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".rope.dimension_sections", {11, 11, 10, 0}));
+  if (!g.hasPle()) return;
+  key("ple.ngram_size", g.pleNgram);
+  key("ple.heads_per_ngram", g.pleHeadsPerNgram);
+  key("ple.conv_kernel", g.pleConvolutionTaps);
+  key("ple.eos_token_id", 248044);
+  key("embedding_length_per_layer_input", g.pleHeadDimension);
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".ple.layers", {int32_t(g.pleLayer)}));
+  keys.push_back(test_gguf::uint64ArrayKey(arch + ".ple.layer_multipliers", {23703573157769, 20109073645365, 8052911324071}));
+  keys.push_back(test_gguf::uint64ArrayKey(arch + ".ple.head_offsets", pleOffsets()));
+  keys.push_back(test_gguf::uint64ArrayKey(arch + ".ple.head_vocab_sizes", {kPleVocabularies.begin(), kPleVocabularies.end()}));
+}
+
 // Writes a GGUF of the tensors declaring the geometry.
 inline void writeGguf(const std::filesystem::path &path, const std::vector<Tensor> &tensors,
                       const model::gguf::TargetGeometry &geometry) {
-  splash::test::writeFile(path, test_gguf::file(metadata(geometry), tensors));
+  std::vector<test_gguf::Key> keys = metadata(geometry);
+  if (geometry.qwen4()) qwen4Metadata(keys, geometry);
+  splash::test::writeFile(path, test_gguf::file(keys, tensors));
 }
 
 // The plan's copy of the named tensor, or nullptr.

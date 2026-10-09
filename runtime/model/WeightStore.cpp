@@ -293,9 +293,13 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     if (!bytes) throw WeightStoreError("GGUF descriptor is not host visible");
     GgufTensorDescriptor d;
     std::memcpy(&d, bytes, sizeof d);
-    // Float tensors are rows as stored; quantized ones fill whole tiles.
+    // Float tensors are rows as stored; quantized ones fill whole 64-column
+    // tiles (the image pads their rows to plane tiles) and their format's
+    // column unit.
+    const uint32_t format = gguf_format_of(d.type);
     if (!d.outputSize || !d.inputSize ||
-        (d.type != ggml::kF32 && (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)))
+        (d.type != ggml::kF32 && (d.outputSize % GGUF_TILE_COLUMNS ||
+                                  (format != GGUF_FMT_COUNT && d.inputSize % ggufColumnUnit(kQuantFormats[format])))))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
 }
@@ -314,7 +318,7 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
     const QuantFormat &layout = kQuantFormats[format];
-    const GgufPlaneBytes planes = ggufPlaneBytes(layout, d.outputSize, d.inputSize);
+    const GgufPlaneBytes planes = ggufPlaneBytes(layout, ggufStorageRows(d.outputSize), d.inputSize);
     if (d.p0 != layout.plane0_bytes || d.p1 != layout.plane1_bytes ||
         d.metaBytes != layout.meta_bytes || d.metaGroups != layout.meta_groups ||
         d.plane0Bytes != planes.plane0 || d.plane1Bytes != planes.plane1 || d.metaTotalBytes != planes.meta)

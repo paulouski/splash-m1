@@ -33,6 +33,8 @@ struct QwenMixerGeometry final {
 // reads. A family sets every value and adds its FFN sizes, its file magics
 // and its ffnKind.
 template <size_t CaptureLayers> struct QwenHybridLayout {
+  // Whether the family's weights load from a GGUF only.
+  static constexpr bool ggufOnly = false;
   uint32_t maximumContextTokens = kv::kMaximumLogicalTokens;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;

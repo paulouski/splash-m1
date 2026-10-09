@@ -1,6 +1,7 @@
 #include "ModelDescriptor.hpp"
 #include "QwenVision.hpp"
 #include "PrismMlx.hpp"
+#include "model/GgufFile.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -177,6 +178,18 @@ ModelDescriptor qwen36Descriptor(std::string name) {
   vision.outputHiddenSize = target.hiddenSize;
   return makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
                              vision);
+}
+
+// Qwen3.8-Flash-Next decodes without a DFlash2 draft (its MTP head is a later
+// proposal source) and loads from a GGUF only; it serves no vision tower.
+ModelDescriptor qwen4ExpDescriptor(std::string name) {
+  constexpr Qwen4ExpLayout target;
+  ModelDescriptor result = makeModelDescriptor(
+      std::move(name), target, nullDraftLayout(target.hiddenSize, target.vocabularySize, target.capturedHiddenSize()),
+      kQwen4ExpVisionLayout);
+  result.proposals = ProposalSource::None;
+  result.targetSource = TargetSource::Gguf;
+  return result;
 }
 
 void validateTokenizer(const std::filesystem::path &root,
@@ -513,25 +526,42 @@ DFlashDraftLayout nullDraftLayout(uint32_t hiddenSize, uint32_t vocabularySize,
   return layout;
 }
 
+// The text model type a GGUF's architecture stands for, for a directory
+// without a config.json.
+std::string textTypeOfGguf(const std::filesystem::path &directory) {
+  std::vector<std::filesystem::path> files;
+  for (const auto &entry : std::filesystem::directory_iterator(directory))
+    if (entry.path().extension() == ".gguf") files.push_back(entry.path());
+  if (files.empty()) throw std::invalid_argument("target directory contains neither a config.json nor a gguf");
+  WeightSource source(*std::min_element(files.begin(), files.end()));
+  const std::string architecture = GgufFile(source).architecture();
+  if (architecture == "qwen4exp") return "qwen4_exp_text";
+  throw std::invalid_argument("unsupported model architecture: " + architecture);
+}
+
 ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
                                   const std::optional<std::filesystem::path> &draftDirectory) {
   @autoreleasepool {
-    NSDictionary *text = textConfigOf(targetDirectory);
-    const auto type = requireString(text, @"model_type", "text model type");
+    const bool hasConfig = std::filesystem::exists(targetDirectory / "config.json");
+    NSDictionary *text = hasConfig ? textConfigOf(targetDirectory) : nil;
+    const std::string type =
+        hasConfig ? requireString(text, @"model_type", "text model type") : textTypeOfGguf(targetDirectory);
     std::string name = targetDirectory.filename().string();
     if (name.empty()) name = targetDirectory.parent_path().filename().string();
     if (name.empty()) name = "local-model";
     ModelDescriptor result;
     if (type == "qwen3_5_moe_text") result = qwen36Descriptor(name);
     else if (type == "qwen3_5_text") result = qwen38Descriptor(name);
+    else if (type == "qwen4_exp_text") result = qwen4ExpDescriptor(name);
     else throw std::invalid_argument("unsupported model architecture: " + type);
-    std::visit([&](const auto &layout) {
-      requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
-          {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
-          {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
-          {"head_dim", layout.attentionHeadDimension}});
-    }, result.target);
-    if (!draftDirectory) {
+    if (text)
+      std::visit([&](const auto &layout) {
+        requireNumbers(text, {{"hidden_size", layout.hiddenSize}, {"num_hidden_layers", layout.layers},
+            {"vocab_size", layout.vocabularySize}, {"max_position_embeddings", layout.maximumContextTokens},
+            {"num_attention_heads", layout.attentionQueryHeads}, {"num_key_value_heads", layout.attentionKvHeads},
+            {"head_dim", layout.attentionHeadDimension}});
+      }, result.target);
+    if (!draftDirectory && result.proposals != ProposalSource::None) {
       const ModelDescriptor draftless = std::visit(
           [&](const auto &layout) {
             return makeModelDescriptor(
@@ -545,6 +575,8 @@ ModelDescriptor inspectLocalModel(const std::filesystem::path &targetDirectory,
     }
     result.targetSource = detectTargetFormat(targetDirectory);
 
+    if (draftDirectory && result.proposals == ProposalSource::None)
+      throw std::invalid_argument("this model has no DFlash2 draft");
     if (draftDirectory) {
       NSDictionary *draft = readObject(*draftDirectory / "config.json", "draft config");
       validateSourceDraft(draft, result);

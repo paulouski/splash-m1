@@ -3,6 +3,8 @@
 #include "TestGguf.hpp"
 #include "model/GgufFile.hpp"
 
+#include <deque>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -90,7 +92,49 @@ int main() {
       gguf::append<uint64_t>(nested, 1);
     }
     rejects("excessive nesting", array(nested), "nesting is too deep");
+    // A split GGUF: the first file holds the metadata, every file its tensors and split.no.
+    const auto parts = [&](const std::vector<gguf::Bytes> &files, const char *what, std::string_view expected) {
+      std::vector<std::filesystem::path> paths;
+      for (size_t i = 0; i < files.size(); ++i) {
+        paths.push_back(directory.path() / ("part-" + std::to_string(i) + ".gguf"));
+        splash::test::writeFile(paths.back(), files[i]);
+      }
+      std::deque<splash::model::WeightSource> sources;
+      for (const auto &part : paths) sources.emplace_back(part);
+      std::vector<splash::model::WeightSource *> pointers;
+      for (auto &source : sources) pointers.push_back(&source);
+      if (expected.empty()) {
+        const splash::model::GgufFile joined(pointers);
+        const auto &a = joined.require("a"), &b = joined.require("b");
+        require(joined.files() == 2 && joined.architecture() == "fixture" &&
+                    joined.unsignedValue("fixture.block_count") == 2 && joined.tensors().size() == 2,
+                "split metadata or tensor count changed");
+        require(a.file == 0 && b.file == 1 && &joined.source(1) == pointers[1] && a.offset == 0 && b.offset == 0,
+                "a split tensor must name its file and keep its offset in that file");
+        require(joined.source(1).dataOffset() > 0 && b.bytes == kQ4KBlockBytes, "split file data offsets changed");
+        return;
+      }
+      splash::test::rejects([&] { const splash::model::GgufFile joined(pointers); }, expected,
+                            std::string("accepted invalid split GGUF: ") + what);
+    };
+    const auto split = [&](uint32_t no, uint32_t count, uint32_t tensors, const char *name, bool metadata) {
+      std::vector<gguf::Key> keys;
+      if (metadata) {
+        keys.push_back(gguf::stringKey("general.architecture", "fixture"));
+        keys.push_back(gguf::uint32Key("fixture.block_count", 2));
+      }
+      keys.push_back(gguf::uint32Key("split.no", no));
+      keys.push_back(gguf::uint32Key("split.count", count));
+      keys.push_back(gguf::uint32Key("split.tensors.count", tensors));
+      return gguf::file(keys, {{name, {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)}});
+    };
+    parts({split(0, 2, 2, "a", true), split(1, 2, 2, "b", false)}, "valid", "");
+    parts({split(0, 2, 2, "a", true), split(0, 2, 2, "b", false)}, "second file out of order", "is out of order");
+    parts({split(0, 3, 2, "a", true), split(1, 3, 2, "b", false)}, "split.count", "split.count does not match");
+    parts({split(0, 2, 3, "a", true), split(1, 2, 3, "b", false)}, "split.tensors.count", "split.tensors.count");
+    parts({split(0, 2, 2, "a", true), split(1, 2, 2, "a", false)}, "tensor in both files", "duplicate GGUF tensor: a");
     std::cout << "GGUF parser bounds tests passed\n";
+
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
