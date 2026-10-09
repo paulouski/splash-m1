@@ -52,6 +52,11 @@ constexpr std::pair<std::string_view, std::string_view> kGroup12Kernels[] = {
     {"verify_attention_reduce_kv2_g8", "verify_attention_reduce_kv2_g12"},
     {"verify_attention_qkv_kv2_g8", "verify_attention_qkv_kv2_g12"},
     {"verify_attention_gate_kv2_g8", "verify_attention_gate_kv2_g12"},
+    // The KV stores depend on the KV heads alone.
+    {"prefill_attention_bf16_store_kv2_g8", "prefill_attention_bf16_store_kv2_g8"},
+    {"prefill_attention_q8_store_kv2_g8", "prefill_attention_q8_store_kv2_g8"},
+    {"verify_attention_bf16_store_kv2_g8", "verify_attention_bf16_store_kv2_g8"},
+    {"verify_attention_q8_store_kv2_g8", "verify_attention_q8_store_kv2_g8"},
     // The table gates' suffix (verify_attention_gate_table16_kv2_g12, ...).
     {"_kv2_g8", "_kv2_g12"},
 };
