@@ -613,7 +613,7 @@ void flashNextShapes(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t kColumnPadding = 64;
   size_t checks = 0;
   for (const Shape &shape : {Shape{10240, 320, {Q80}}, Shape{320, 10240, {Q80}},
-                             Shape{640, 2560, {Q5K, IQ1S, IQ2XXS, IQ2XS, IQ3XXS, IQ4NL}},
+                             Shape{640, 2560, {Q5K, Q6K, IQ1S, IQ2XXS, IQ2XS, IQ3XXS, IQ4NL}},
                              Shape{2560, 640, {Q80, IQ4NL}}})
     for (const Fmt f : shape.formats) {
       const uint32_t N = shape.N, K = shape.K, columns = N + kColumnPadding;
