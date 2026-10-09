@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include "TestChecks.hpp"
+#include "metal/abi/Qwen4.h"
 #include "ops/PagedAttention.hpp"
 #include "tuning/HostKvExtents.hpp"
 #include "Q8PageFormatReference.hpp"
@@ -15,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,17 +31,25 @@ constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
 static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 
-// The two production GQA geometries. The group size selects the kernel
-// specialization; the suffix names its pipelines.
+// The production GQA geometries. The group size selects the kernel
+// specialization; the suffix names its pipelines. The group of twelve has
+// register-tile kernels alone, in two threadgroups per KV head, and runs over
+// either KV format.
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
   const char *suffix;
+  Format format = Format::Int8;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
-  Layout layout() const { return {1, kvHeads, kHeadDimension}; }
+  Layout layout() const { return {1, kvHeads, kHeadDimension, format}; }
+  bool group12() const { return queryHeadsPerKvHead == 12; }
+  bool int8() const { return format == Format::Int8; }
 };
-constexpr std::array<Shape, 2> kShapes{{{4, 6, ""}, {2, 8, "_kv2_g8"}}};
+constexpr std::array<Shape, 4> kShapes{{{4, 6, ""},
+                                        {2, 8, "_kv2_g8"},
+                                        {2, 12, "_kv2_g12"},
+                                        {2, 12, "_kv2_g12", Format::BFloat16}}};
 
 using splash::test::require;
 
@@ -149,6 +159,9 @@ struct Case {
   std::vector<id<MTLBuffer>> extents;
   std::unique_ptr<HostKvExtents> pool;
   id<MTLBuffer> queries;
+  // The QSA bitmaps cpuReference attends through, [row][maskWords] (none: causal).
+  uint32_t maskWords = 0;
+  std::vector<uint32_t> referenceMask;
 
   uint64_t queryIndex(uint32_t head, uint32_t row, uint32_t dimension) const {
     const uint32_t kvHead = head / shape.queryHeadsPerKvHead;
@@ -238,6 +251,18 @@ void fill(Case &data) {
         }
       }
     }
+    if (!shape.int8()) {
+      for (uint32_t token = 0; token < valid; ++token)
+        for (uint32_t head = 0; head < shape.kvHeads; ++head)
+          for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
+            const uint64_t index = logicalIndex(token, head, dimension);
+            data.slab<BFloat16Bits>(SPLASH_KV_KEYS, logicalPage)[splash_kv_key_element(
+                head, token, dimension)] = floatToBFloat16(pageKeys[index]);
+            data.slab<BFloat16Bits>(SPLASH_KV_VALUES, logicalPage)[splash_kv_value_element(
+                head, token, dimension)] = floatToBFloat16(pageValues[index]);
+          }
+      continue;
+    }
     quantizeLayerPage(pageKeys, pageValues, valid, *quantized);
     const uint64_t elements = layout.elementsPerLayerPage();
     const uint64_t scales = layout.scalesPerTensorLayerPage();
@@ -297,6 +322,14 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
       std::vector<double> weights(visible);
       double maximum = -std::numeric_limits<double>::infinity();
       for (uint32_t token = 0; token < visible; ++token) {
+        if (data.maskWords) {
+          const uint32_t block = token / 4;
+          const uint32_t word = data.referenceMask[uint64_t{row} * data.maskWords + block / 32];
+          if (!((word >> (block % 32)) & 1u)) {
+            weights[token] = -std::numeric_limits<double>::infinity();
+            continue;
+          }
+        }
         double score = 0.0;
         for (uint32_t dimension = 0; dimension < kHeadDimension; ++dimension) {
           const float query = bfloat16ToFloat(
@@ -343,25 +376,58 @@ struct Pipelines {
   id<MTLComputePipelineState> prefillSplit;
   id<MTLComputePipelineState> prefillReduce;
   uint32_t threads = 256;
+  // The group of twelve: two threadgroups per KV head, QSA bitmaps bound.
+  bool group12 = false;
+  uint32_t halves = 1;
 };
+
+// A step's QSA bitmaps: [row0 + rows][words] words, the dispatch's first
+// row at row0.
+struct MaskArgs {
+  id<MTLBuffer> buffer = nil;
+  uint32_t words = 0;
+  uint32_t row0 = 0;
+};
+
+// The group-of-twelve kernels always read their mask bindings: no bitmaps are
+// words = 0 and a placeholder buffer.
+void bindMask(id<MTLDevice> device, id<MTLComputeCommandEncoder> encoder,
+              const Pipelines &pipelines, const MaskArgs *mask, uint32_t index) {
+  if (!pipelines.group12) {
+    require(!mask, "only the group-of-twelve kernels read QSA bitmaps");
+    return;
+  }
+  const Qwen4QsaMaskParams params{mask ? mask->words : 0, mask ? mask->row0 : 0};
+  [encoder setBuffer:mask ? mask->buffer : makeBuffer(device, 16) offset:0 atIndex:index];
+  [encoder setBytes:&params length:sizeof(params) atIndex:index + 1];
+}
 
 // The Apple7/8 register tile (_sgf, 32 x G threads) shares the reductions.
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape, bool registerTile = false) {
   Pipelines result;
   const std::string tile = registerTile ? "_sgf" : "";
-  if (registerTile)
-    result.threads = 32 * shape.queryHeadsPerKvHead;
-  result.splitName = "verify_attention_q8_split" + tile + shape.suffix;
+  const std::string element = shape.int8() ? "q8" : "bf16";
+  result.group12 = shape.group12();
+  require(!result.group12 || registerTile, "the group of twelve has only the register tile");
+  if (registerTile) {
+    result.halves = result.group12 ? 2 : 1;
+    result.threads = 32 * shape.queryHeadsPerKvHead / result.halves;
+  }
+  result.splitName = "verify_attention_" + element + "_split" + tile + shape.suffix;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
       device, library, std::string("verify_attention_reduce") + shape.suffix);
-  result.prefillSplitName = "prefill_attention_q8_split" + tile + shape.suffix;
+  result.prefillSplitName = "prefill_attention_" + element + "_split" + tile + shape.suffix;
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
       device, library, std::string("prefill_attention_reduce") + shape.suffix);
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
+            << " max_threads=" << result.split.maxTotalThreadsPerThreadgroup
+            << " prefill_pipeline=" << result.prefillSplitName << " threadgroup_bytes="
+            << result.prefillSplit.staticThreadgroupMemoryLength
+            << " max_threads=" << result.prefillSplit.maxTotalThreadsPerThreadgroup
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
             << '\n';
   if (registerTile) {
@@ -392,7 +458,7 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
 // Every lane of a verify step of `width` lanes attends the case's rows.
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
                   const Pipelines &pipelines, const Case &data,
-                  uint32_t width) {
+                  uint32_t width, const MaskArgs *mask = nullptr) {
   id<MTLComputePipelineState> split = pipelines.split;
   id<MTLComputePipelineState> reduce = pipelines.reduce;
   const Shape shape = data.shape;
@@ -424,10 +490,11 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:params.data()
               length:sizeof(VerifyAttentionParams) * params.size()
              atIndex:7];
+  bindMask(device, encoder, pipelines, mask, 8);
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads * pipelines.halves, splits, width)
           threadsPerThreadgroup:MTLSizeMake(pipelines.threads, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
@@ -445,35 +512,36 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
 
 // The case's rows as the one query tile of a prefill chunk.
 Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                         id<MTLComputePipelineState> split,
-                         id<MTLComputePipelineState> reduce, const Case &data,
-                         uint32_t threads = 256) {
+                         const Pipelines &pipelines, const Case &data,
+                         const MaskArgs *mask = nullptr) {
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
+  const uint32_t tiles = (data.params.rows + kRows - 1) / kRows;
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
-  const uint64_t slots = uint64_t{shape.kvHeads} * splits;
+  const uint64_t slots = uint64_t{tiles} * shape.kvHeads * splits;
   id<MTLBuffer> partials = makeBuffer(
       device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-  [encoder setComputePipelineState:split];
+  [encoder setComputePipelineState:pipelines.prefillSplit];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
   [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:4];
+  bindMask(device, encoder, pipelines, mask, 5);
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, 1, splits)
-          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
-  [encoder setComputePipelineState:reduce];
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads * pipelines.halves, tiles, splits)
+          threadsPerThreadgroup:MTLSizeMake(pipelines.threads, 1, 1)];
+  [encoder setComputePipelineState:pipelines.prefillReduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
   [encoder setBuffer:statistics offset:0 atIndex:1];
   [encoder setBuffer:output offset:0 atIndex:2];
   [encoder setBytes:&data.params length:sizeof(data.params) atIndex:3];
-  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), 1)
+  [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), tiles)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
   finish(command);
@@ -632,14 +700,13 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   Case data = makeCase(device, shape, committed, activeRows, splits);
   fill(data);
   const Case oneExtent = oneExtentCopy(device, data);
-  const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, true);
+  const std::vector<BFloat16Bits> expectedQ8 = cpuReference(data, shape.int8());
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
   const bool verify = activeRows == kRows;
   const std::string &name = verify ? pipelines.splitName : pipelines.prefillSplitName;
   const auto run = [&](const Case &c) {
     return verify ? dispatch(device, queue, pipelines, c, width)
-                  : dispatchPrefill(device, queue, pipelines.prefillSplit,
-                                    pipelines.prefillReduce, c, pipelines.threads);
+                  : dispatchPrefill(device, queue, pipelines, c);
   };
   const Dispatch first = run(data);
   checkOutput(data, width, expectedQ8, expectedBf16, first.output, qualityGate, name);
@@ -648,6 +715,183 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
               name + "_repeat");
   requireIdentical(name, data, width, first, repeat, "attention repeat");
   requireIdentical(name, data, width, first, run(oneExtent), "attention over one extent");
+}
+
+// QSA block bitmaps, [row][words] 32-bit words, bit b of a row naming its
+// tokens 4 b .. 4 b + 3. A page holds eight blocks.
+using Bitmaps = std::vector<uint32_t>;
+
+uint32_t maskWordsFor(uint32_t committed, uint32_t rows) {
+  const uint32_t pages = (committed + rows + kPageTokens - 1) / kPageTokens;
+  return (pages * 8 + 31) / 32;
+}
+
+// About a quarter of the blocks, and block 0 so that no row is empty.
+Bitmaps randomBitmaps(uint32_t rows, uint32_t words, uint32_t seed) {
+  std::mt19937 random(seed);
+  Bitmaps bits(uint64_t{rows} * words);
+  for (uint32_t &word : bits)
+    word = random() & random();
+  for (uint32_t row = 0; row < rows; ++row)
+    bits[uint64_t{row} * words] |= 1u;
+  return bits;
+}
+
+// Block 0 and `blocks` alone, in every row.
+Bitmaps onlyBlocks(uint32_t rows, uint32_t words, std::initializer_list<uint32_t> blocks) {
+  Bitmaps bits(uint64_t{rows} * words);
+  for (uint32_t row = 0; row < rows; ++row) {
+    bits[uint64_t{row} * words] |= 1u;
+    for (const uint32_t block : blocks)
+      bits[uint64_t{row} * words + block / 32] |= 1u << (block % 32);
+  }
+  return bits;
+}
+
+// Blocks [first, last) cleared in every row (block 0 stays).
+void clearBlocks(Bitmaps &bits, uint32_t words, uint32_t first, uint32_t last) {
+  for (uint64_t row = 0; row < bits.size() / words; ++row)
+    for (uint32_t block = std::max(first, 1U); block < last; ++block)
+      bits[row * words + block / 32] &= ~(1u << (block % 32));
+}
+
+// The device bitmaps of lanes whose rows follow row0 rows of junk (all ones,
+// so that a lane reading the wrong rows is dense), in a buffer that ends with
+// the last lane's last row.
+MaskArgs makeMask(id<MTLDevice> device, uint32_t words, uint32_t row0, uint32_t rows,
+                  const std::vector<Bitmaps> &lanes) {
+  MaskArgs mask;
+  mask.words = words;
+  mask.row0 = row0;
+  mask.buffer = makeBuffer(device, (uint64_t{row0} + lanes.size() * rows) * words * 4);
+  auto *bits = static_cast<uint32_t *>(mask.buffer.contents);
+  std::fill_n(bits, uint64_t{row0} * words, ~0u);
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    require(lanes[lane].size() == uint64_t{rows} * words, "bitmap rows departed from the case");
+    std::copy(lanes[lane].begin(), lanes[lane].end(),
+              bits + (uint64_t{row0} + lane * rows) * words);
+  }
+  return mask;
+}
+
+// Eight rows run a verify step with one bitmap set per lane, fewer (or more:
+// several query tiles) a prefill chunk of one. Every lane must match the
+// reference over its own bitmaps, which differ, and a repeat the bytes.
+// `emptySplit` >= 0 names a split whose pages the bitmaps clear in every row.
+void runMasked(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines &pipelines,
+               Shape shape, uint32_t committed, uint32_t rows, uint32_t splits, uint32_t row0,
+               const std::vector<Bitmaps> &lanes, const std::string &label,
+               int emptySplit = -1) {
+  const bool verify = rows == kRows;
+  const uint32_t width = uint32_t(lanes.size());
+  require(verify ? width >= 1 && width <= 4 : width == 1, "invalid masked attention case");
+  Case data = makeCase(device, shape, committed, rows, splits);
+  fill(data);
+  const uint32_t words = maskWordsFor(committed, rows);
+  data.maskWords = words;
+  const MaskArgs mask = makeMask(device, words, row0, rows, lanes);
+  const auto run = [&] {
+    return verify ? dispatch(device, queue, pipelines, data, width, &mask)
+                  : dispatchPrefill(device, queue, pipelines, data, &mask);
+  };
+  const Dispatch first = run();
+  const std::string name = (verify ? pipelines.splitName : pipelines.prefillSplitName) + label;
+  for (uint32_t lane = 0; lane < width; ++lane) {
+    data.referenceMask = lanes[lane];
+    const std::vector<BFloat16Bits> expected = cpuReference(data, shape.int8());
+    const uint64_t laneBytes = expected.size() * sizeof(BFloat16Bits);
+    const std::vector<uint8_t> output(first.output.begin() + lane * laneBytes,
+                                      first.output.begin() + (lane + 1) * laneBytes);
+    checkOutput(data, 1, expected, expected, output, false, name + " lane=" + std::to_string(lane));
+  }
+  requireIdentical(name, data, width, first, run(), "masked attention repeat");
+  if (emptySplit >= 0) {
+    // Nothing of the split is admitted: it leaves no maximum and no sum.
+    require(uint32_t(emptySplit) < splits, "invalid empty split");
+    const auto *stats = reinterpret_cast<const float *>(first.statistics.data());
+    for (uint32_t lane = 0; lane < width; ++lane)
+      for (uint32_t head = 0; head < shape.kvHeads; ++head)
+        for (uint32_t row = 0; row < shape.fusedRows(); ++row) {
+          const uint64_t slot = (uint64_t{lane} * shape.kvHeads + head) * splits + emptySplit;
+          const float *stat = stats + (slot * shape.fusedRows() + row) * 2;
+          require(stat[0] == -INFINITY && stat[1] == 0.0f,
+                  "a split without an admitted token left a maximum or a sum");
+        }
+  }
+}
+
+// Bitmaps with every block set are the causal kernel, to the byte.
+void runAllOnes(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines &pipelines,
+                Shape shape, uint32_t committed, uint32_t rows, uint32_t width) {
+  const bool verify = rows == kRows;
+  Case data = makeCase(device, shape, committed, rows, kVerifySplits);
+  fill(data);
+  const uint32_t words = maskWordsFor(committed, rows);
+  const std::vector<Bitmaps> lanes(width, Bitmaps(uint64_t{rows} * words, ~0u));
+  const MaskArgs mask = makeMask(device, words, 3, rows, lanes);
+  const auto run = [&](const MaskArgs *bitmaps) {
+    return verify ? dispatch(device, queue, pipelines, data, width, bitmaps)
+                  : dispatchPrefill(device, queue, pipelines, data, bitmaps);
+  };
+  requireIdentical(verify ? pipelines.splitName : pipelines.prefillSplitName, data, width,
+                   run(nullptr), run(&mask), "all-ones bitmaps");
+}
+
+// The group of twelve's QSA bitmaps: every bitmap-to-row stride, the first
+// row, word and page edges, and the splits and tails that admit nothing.
+void runMaskedCases(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines &pipelines,
+                    Shape shape) {
+  runAllOnes(device, queue, pipelines, shape, 1'100, 8, 2);
+  runAllOnes(device, queue, pipelines, shape, 127, 5, 1);
+  runAllOnes(device, queue, pipelines, shape, 421, 12, 1);
+  const auto random = [&](uint32_t committed, uint32_t rows, uint32_t lanes, uint32_t seed) {
+    std::vector<Bitmaps> result;
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      result.push_back(randomBitmaps(rows, maskWordsFor(committed, rows), seed + lane));
+    return result;
+  };
+  // Distinct bitmaps per lane after junk rows.
+  runMasked(device, queue, pipelines, shape, 1'100, 8, kVerifySplits, 5, random(1'100, 8, 3, 11),
+            " random_lanes");
+  runMasked(device, queue, pipelines, shape, 4'093, 8, 65, 0, random(4'093, 8, 2, 21),
+            " random_65_splits");
+  // Rows that repeat the last active row's bitmap, from a buffer that ends there.
+  for (uint32_t rows = 1; rows < kRows; ++rows)
+    runMasked(device, queue, pipelines, shape, 127, rows, SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS,
+              3, random(127, rows, 1, 30 + rows), " random_prefill_rows");
+  // Two query tiles, the second at bitmap row row0 + 8.
+  runMasked(device, queue, pipelines, shape, 421, 12, 7, 2, random(421, 12, 1, 41),
+            " random_two_tiles");
+  runMasked(device, queue, pipelines, shape, 421, 20, 7, 1, random(421, 20, 1, 42),
+            " random_three_tiles");
+  // Blocks 31 and 32 (tokens 124 .. 131), 63 and 64: the first pages across a word.
+  for (const uint32_t edge : {31U, 63U}) {
+    const uint32_t committed = 4 * edge + 20;
+    runMasked(device, queue, pipelines, shape, committed, 8, 4, 0,
+              {onlyBlocks(8, maskWordsFor(committed, 8), {edge, edge + 1})}, " word_edge");
+  }
+  // A page no row admits.
+  {
+    std::vector<Bitmaps> lanes = random(1'100, 8, 2, 51);
+    for (Bitmaps &lane : lanes)
+      clearBlocks(lane, maskWordsFor(1'100, 8), 16, 24);
+    runMasked(device, queue, pipelines, shape, 1'100, 8, kVerifySplits, 0, lanes, " empty_page");
+  }
+  // Only the last, partly visible block: the rows that reach its first token.
+  {
+    const uint32_t committed = 1'101;
+    runMasked(device, queue, pipelines, shape, committed, 8, kVerifySplits, 0,
+              {onlyBlocks(8, maskWordsFor(committed, 8), {277})}, " tail_block");
+    runMasked(device, queue, pipelines, shape, committed, 3, kVerifySplits, 0,
+              {onlyBlocks(3, maskWordsFor(committed, 3), {275})}, " tail_block_prefill");
+  }
+  // A split with nothing admitted by any row (pages 15 .. 19 of split 3).
+  {
+    std::vector<Bitmaps> lanes = random(4'093, 8, 2, 61);
+    for (Bitmaps &lane : lanes)
+      clearBlocks(lane, maskWordsFor(4'093, 8), 120, 160);
+    runMasked(device, queue, pipelines, shape, 4'093, 8, kVerifySplits, 1, lanes, " empty_split", 3);
+  }
 }
 
 // Isolate the merge from QK/PV: large differences in maxima, cancellation,
@@ -765,16 +1009,20 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
-    for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
-      checkReduce(device, queue, library, shape, splits, kRows);
-      if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
-        checkReduce(device, queue, library, shape, splits, 1);
-    }
+    // The reduces do not depend on the KV format.
+    if (shape.int8())
+      for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
+        checkReduce(device, queue, library, shape, splits, kRows);
+        if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
+          checkReduce(device, queue, library, shape, splits, 1);
+      }
     #ifdef SPLASH_MACOS15_BUILD
     for (const bool registerTile : {true}) {
 #else
     for (const bool registerTile : {false, true}) {
 #endif
+    if (shape.group12() && !registerTile)
+      continue;
     const Pipelines pipelines = makePipelines(device, library, shape, registerTile);
     for (uint32_t width = 1; width <= 4; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);
@@ -783,6 +1031,8 @@ void run(const char *libraryPath) {
       runCase(device, queue, pipelines, shape, 127, activeRows, 1);
     runCase(device, queue, pipelines, shape, 129, 8, 4);
     runCase(device, queue, pipelines, shape, 421, 3, 1);
+    if (shape.group12())
+      runMaskedCases(device, queue, pipelines, shape);
     // Several pages per split, a partially filled last page, and a history
     // that leaves some splits empty.
     runCase(device, queue, pipelines, shape, 1'100, 8, 2, false);
@@ -795,9 +1045,11 @@ void run(const char *libraryPath) {
     runCase(device, queue, pipelines, shape, 4'093, 8, 2, false,
             kVerifyMaximumSplits);
     runCase(device, queue, pipelines, shape, 1'100, 8, 1, false, 1);
-    runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
-    runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
-    runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65);
+    if (shape.int8()) {
+      runCase(device, queue, pipelines, shape, 8'192, 5, 1, false);
+      runCase(device, queue, pipelines, shape, 32'768, 7, 1, false);
+      runCase(device, queue, pipelines, shape, 32'768, 8, 2, false, 65);
+    }
     }
   }
   std::cout << "q8_flash_attention_metal_test: ok\n";

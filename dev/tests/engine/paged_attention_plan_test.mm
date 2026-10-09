@@ -195,6 +195,44 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
   rejects([&] { (void)ops::PagedAttention::verifyPlan(1, queryHeads + 1, layout, zeroHistory); });
 }
 
+// Qwen3.8-Flash-Next's 24 query heads over two KV heads: only the register
+// tile has split kernels, two threadgroups of six simdgroups per KV head.
+void checkGroup12Plans(kv::Format format) {
+  const kv::Layout layout{1, 2, 256, format};
+  const std::string element = format == kv::Format::Int8 ? "q8" : "bf16";
+  const std::array<uint32_t, 2> histories{0, 131072};
+  for (const uint32_t rows : {1U, 17U, 2048U}) {
+    const auto plan = ops::PagedAttention::prefillPlan(rows, 24, layout, ops::AttentionTile::Register);
+    const uint32_t tiles = (rows + 7) / 8;
+    require(plan.splitPipeline == "prefill_attention_" + element + "_split_sgf_kv2_g12" &&
+                plan.reducePipeline == "prefill_attention_reduce_kv2_g12" &&
+                plan.splitThreads.x == 192 && plan.splitThreads.y == 1 && plan.splitThreads.z == 1 &&
+                plan.splitGroups.x == 4 && plan.splitGroups.y == tiles &&
+                plan.splitGroups.z == plan.splits && plan.reduceGroups.x == 2 &&
+                plan.reduceGroups.y == 96 && plan.reduceGroups.z == tiles &&
+                plan.workspace.partialsBytes ==
+                    uint64_t{tiles} * plan.splits * 2 * 96 * 256 * 4,
+            "group-of-twelve register prefill plan is wrong");
+  }
+  for (const uint32_t lanes : {1U, 4U}) {
+    const std::array<uint32_t, 4> lane{0, 31, 16384, 131072};
+    const auto plan = ops::PagedAttention::verifyPlan(lanes, 24, layout, std::span(lane).first(lanes),
+                                                      ops::AttentionTile::Register);
+    require(plan.splitPipeline == "verify_attention_" + element + "_split_sgf_kv2_g12" &&
+                plan.reducePipeline == "verify_attention_reduce_kv2_g12" &&
+                plan.splitThreads.x == 192 && plan.splitGroups.x == 4 &&
+                plan.splitGroups.y == plan.splits && plan.splitGroups.z == lanes &&
+                plan.reduceGroups.x == 2 && plan.reduceGroups.y == 96 &&
+                plan.reduceGroups.z == lanes &&
+                plan.workspace.partialsBytes ==
+                    uint64_t{lanes} * 8 * kv::kVerifyMaximumSplits * 24 * 256 * 4,
+            "group-of-twelve register verify plan is wrong");
+  }
+  // The tensor-operation tile has no group-of-twelve split kernel.
+  rejects([&] { (void)ops::PagedAttention::prefillPlan(8, 24, layout); });
+  rejects([&] { (void)ops::PagedAttention::verifyPlan(1, 24, layout, std::span(histories).first(1)); });
+}
+
 // The attention layer under test is the second of a pool's two, so its region
 // starts past the first one's in every extent.
 constexpr uint32_t kLayer = 1;
@@ -789,6 +827,8 @@ int main(int argc, char **argv) {
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (uint32_t heads : {24U, 16U})
         checkPlans(heads, {1, heads == 24 ? 4U : 2U, 256, format});
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
+      checkGroup12Plans(format);
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;

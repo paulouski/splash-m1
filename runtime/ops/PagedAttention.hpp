@@ -165,6 +165,15 @@ private:
         storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
+// The QSA block bitmaps of a step (Qwen3.8-Flash-Next): words per row, 0 when
+// every row attends causally, and the bitmap row of the dispatch's first query
+// row. Only the group-of-twelve register-tile kernels read them.
+struct QsaMask final {
+  metal::MetalBuffer bits;
+  uint32_t words = 0;
+  uint32_t row0 = 0;
+};
+
 struct PagedVerifyBuffers final {
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
@@ -259,13 +268,13 @@ public:
                          metal::MetalBuffer statistics,
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
-                         const PrefillAttentionPlan &plan);
+                         const PrefillAttentionPlan &plan, QsaMask mask = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
-                        const VerifyAttentionPlan &plan);
+                        const VerifyAttentionPlan &plan, QsaMask mask = {});
 };
 
 } // namespace splash::ops

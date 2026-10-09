@@ -1,5 +1,7 @@
 #include "ops/PagedAttention.hpp"
 
+#include "metal/abi/Qwen4.h"
+
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -43,13 +45,17 @@ KernelLayout attentionKernelLayout(uint32_t queryHeads, kv::Layout layout) {
   throw std::invalid_argument("no paged-attention kernel for layout");
 }
 
-// The group-of-twelve kernels (kernels/*/attention_*.metal, paged_attention.metal),
-// by their group-of-eight name; the split kernels have no such variant yet.
+// The group-of-twelve kernels (kernels/*/attention_*.metal), by their
+// group-of-eight name; only the register-tile split kernels have such a variant.
 constexpr std::pair<std::string_view, std::string_view> kGroup12Kernels[] = {
     {"prefill_attention_reduce_kv2_g8", "prefill_attention_reduce_kv2_g12"},
     {"prefill_attention_qkv_kv2_g8", "prefill_attention_qkv_kv2_g12"},
     {"prefill_attention_gate_kv2_g8", "prefill_attention_gate_kv2_g12"},
     {"verify_attention_reduce_kv2_g8", "verify_attention_reduce_kv2_g12"},
+    {"prefill_attention_q8_split_sgf_kv2_g8", "prefill_attention_q8_split_sgf_kv2_g12"},
+    {"prefill_attention_bf16_split_sgf_kv2_g8", "prefill_attention_bf16_split_sgf_kv2_g12"},
+    {"verify_attention_q8_split_sgf_kv2_g8", "verify_attention_q8_split_sgf_kv2_g12"},
+    {"verify_attention_bf16_split_sgf_kv2_g8", "verify_attention_bf16_split_sgf_kv2_g12"},
     {"verify_attention_qkv_kv2_g8", "verify_attention_qkv_kv2_g12"},
     {"verify_attention_gate_kv2_g8", "verify_attention_gate_kv2_g12"},
     // The KV stores depend on the KV heads alone.
@@ -102,10 +108,24 @@ uint32_t prefillSplits(uint32_t tiles) {
   return std::clamp(maximum / tiles, 1U, maximum);
 }
 
-// The register tile runs one simdgroup per eight fused rows of the GQA group.
-uint64_t splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout) noexcept {
-  return tile == AttentionTile::Register ? uint64_t{32} * (queryHeads / layout.kvHeads)
-                                         : metal::CommandGraph::kDefaultThreads;
+// A group of twelve runs its register tile as two threadgroups per KV head,
+// each of the rows of half the group.
+uint32_t splitHalves(KernelLayout kernel, AttentionTile tile) noexcept {
+  return kernel == KernelLayout::Kv2Group12 && tile == AttentionTile::Register ? 2 : 1;
+}
+
+// The register tile runs one simdgroup per eight fused rows of the GQA group
+// (of its half of it).
+uint64_t splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout,
+                      uint32_t halves) noexcept {
+  return tile == AttentionTile::Register
+             ? uint64_t{32} * (queryHeads / layout.kvHeads) / halves
+             : metal::CommandGraph::kDefaultThreads;
+}
+
+// The group-of-twelve register-tile split kernels, which also bind the QSA bitmaps.
+bool masked(std::string_view pipeline) noexcept {
+  return pipeline.ends_with("_split_sgf_kv2_g12");
 }
 
 } // namespace
@@ -134,8 +154,8 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
                             "prefill_attention_q8_split_kv2_g8"),
           pipeline(kernel, "prefill_attention_reduce",
                    "prefill_attention_reduce_kv2_g8"),
-          {layout.kvHeads, tiles, splits},
-          {splitThreads(tile, queryHeads, layout), 1, 1},
+          {layout.kvHeads * splitHalves(kernel, tile), tiles, splits},
+          {splitThreads(tile, queryHeads, layout, splitHalves(kernel, tile)), 1, 1},
           {layout.kvHeads, fusedRows, tiles}, layout.format};
 }
 
@@ -171,8 +191,8 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
                             "verify_attention_q8_split_kv2_g8"),
           pipeline(kernel, "verify_attention_reduce",
                    "verify_attention_reduce_kv2_g8"),
-          {layout.kvHeads, splits, lanes},
-          {splitThreads(tile, queryHeads, layout), 1, 1},
+          {layout.kvHeads * splitHalves(kernel, tile), splits, lanes},
+          {splitThreads(tile, queryHeads, layout, splitHalves(kernel, tile)), 1, 1},
           {layout.kvHeads,
            kv::kVerifyRows * (queryHeads / layout.kvHeads), lanes},
           layout.format == kv::Format::BFloat16
@@ -329,7 +349,7 @@ void PagedAttention::addPrefill(
     metal::MetalBuffer queries, metal::MetalBuffer output,
     metal::MetalBuffer partials, metal::MetalBuffer statistics,
     metal::MetalBuffer pageTable, const kv::ChunkedPrefillParams &chunk,
-    const PrefillAttentionPlan &plan) {
+    const PrefillAttentionPlan &plan, QsaMask mask) {
   if (chunk.chunk_tokens != plan.rows)
     throw std::invalid_argument("prefill attention rows do not match plan");
   const std::string_view error = kv::chunkedPrefillValidationError(chunk);
@@ -343,9 +363,15 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
-  graph.add(std::string(plan.splitPipeline),
-            {std::move(queries), partials, statistics, std::move(pageTable)},
-            params, plan.splitGroups, plan.splitThreads);
+  if (masked(plan.splitPipeline))
+    graph.add(std::string(plan.splitPipeline),
+              {std::move(queries), partials, statistics, std::move(pageTable)}, params,
+              {mask.words ? mask.bits : partials}, Qwen4QsaMaskParams{mask.words, mask.row0},
+              plan.splitGroups, plan.splitThreads);
+  else
+    graph.add(std::string(plan.splitPipeline),
+              {std::move(queries), partials, statistics, std::move(pageTable)},
+              params, plan.splitGroups, plan.splitThreads);
   graph.add(std::string(plan.reducePipeline),
             {std::move(partials), std::move(statistics), std::move(output)},
             params, plan.reduceGroups);
@@ -354,7 +380,7 @@ void PagedAttention::addPrefill(
 void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                                PagedVerifyBuffers buffers,
                                std::span<const kv::ChunkedPrefillParams> chunks,
-                               const VerifyAttentionPlan &plan) {
+                               const VerifyAttentionPlan &plan, QsaMask mask) {
   constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
@@ -381,10 +407,17 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
             {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
-  graph.add(std::string(plan.splitPipeline),
-            {buffers.queries, buffers.partials, buffers.statistics, tables[0],
-             tables[1], tables[2], tables[3]},
-            attention, plan.splitGroups, plan.splitThreads);
+  if (masked(plan.splitPipeline))
+    graph.add(std::string(plan.splitPipeline),
+              {buffers.queries, buffers.partials, buffers.statistics, tables[0],
+               tables[1], tables[2], tables[3]},
+              attention, {mask.words ? mask.bits : buffers.partials},
+              Qwen4QsaMaskParams{mask.words, mask.row0}, plan.splitGroups, plan.splitThreads);
+  else
+    graph.add(std::string(plan.splitPipeline),
+              {buffers.queries, buffers.partials, buffers.statistics, tables[0],
+               tables[1], tables[2], tables[3]},
+              attention, plan.splitGroups, plan.splitThreads);
   graph.add(std::string(plan.reducePipeline),
             {buffers.partials, buffers.statistics, buffers.output},
             attention, plan.reduceGroups);

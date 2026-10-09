@@ -126,15 +126,30 @@ template <> struct ValueRun<bfloat> {
   }
 };
 
+// Whether score step s of a lane's row attends its token: within the causal
+// limit, and its four-token block bit set (bit 0 of blocks: the lane's tokens
+// b and b + 1, bit 1: b + 4 and b + 5).
+__attribute__((always_inline)) inline bool admitted(uint token, uint limit, uint blocks, uint s) {
+  return token < limit && ((blocks >> (s >> 1)) & 1u);
+}
+
 // One tile of eight query rows x G heads over its split's pages, as
 // splash_paged_attention_tile: row r of the tile sees committed_tokens + r + 1
 // tokens, and rows past active_rows repeat the last active row's mask.
-template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
+// Halves splits the G simdgroups-worth of fused rows over that many
+// threadgroups: this one runs the rows of half `half_index`, with G / Halves
+// simdgroups and query_words of (G / Halves) * 1024 words. Masked tiles admit
+// a token only when its four-token block's bit is set in the bitmap of its
+// query row (block_mask: the tile's first row, mask_words words per row;
+// mask_words == 0: every row attends causally).
+template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, uint Halves = 1,
+          bool Masked = false>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    uint sg, uint lane, threadgroup uint *query_words) {
+    uint sg, uint lane, threadgroup uint *query_words, uint half_index = 0,
+    device const uint *block_mask = nullptr, uint mask_words = 0) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint Rows = 8;
@@ -142,6 +157,7 @@ __attribute__((always_inline)) inline void tile(
   constexpr uint N = SplashKvPageTokens;
   constexpr uint D = SplashKvHeadDimension;
   static_assert(N == 32 && D == 256, "fragment maps assume Page32 and D = 256");
+  static_assert(G % Halves == 0, "halves split whole simdgroups");
   static_assert(SPLASH_TARGET_VERIFY_ROWS == Rows &&
                     SPLASH_PREFILL_ATTENTION_TILE_ROWS == Rows,
                 "one simdgroup per G fused rows of an eight-row tile");
@@ -155,7 +171,9 @@ __attribute__((always_inline)) inline void tile(
   const Lane l = lane_map(lane);
   const uint fm = l.fm, fn = l.fn;
   // This lane's fused rows are row and row + 1, the columns of its fragments.
-  const uint row = sg * 8 + fn;
+  uint row = sg * 8 + fn;
+  if constexpr (Halves > 1)
+    row += half_index * (G / Halves) * 8;
   const uint2 limit(
       min(visible, committed_tokens + min(row / G, active_rows - 1) + 1),
       min(visible, committed_tokens + min((row + 1) / G, active_rows - 1) + 1));
@@ -175,6 +193,15 @@ __attribute__((always_inline)) inline void tile(
         const uint d = 64 * b + block_dimension(fm, t);
         queries[(b * 8 + t) * 32] = uint(q0[d]) | (uint(q1[d]) << 16);
       }
+  }
+  // The bitmaps of the lane's rows (row, row + 1), which share a query row
+  // whenever G is even.
+  device const uint *mask_row0 = nullptr, *mask_row1 = nullptr;
+  if constexpr (Masked) {
+    if (mask_words) {
+      mask_row0 = block_mask + ulong(min(row / G, active_rows - 1)) * mask_words;
+      mask_row1 = block_mask + ulong(min((row + 1) / G, active_rows - 1)) * mask_words;
+    }
   }
   // O^T tiles: dimension 8 d + fm of rows (row, row + 1).
   float2 output[32];
@@ -204,6 +231,17 @@ __attribute__((always_inline)) inline void tile(
       value_scale[3] = v45.y;
     }
 
+    // The block bits of this lane's two token pairs. A page is eight blocks
+    // and the pair's first block is even, so both bits lie in one word.
+    uint2 blocks(3u);
+    if constexpr (Masked) {
+      if (mask_words) {
+        const uint first = page * 8 + (scale_base >> 2);
+        blocks = uint2((mask_row0[first >> 5] >> (first & 31)) & 3u,
+                       (mask_row1[first >> 5] >> (first & 31)) & 3u);
+      }
+    }
+
     // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1).
     float2 scores[4];
 #pragma unroll
@@ -231,8 +269,12 @@ __attribute__((always_inline)) inline void tile(
       if constexpr (Quantized)
         score *= key_scale[s];
       score *= 0.0625f;
-      scores[s] = float2(token < limit.x ? score.x : -INFINITY,
-                         token < limit.y ? score.y : -INFINITY);
+      if constexpr (Masked)
+        scores[s] = float2(admitted(token, limit.x, blocks.x, s) ? score.x : -INFINITY,
+                           admitted(token, limit.y, blocks.y, s) ? score.y : -INFINITY);
+      else
+        scores[s] = float2(token < limit.x ? score.x : -INFINITY,
+                           token < limit.y ? score.y : -INFINITY);
       local_max = max(local_max, scores[s]);
     }
     // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
@@ -245,9 +287,14 @@ __attribute__((always_inline)) inline void tile(
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
       const uint token = token_start + page_token(fm, s);
-      probability[s] =
-          float2(token < limit.x ? fast::exp(scores[s].x - next_max.x) : 0.0f,
-                 token < limit.y ? fast::exp(scores[s].y - next_max.y) : 0.0f);
+      if constexpr (Masked)
+        probability[s] = float2(
+            admitted(token, limit.x, blocks.x, s) ? fast::exp(scores[s].x - next_max.x) : 0.0f,
+            admitted(token, limit.y, blocks.y, s) ? fast::exp(scores[s].y - next_max.y) : 0.0f);
+      else
+        probability[s] =
+            float2(token < limit.x ? fast::exp(scores[s].x - next_max.x) : 0.0f,
+                   token < limit.y ? fast::exp(scores[s].y - next_max.y) : 0.0f);
       local_sum += probability[s];
     }
     local_sum += simd_shuffle_xor(local_sum, 2);
@@ -270,9 +317,14 @@ __attribute__((always_inline)) inline void tile(
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
       const uint token = token_start + page_token(fm, s);
-      weights[s] = float2(
-          token < limit.x ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
-          token < limit.y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
+      if constexpr (Masked)
+        weights[s] = float2(
+            admitted(token, limit.x, blocks.x, s) ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
+            admitted(token, limit.y, blocks.y, s) ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
+      else
+        weights[s] = float2(
+            token < limit.x ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
+            token < limit.y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
     }
 
     // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
