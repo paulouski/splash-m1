@@ -183,6 +183,16 @@ void testCleanRuntimeStatus() {
               json.find("\"written_bytes\":67890") != std::string::npos &&
               json.find("\"file_bytes\":24680,") != std::string::npos,
           "disk byte accounting was not exposed");
+  require(json.find("\"prefill_rows\":4096,\"prefill_bound_ms\":2000,") !=
+              std::string::npos,
+          "status omitted the effective prefill command bound");
+  auto unbounded = engine;
+  unbounded.scheduler.prefillBoundMilliseconds = kUnboundedPrefillCommand;
+  require(runtimeStatusJson(memoryPlan, unbounded, metal, warmup, audit(memoryPlan),
+                            metrics, executorTelemetry, identity, governor, true, {},
+                            {}, {})
+                  .find("\"prefill_bound_ms\":null,") != std::string::npos,
+          "status did not report an unbounded prefill command as null");
   require(json.find("\"state_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
               std::string::npos,
           "the memory plan status omitted the disk tier's state staging");

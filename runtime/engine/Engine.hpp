@@ -37,8 +37,9 @@ struct EngineConfig final {
   // images.
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
   // Keep isolated prefill commands short enough that macOS does not abort
-  // them for starving the display; false sends full-budget commands.
-  bool boundPrefillCommands = true;
+  // them for starving the display; kUnboundedPrefillCommand sends
+  // full-budget commands.
+  double prefillCommandMilliseconds = kDefaultPrefillCommandMilliseconds;
   // Largest packed prefill command the model's arena holds.
   uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
   // Requests decoding at once; the rest wait for a state cell.

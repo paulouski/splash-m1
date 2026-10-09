@@ -13,12 +13,6 @@ constexpr uint32_t kMaximumOvertakes =
     model::ExecutionLimits::maximumBatchWidth - 1;
 
 constexpr double kContendedPrefillMilliseconds = 500.0;
-// One prefill command runs as one GPU command buffer. On slower GPUs a full
-// budget over a long context takes a minute, and macOS aborts such a command
-// when it starves the display (ImpactingInteractivity). Isolated prefill keeps
-// each command within this bound; it is long enough that short contexts on
-// current GPUs keep the full budget.
-constexpr double kIsolatedPrefillMilliseconds = 5000.0;
 constexpr uint32_t kMinimumPrefillRows = 64;
 
 // A command excludes at most the lanes of a full batch: a linear search.
@@ -27,6 +21,12 @@ bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
 }
 
 } // namespace
+
+void Scheduler::boundIsolatedPrefill(double milliseconds) {
+  if (!(milliseconds > 0.0))
+    throw std::invalid_argument("prefill command bound must be positive");
+  isolatedPrefillMilliseconds_ = milliseconds;
+}
 
 void Scheduler::submit(RequestSpec request) {
   Request state;
@@ -339,8 +339,8 @@ uint32_t Scheduler::prefillBudget(
       rows /= 2;
     return rows;
   };
-  const uint32_t isolated = boundIsolatedPrefill_
-                                ? boundedRows(kIsolatedPrefillMilliseconds)
+  const uint32_t isolated = std::isfinite(isolatedPrefillMilliseconds_)
+                                ? boundedRows(isolatedPrefillMilliseconds_)
                                 : maximum;
   const uint32_t rows = boundedRows(kContendedPrefillMilliseconds);
   const uint32_t leaderRemaining =
@@ -568,6 +568,7 @@ uint32_t Scheduler::promptProcessed(uint64_t id) const {
 
 SchedulerSnapshot Scheduler::snapshot() const noexcept {
   SchedulerSnapshot result = counters_;
+  result.prefillBoundMilliseconds = isolatedPrefillMilliseconds_;
   for (const auto &[_, request] : requests_) {
     switch (request.phase) {
     case Phase::Queued:

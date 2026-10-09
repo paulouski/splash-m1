@@ -55,6 +55,11 @@ OPTIONS = {
     "--prefill-mode": values(
         "--prefill-mode", {"bounded": "bounded", "full": "full"}, ("fast",)
     ),
+    "--prefill-bound-ms": values(
+        "--prefill-bound-ms",
+        {"1": 1, "3000": 3000, "600000": 600000},
+        ("0", "-5", "2s", "600001", "1.5"),
+    ),
     "--idle-unload": values("--idle-unload", {"0": 0.0, "300": 300.0}, ("soon",)),
     "--max-memory": values(
         "--max-memory",

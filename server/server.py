@@ -2044,7 +2044,23 @@ def parse_args(argv=None):
     return args
 
 
-def _native_command(args):
+# After macOS aborts a prefill command for stalling the display, each restart
+# halves the bound down to this floor, the contended-prefill bound.
+PREFILL_BOUND_FLOOR_MS = 500
+DISPLAY_STALL_ABORT = "ImpactingInteractivity"
+
+
+def _prefill_bound(args):
+    return (
+        serve_options.PREFILL_BOUND_DEFAULT_MS
+        if args.prefill_bound_ms is None
+        else args.prefill_bound_ms
+    )
+
+
+def _native_command(args, prefill_bound_ms=None):
+    if prefill_bound_ms is None:
+        prefill_bound_ms = _prefill_bound(args)
     command = [
         args.binary,
         "serve-native",
@@ -2065,7 +2081,33 @@ def _native_command(args):
         )
     if args.prefill_mode != "bounded":
         command.extend(("--prefill-mode", args.prefill_mode))
+    elif prefill_bound_ms != serve_options.PREFILL_BOUND_DEFAULT_MS:
+        command.extend(("--prefill-bound-ms", str(prefill_bound_ms)))
     return command
+
+
+def _shorter_prefill_after_display_stall(args):
+    """Relaunch command policy: macOS aborts a GPU command that holds the
+    GPU while the display needs it, and how long it tolerates depends on
+    display load. Each such abort halves the bound for the next engine."""
+    bound = _prefill_bound(args)
+
+    def command_after_failure(failure):
+        nonlocal bound
+        if (
+            args.prefill_mode != "bounded"
+            or DISPLAY_STALL_ABORT not in str(failure)
+            or bound <= PREFILL_BOUND_FLOOR_MS
+        ):
+            return None
+        bound = max(PREFILL_BOUND_FLOOR_MS, bound // 2)
+        print_status(
+            f"Prefill bound · {bound} ms after a macOS display-stall abort",
+            error=True,
+        )
+        return _native_command(args, prefill_bound_ms=bound)
+
+    return command_after_failure
 
 
 def _interrupt(_signum, _frame):
@@ -2122,6 +2164,7 @@ def main():
             pending_limit=args.queue_size,
             eager_start=False,
         )
+        runtime.command_after_failure = _shorter_prefill_after_display_stall(args)
         saved_idle = load_idle_unload(DEFAULT_SETTINGS_PATH)
         idle_unload = args.idle_unload if saved_idle is None else saved_idle
         print_status(

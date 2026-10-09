@@ -81,7 +81,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   if (!config_.maximumLanes ||
       config_.maximumLanes > model::ExecutionLimits::maximumBatchWidth)
     throw std::invalid_argument("invalid decode lane cap");
-  scheduler_.boundIsolatedPrefill(config_.boundPrefillCommands);
+  scheduler_.boundIsolatedPrefill(config_.prefillCommandMilliseconds);
   scheduler_.maximumPrefillRows(config_.prefillRows);
   scheduler_.maximumLanes(config_.maximumLanes);
 }

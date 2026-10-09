@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 using namespace splash;
 using namespace splash::engine;
@@ -158,7 +159,7 @@ void testWarmupTimingSeedsFirstContendedCommand() {
     scheduler.submit(request(1, 8193));
     scheduler.resourcesReady(1, 0);
     require(scheduler.next({})->items[0].tokenCount ==
-                (sample == 6144.0 ? 1024 : 2048),
+                (sample == 6144.0 ? 512 : 2048),
             "warmup did not bound an uncontended prefill command");
     scheduler.submit(request(2, 1));
     scheduler.resourcesReady(2, 1);
@@ -650,6 +651,7 @@ void testHigherPriorityPrefillPrecedesDecodeDebt() {
 
 void testMeasuredBudgetOnlyLimitsContendedWork() {
   engine::Scheduler scheduler(0.0);
+  scheduler.boundIsolatedPrefill(5000.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   const BatchPlan first = *scheduler.next({});
@@ -673,26 +675,54 @@ void testMeasuredBudgetOnlyLimitsContendedWork() {
 }
 
 void testIsolatedPrefillStaysWithinCommandBound() {
-  // A long context on a slow GPU: 32 ms per row keeps an isolated command
-  // near five seconds instead of a minute, and fast work keeps the budget.
+  // A long context on a slow GPU: 8 ms per row keeps an isolated command
+  // within two seconds instead of sixteen, and fast work keeps the budget.
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 200'000));
   scheduler.resourcesReady(1, 0);
-  completePrefill(scheduler, *scheduler.next({}), 2048 * 32.0);
+  completePrefill(scheduler, *scheduler.next({}), 2048 * 8.0);
   const BatchPlan slow = *scheduler.next({});
   require(slow.items[0].tokenCount == 128,
           "slow isolated prefill exceeded the command time bound");
   for (uint32_t sample = 0; sample < 16; ++sample) {
     const BatchPlan plan = *scheduler.next({});
-    completePrefill(scheduler, plan, plan.items[0].tokenCount * 1.0);
+    completePrefill(scheduler, plan, plan.items[0].tokenCount * 0.5);
   }
   require(scheduler.next({})->items[0].tokenCount == 2048,
           "isolated prefill did not recover the full budget when fast");
 }
 
+void testConfiguredPrefillBoundSetsCommandLength() {
+  // 32 ms per row: five seconds fits 128 rows, and the default two seconds
+  // reaches the 64-row floor.
+  for (const auto [bound, rows] :
+       {std::pair{5000.0, 128u},
+        std::pair{engine::kDefaultPrefillCommandMilliseconds, 64u}}) {
+    engine::Scheduler scheduler(0.0);
+    scheduler.boundIsolatedPrefill(bound);
+    require(scheduler.snapshot().prefillBoundMilliseconds == bound,
+            "snapshot did not report the configured prefill bound");
+    scheduler.submit(request(1, 200'000));
+    scheduler.resourcesReady(1, 0);
+    completePrefill(scheduler, *scheduler.next({}), 2048 * 32.0);
+    require(scheduler.next({})->items[0].tokenCount == rows,
+            "configured prefill bound did not set the command length");
+  }
+  for (double invalid : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
+    engine::Scheduler scheduler(0.0);
+    bool rejected = false;
+    try {
+      scheduler.boundIsolatedPrefill(invalid);
+    } catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "scheduler accepted a nonpositive prefill bound");
+  }
+}
+
 void testFullPrefillModeKeepsWholeBudget() {
   engine::Scheduler scheduler(0.0);
-  scheduler.boundIsolatedPrefill(false);
+  scheduler.boundIsolatedPrefill(engine::kUnboundedPrefillCommand);
   scheduler.submit(request(1, 200'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 2048 * 32.0);
@@ -741,6 +771,7 @@ void testMeasuredBudgetUsesActualRowsAndRecovers() {
 
 void testMeasuredBudgetPreservesPriorityAndStateBoundaries() {
   engine::Scheduler scheduler(0.0);
+  scheduler.boundIsolatedPrefill(5000.0);
   scheduler.submit(request(1, 20'000, false, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -785,6 +816,7 @@ void testUnavailableTimingAndMinimumBudget() {
 
 void testMeasuredBudgetDoesNotCountBlockedPeers() {
   engine::Scheduler scheduler(0.0);
+  scheduler.boundIsolatedPrefill(5000.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -797,6 +829,7 @@ void testMeasuredBudgetDoesNotCountBlockedPeers() {
 
 void testMeasuredBudgetPreservesPurePrefillPacking() {
   engine::Scheduler scheduler(0.0);
+  scheduler.boundIsolatedPrefill(5000.0);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -829,6 +862,7 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
   for (const auto priority : {RequestPriority::Normal,
                               RequestPriority::Background}) {
     engine::Scheduler scheduler(0.0);
+    scheduler.boundIsolatedPrefill(5000.0);
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
     completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -856,11 +890,12 @@ void testMeasuredBudgetFinishesShortPrefillPromptly() {
 // At a measured 2.75 ms per row the slice is 128 rows. An arrival that
 // finishes within the full budget, though not within one slice, takes a
 // command of its own rows instead of a full one shared with a long prompt;
-// one that does not finish in it still packs a full command.
+// one that does not finish in it still packs a full command. Full-budget
+// commands, as without the isolated command bound.
 void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
   const auto beside = [](std::initializer_list<uint32_t> arrivals) {
     Scheduler scheduler(0.0);
-    scheduler.boundIsolatedPrefill(false);
+    scheduler.boundIsolatedPrefill(kUnboundedPrefillCommand);
     scheduler.observePrefill(2048, 5632.0);
     scheduler.submit(request(1, 20'000));
     scheduler.resourcesReady(1, 0);
@@ -1092,6 +1127,7 @@ void testWaitingMaskBoundsPeerPrefill() {
                                          RequestPriority::Normal,
                                          RequestPriority::Background}) {
     Scheduler scheduler(0.0);
+    scheduler.boundIsolatedPrefill(5000.0);
     scheduler.observePrefill(2048, 4096.0);
     scheduler.submit(request(1, 1, true, priority));
     scheduler.resourcesReady(1, 0);
@@ -1209,6 +1245,7 @@ int main() {
     testHigherPriorityPrefillPrecedesDecodeDebt();
     testMeasuredBudgetOnlyLimitsContendedWork();
     testIsolatedPrefillStaysWithinCommandBound();
+    testConfiguredPrefillBoundSetsCommandLength();
     testFullPrefillModeKeepsWholeBudget();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();

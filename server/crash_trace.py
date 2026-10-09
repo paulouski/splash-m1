@@ -82,6 +82,12 @@ class CrashTraceRing:
         self._dumped_generation = 0
         self._last_dump: Path | None = None
 
+    def replace_command(self, command: Sequence[str]) -> None:
+        """Record the command of the engine about to start; a relaunch may
+        change its arguments."""
+        with self._lock:
+            self._command = tuple(command)
+
     @property
     def active(self) -> bool:
         # Production subprocesses always have an exact replay command. Test

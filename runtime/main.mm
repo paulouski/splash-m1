@@ -58,8 +58,12 @@ struct NativeArguments final {
   kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
-  bool boundPrefillCommands = true;
+  // --prefill-mode bounded|full and --prefill-bound-ms: the isolated prefill
+  // command bound (Scheduler.hpp), infinite for full.
+  double prefillCommandMilliseconds = engine::kDefaultPrefillCommandMilliseconds;
 };
+
+constexpr uint32_t kMaximumPrefillBoundMilliseconds = 600'000;
 
 // One observer spans bootstrap and serving. The dispatch queue only records
 // pressure and wakes control; all allocation/reclaim decisions stay on the
@@ -132,6 +136,7 @@ void printUsage(std::string_view executable) {
       " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
       " [--kv-format int8|bf16] [--decode-share SHARE]"
       " [--max-image-patches PATCHES] [--prefill-mode bounded|full]"
+      " [--prefill-bound-ms MILLISECONDS]"
       " [--decode-ladder on|off]");
 }
 
@@ -250,6 +255,8 @@ NativeArguments parseArguments(int argc, char **argv) {
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
   // Options follow as --name value pairs; a missing value fails its check.
+  bool boundPrefill = true;
+  uint32_t prefillBound = 0;
   for (; next < argc; next += 2) {
     const std::string_view option(argv[next]);
     const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
@@ -269,7 +276,10 @@ NativeArguments parseArguments(int argc, char **argv) {
     } else if (option == "--prefill-mode") {
       if (value != "bounded" && value != "full")
         throw UsageError("--prefill-mode requires bounded or full");
-      result.boundPrefillCommands = value == "bounded";
+      boundPrefill = value == "bounded";
+    } else if (option == "--prefill-bound-ms") {
+      if (!parsePositive(value, prefillBound) || prefillBound > kMaximumPrefillBoundMilliseconds)
+        throw UsageError("--prefill-bound-ms requires 1 to 600000");
     } else if (option == "--decode-ladder") {
       if (value != "on" && value != "off")
         throw UsageError("--decode-ladder requires on or off");
@@ -281,6 +291,9 @@ NativeArguments parseArguments(int argc, char **argv) {
       throw UsageError("unexpected argument " + std::string(option));
     }
   }
+  result.prefillCommandMilliseconds = !boundPrefill   ? engine::kUnboundedPrefillCommand
+                                      : prefillBound ? static_cast<double>(prefillBound)
+                                                     : engine::kDefaultPrefillCommandMilliseconds;
   if (twoDirectories) {
     const std::filesystem::path target = canonicalDirectory(argv[2], "TARGET_DIRECTORY");
     const std::filesystem::path draft = canonicalDirectory(argv[3], "DRAFT_DIRECTORY");
@@ -332,7 +345,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.requestedContextTokens = arguments.maxContext;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
-  config.nativeLoop.engine.boundPrefillCommands = arguments.boundPrefillCommands;
+  config.nativeLoop.engine.prefillCommandMilliseconds = arguments.prefillCommandMilliseconds;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;
 }

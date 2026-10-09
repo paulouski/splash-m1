@@ -489,14 +489,24 @@ class MultiplexedRuntime:
         # runs, without locks, on the thread that saw the failure, before the
         # engine's calls end, and must not block.
         self.on_engine_failure: FailureListener | None = None
+        # Called with the failure of an engine that reached Ready, under the
+        # state lock and before any restart can begin; returns the command for
+        # the next engine or None to keep the current one. It must not block
+        # or re-enter the runtime.
+        self.command_after_failure: (
+            Callable[[EngineRuntimeError], Sequence[str] | None] | None
+        ) = None
 
         if eager_start:
             self._ensure_process()
 
     def _default_process_factory(self) -> ProcessLike:
-        assert self._command is not None
+        with self._state_lock:
+            command = self._command
+        assert command is not None
+        self._crash_trace.replace_command(command)
         return subprocess.Popen(
-            self._command,
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
@@ -1326,6 +1336,17 @@ class MultiplexedRuntime:
         if finish:
             finish()
 
+    def _replace_command_after(self, failure: EngineRuntimeError) -> None:
+        policy = self.command_after_failure
+        if policy is None:
+            return
+        try:
+            command = policy(failure)
+        except Exception:
+            return
+        if command:
+            self._command = tuple(command)
+
     def _begin_generation_failure(
         self, generation: int, error: EngineRuntimeError
     ) -> Callable[[], None] | None:
@@ -1341,6 +1362,8 @@ class MultiplexedRuntime:
             )
             self._ready_message = None
             self._ready_at = None
+            if served_seconds is not None and self._command is not None:
+                self._replace_command_after(failure)
             attempt = self._startup_attempt
             process = self._process
             calls = tuple(self._pending.values())

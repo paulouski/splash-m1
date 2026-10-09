@@ -49,6 +49,7 @@ The default listener is `127.0.0.1:8000`; use `--port` or `SPLASH_PORT` for anot
 | `--max-request-size` | `128M` | Maximum HTTP request body size. |
 | `--idle-unload` | `0` (off) | Unload the model after this many idle seconds; the next request reloads it. |
 | `--prefill-mode` | `bounded` | `bounded` keeps each prefill GPU command short so macOS does not abort long-context prefill; `full` sends whole 2048-token chunks. |
+| `--prefill-bound-ms` | `2000` (`SPLASH_PREFILL_BOUND_MS`) | Longest bounded prefill GPU command in milliseconds. After a macOS `ImpactingInteractivity` abort the restarted engine halves it, down to 500. `/status` reports it as `scheduler.prefill_bound_ms`. |
 | `--no-webui` | off | Disable the chat page. |
 
 `--kv-format bf16` and `--max-image-pixels` are accepted by the parsers but unsupported on the macOS 15 build (INT8 KV, no vision). `--decode-share` (decode time owed per unit of prefill time) is a scheduler option whose support follows the runtime.

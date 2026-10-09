@@ -551,6 +551,7 @@ def main_args(**overrides):
             "binary": "splash",
             "kv_format": "int8",
             "prefill_mode": "bounded",
+            "prefill_bound_ms": None,
             **overrides,
         }
     )
@@ -3532,6 +3533,38 @@ class ServerTest(unittest.TestCase):
         for line in lines:
             self.assertRegex(line, r"^\d{2}:\d{2}:\d{2} worker \d line \d+$")
 
+    def test_display_stall_halves_the_prefill_bound_to_its_floor(self):
+        package = api.ROOT / "install/models/community/custom-splash"
+        required = [
+            str(package),
+            "--tokenizer",
+            str(package / "tokenizer"),
+            "--model",
+            "community/custom-splash",
+        ]
+        stall = api.engine_runtime.EngineUnhealthy(
+            "Metal backend is unhealthy: Metal command 117 failed (sparse event 0): "
+            "Impacting Interactivity "
+            "(0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)"
+        )
+        with mock.patch.object(api, "print_status") as status:
+            policy = api._shorter_prefill_after_display_stall(api.parse_args(required))
+            self.assertIsNone(policy(api.engine_runtime.EngineUnhealthy("GPU is gone")))
+            bounds = []
+            for _ in range(4):
+                command = policy(stall)
+                bounds.append(
+                    None
+                    if command is None
+                    else command[command.index("--prefill-bound-ms") + 1]
+                )
+            self.assertEqual(bounds, ["1000", "500", None, None])
+            self.assertEqual(status.call_count, 2)
+            full = api._shorter_prefill_after_display_stall(
+                api.parse_args([*required, "--prefill-mode", "full"])
+            )
+            self.assertIsNone(full(stall))
+
     def test_server_requires_explicit_model_and_paths(self):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
@@ -3589,6 +3622,43 @@ class ServerTest(unittest.TestCase):
         )
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             api.parse_args([*required, "--prefill-mode", "fast"])
+        # Prefill commands stay within 2 s unless the mode or bound says
+        # otherwise; the engine applies the default itself.
+        self.assertEqual(args.prefill_mode, "bounded")
+        self.assertIsNone(args.prefill_bound_ms)
+        self.assertNotIn("--prefill-mode", api._native_command(args))
+        self.assertNotIn("--prefill-bound-ms", api._native_command(args))
+        full_args = api.parse_args([*required, "--prefill-mode", "full"])
+        self.assertEqual(
+            api._native_command(full_args)[-2:], ["--prefill-mode", "full"]
+        )
+        bound_args = api.parse_args([*required, "--prefill-bound-ms", "3000"])
+        self.assertEqual(
+            api._native_command(bound_args)[-2:], ["--prefill-bound-ms", "3000"]
+        )
+        self.assertNotIn(
+            "--prefill-bound-ms",
+            api._native_command(
+                api.parse_args(
+                    [*required, "--prefill-mode", "full", "--prefill-bound-ms", "3000"]
+                )
+            ),
+        )
+        with mock.patch.dict(os.environ, {"SPLASH_PREFILL_BOUND_MS": "1500"}):
+            self.assertEqual(api.parse_args(required).prefill_bound_ms, 1500)
+        for invalid in (
+            ["--prefill-mode", "fast"],
+            ["--prefill-bound-ms", "0"],
+            ["--prefill-bound-ms", "-5"],
+            ["--prefill-bound-ms", "2s"],
+            ["--prefill-bound-ms", "600001"],
+        ):
+            with (
+                self.subTest(invalid=invalid),
+                mock.patch("sys.stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                api.parse_args([*required, *invalid])
         self.assertEqual(
             api.parse_args([*required, "--max-context", "262144"]).max_context, 262144
         )

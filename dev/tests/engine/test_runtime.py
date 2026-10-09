@@ -1192,6 +1192,58 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(healthy.result(1.0).completion_tokens, 3)
         self.assertTrue(runtime.ready)
 
+    def test_failure_policy_sets_the_next_engine_command(self):
+        launched = []
+        factory = FakeFactory()
+        runtime = None
+
+        def launch():
+            launched.append(runtime._command)
+            return factory()
+
+        runtime = engine_runtime.MultiplexedRuntime(
+            ("native", "serve"), process_factory=launch, eager_start=False
+        )
+        self.addCleanup(runtime.close)
+        failures = []
+
+        def policy(failure):
+            failures.append(str(failure))
+            if len(failures) == 2:
+                raise RuntimeError("policy bug")
+            return ("native", "serve", "--prefill-bound-ms", "1000")
+
+        runtime.command_after_failure = policy
+        for token in (130, 140, 150):
+            self.assertTrue(runtime.wait_ready(1))
+            call = runtime.submit(request(token))
+            if token == 150:
+                send_success(factory.processes[-1], call)
+                call.result(1.0)
+                break
+            factory.processes[-1].send(
+                wire.ErrorEvent(
+                    wire.FailureClass.ENGINE_UNHEALTHY,
+                    0,
+                    False,
+                    b"gpu_fault",
+                    b"Impacting Interactivity",
+                )
+            )
+            with self.assertRaises(engine_runtime.EngineUnhealthy):
+                call.result(1.0)
+        self.assertEqual(len(failures), 2)
+        self.assertIn("Impacting Interactivity", failures[0])
+        # The first failure set the command; the policy's exception kept it.
+        self.assertEqual(
+            launched,
+            [
+                ("native", "serve"),
+                ("native", "serve", "--prefill-bound-ms", "1000"),
+                ("native", "serve", "--prefill-bound-ms", "1000"),
+            ],
+        )
+
     def test_unhealthy_fatal_and_eof_fail_all_then_restart_on_wait_ready(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
