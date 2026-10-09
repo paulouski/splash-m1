@@ -122,6 +122,7 @@ Memory and context are sized automatically. To set your own limits, add these to
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--max-context 100K` | Set the context limit. |
 | `--language-only` | Skip vision preparation; serve text only. |
+| `--offline` | Start the installed model without contacting the Hugging Face Hub. |
 | `--max-cache-disk 16G` | Offload KV cache and states to SSD as needed. Off by default. |
 | `--allowed-origin ORIGIN` | Let a browser app on another origin call the API (repeatable). |
 

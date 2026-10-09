@@ -204,6 +204,9 @@ def serve(args):
     # inherits SIGINT as ignored; take both stop signals from the start.
     for number in STOP_SIGNALS:
         signal.signal(number, _interrupt)
+    if args.offline:
+        # The installer, the catalog refresh and the server all read it.
+        os.environ["HF_HUB_OFFLINE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (
@@ -215,8 +218,7 @@ def serve(args):
             fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             raise LauncherError(
-                "Splash installation is busy; "
-                "stop the running server or wait for the upgrade to finish"
+                "Splash is being upgraded; wait for the upgrade to finish"
             ) from None
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -299,11 +301,16 @@ def coding_client(args):
     path = clients.find_executable(args.command)
     listing = _request_json("/v1/models", port=args.port)
     if listing is None:
-        raise LauncherError(
+        message = (
             f"No ready Splash server at {_base_url(args.port)}. "
-            f"Run '{COMMAND} serve --model <HF_REPO_ID>' "
-            "in another terminal first."
+            f"Run '{COMMAND} serve --model <HF_REPO_ID>' in another terminal first."
         )
+        # OpenCode and Hermes have a --port of their own, which goes after --.
+        if args.explicit_port:
+            message += (
+                f" If --port was meant for {args.command} itself, put it after --."
+            )
+        raise LauncherError(message)
     models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
@@ -371,11 +378,8 @@ def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     simple_start = bool(argv and argv[0] == "start")
     client_args = []
-    if argv and argv[0] in clients.INSTALL_URLS:
-        argv, client_args = argv[:1], argv[1:]
-        if client_args[:1] == ["--"]:
-            client_args = client_args[1:]
-    elif "--" in argv:
+    is_client = bool(argv and argv[0] in clients.INSTALL_URLS)
+    if not is_client and "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
     server_examples = f"Examples:\n  {HELP_EXAMPLE}\n\n"
@@ -388,8 +392,11 @@ def parse_args(argv=None):
             f"  {HELP_EXAMPLE}\n"
             f"  {BONSAI_EXAMPLE}  # Macs below 32 GB\n"
             f"  {COMMAND} opencode  # in another terminal, after Ready\n\n"
-            f"Use {COMMAND} serve --help for server settings. Client arguments,\n"
-            "including --help, are passed through to the installed agent."
+            f"Use {COMMAND} serve --help for server settings. An agent command takes\n"
+            "--port PORT for a server on another port and passes every other\n"
+            "argument, including --help, to the installed agent. To pass the\n"
+            "agent's own --port, start its arguments with --:\n"
+            f"  {COMMAND} opencode --port 8001 -- --port 4096"
         ),
     )
     parser.add_argument("--version", action="version", version=_version())
@@ -420,7 +427,6 @@ def parse_args(argv=None):
     server.add_argument(
         "--port",
         type=_parse_port,
-        default=os.environ.get("SPLASH_PORT", str(PORT)),
         help="HTTP port (default: SPLASH_PORT or 8000)",
     )
     server.add_argument(
@@ -444,6 +450,11 @@ def parse_args(argv=None):
         action="store_true",
         help="skip vision preparation and loading",
     )
+    server.add_argument(
+        "--offline",
+        action="store_true",
+        help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
+    )
     serve_options.add_serve_arguments(server)
     if simple_start:
         full = (
@@ -455,7 +466,17 @@ def parse_args(argv=None):
             language_only=True,
         )
     for name in clients.INSTALL_URLS:
-        commands.add_parser(name, help=f"connect {name} to the running server")
+        client = commands.add_parser(
+            name,
+            help=f"connect {name} to the running server",
+            add_help=False,
+            allow_abbrev=False,
+        )
+        client.add_argument(
+            "--port",
+            type=_parse_port,
+            help=f"server port (default: SPLASH_PORT or {PORT})",
+        )
     remove = commands.add_parser(
         "uninstall", help="remove Splash M1, its models, weight cache and settings"
     )
@@ -467,17 +488,27 @@ def parse_args(argv=None):
         action="store_true",
         help="keep downloaded models and weight cache",
     )
-    args = parser.parse_args(argv)
+    if is_client:
+        # Only --port belongs to Splash; preserve the agent's other arguments,
+        # including --help, and stop interpreting options at its separator.
+        args, client_args = parser.parse_known_args(argv)
+        if client_args[:1] == ["--"]:
+            client_args = client_args[1:]
+    else:
+        args = parser.parse_args(argv)
     args.simple_start = simple_start
     if simple_start:
         args.command = "serve"
+    if args.command == "serve" or is_client:
+        # An explicit --port wins; SPLASH_PORT is read only without one.
+        args.explicit_port = args.port is not None
+        if not args.explicit_port:
+            try:
+                args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))
+            except argparse.ArgumentTypeError as error:
+                parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
         serve_options.check_serve_arguments(parser, args)
-    if args.command in clients.INSTALL_URLS:
-        try:
-            args.port = _parse_port(os.environ.get("SPLASH_PORT", str(PORT)))
-        except argparse.ArgumentTypeError as error:
-            parser.error(f"SPLASH_PORT: {error}")
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args

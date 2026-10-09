@@ -108,8 +108,7 @@ class LauncherTests(unittest.TestCase):
 
         self.assertIn("usage: splash-m1", outputs[0])
         example = (
-            "splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit "
-            "--language-only"
+            "splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit --language-only"
         )
         self.assertIn(example, outputs[0])
         self.assertIn(example, outputs[1])
@@ -373,7 +372,10 @@ class LauncherTests(unittest.TestCase):
                             ),
                             1,
                         )
-                self.assertIn("installation is busy", error.getvalue())
+                self.assertIn(
+                    "Splash is being upgraded; wait for the upgrade to finish",
+                    error.getvalue(),
+                )
                 self.assertNotIn("stale/model", error.getvalue())
                 install.assert_not_called()
                 execute.assert_not_called()
@@ -563,26 +565,67 @@ class LauncherTests(unittest.TestCase):
                 9123,
             )
             for name in launcher.clients.INSTALL_URLS:
+                self.assertEqual(launcher.parse_args([name]).port, 8123)
                 args = launcher.parse_args([name, "--port", "7777"])
-                self.assertEqual(args.port, 8123)
-                self.assertEqual(args.client_args, ["--port", "7777"])
+                self.assertEqual(args.port, 7777)
+                self.assertEqual(args.client_args, [])
         for value in ("", "0", "-1", "65536", "invalid", "1.5"):
             with (
                 self.subTest(value=value),
                 mock.patch.dict(os.environ, {"SPLASH_PORT": value}),
-                mock.patch("sys.stderr", io.StringIO()),
             ):
-                for arguments in (["serve", "--model", MODEL_ID], ["claude"]):
-                    with self.assertRaises(SystemExit):
+                for arguments in (
+                    ["serve", "--model", MODEL_ID],
+                    *([name] for name in launcher.clients.INSTALL_URLS),
+                ):
+                    with (
+                        mock.patch("sys.stderr", io.StringIO()) as error,
+                        self.assertRaises(SystemExit),
+                    ):
                         launcher.parse_args(arguments)
-                self.assertEqual(
-                    launcher.parse_args(
-                        ["serve", "--model", MODEL_ID, "--port", "9123"]
-                    ).port,
-                    9123,
-                )
-                with self.assertRaises(SystemExit):
-                    launcher.parse_args(["serve", "--model", MODEL_ID, "--port", value])
+                    self.assertIn("SPLASH_PORT: ", error.getvalue())
+                    self.assertEqual(
+                        launcher.parse_args([*arguments, "--port", "9123"]).port,
+                        9123,
+                    )
+                    with (
+                        mock.patch("sys.stderr", io.StringIO()),
+                        self.assertRaises(SystemExit),
+                    ):
+                        launcher.parse_args([*arguments, "--port", value])
+
+    def test_client_port_selection_preserves_agent_arguments(self):
+        cases = (
+            (["--port", "2268", "--help"], 2268, ["--help"]),
+            (["--port=2268", "--version"], 2268, ["--version"]),
+            (["resume", "--last", "--port", "2268"], 2268, ["resume", "--last"]),
+            (["--por", "2268"], 8000, ["--por", "2268"]),
+            (["--", "--port", "7777"], 8000, ["--port", "7777"]),
+            (
+                ["--port", "2268", "--", "--port=7777", "--help"],
+                2268,
+                ["--port=7777", "--help"],
+            ),
+            (
+                ["--port=2268", "exec", "--", "--port", "7777"],
+                2268,
+                ["exec", "--", "--port", "7777"],
+            ),
+        )
+        for name in launcher.clients.INSTALL_URLS:
+            for arguments, port, forwarded in cases:
+                with self.subTest(name=name, arguments=arguments):
+                    args = launcher.parse_args([name, *arguments])
+                    self.assertEqual(args.port, port)
+                    self.assertEqual(args.client_args, forwarded)
+            for arguments in (["--port"], ["--port", "--help"]):
+                with (
+                    self.subTest(name=name, arguments=arguments),
+                    mock.patch("sys.stderr", io.StringIO()),
+                ):
+                    with self.assertRaises(SystemExit) as failed:
+                        launcher.parse_args([name, *arguments])
+                    self.assertEqual(failed.exception.code, 2)
 
     def test_distinct_ports_have_independent_locks_and_same_port_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary, socket.socket() as listener:
@@ -753,15 +796,26 @@ class LauncherTests(unittest.TestCase):
                 ):
                     os.environ.pop("HERMES_HOME", None)
                     for name in launcher.clients.INSTALL_URLS:
-                        launcher.main([name])
-                        self.assertEqual(
-                            command.call_args.args[2], f"http://127.0.0.1:{port}"
-                        )
-                        self.assertEqual(
-                            command.call_args.args[3:5], (MODEL_ID, 102400)
-                        )
+                        for arguments in ([], ["--port", str(port)]):
+                            with self.subTest(name=name, arguments=arguments):
+                                # An explicit port must override the environment
+                                # for both discovery and the agent's connection.
+                                os.environ["SPLASH_PORT"] = (
+                                    "invalid" if arguments else str(port)
+                                )
+                                launcher.main([name, *arguments])
+                                self.assertEqual(
+                                    command.call_args.args[2],
+                                    f"http://127.0.0.1:{port}",
+                                )
+                                self.assertEqual(
+                                    command.call_args.args[3:5], (MODEL_ID, 102400)
+                                )
+                                self.assertEqual(
+                                    command.call_args.kwargs["client_args"], []
+                                )
                     self.assertEqual(
-                        execute.call_count, len(launcher.clients.INSTALL_URLS)
+                        execute.call_count, 2 * len(launcher.clients.INSTALL_URLS)
                     )
             finally:
                 server.shutdown()
@@ -769,8 +823,35 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(
                 requests,
                 [("/v1/models", "Bearer test-key")]
-                * len(launcher.clients.INSTALL_URLS),
+                * (2 * len(launcher.clients.INSTALL_URLS)),
             )
+
+    def test_only_a_given_port_that_finds_no_server_mentions_the_agents_own(self):
+        with (
+            mock.patch.object(
+                launcher.clients, "find_executable", return_value="/bin/echo"
+            ),
+            mock.patch.object(launcher, "_request_json", return_value=None),
+            mock.patch.object(launcher.os, "execvpe") as execute,
+        ):
+            for environment, arguments, mentioned in (
+                ({}, [], False),
+                ({"SPLASH_PORT": "2268"}, [], False),
+                ({}, ["--port", "4096"], True),
+            ):
+                with (
+                    self.subTest(environment=environment, arguments=arguments),
+                    mock.patch.dict(os.environ, environment),
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    self.assertEqual(launcher.main(["opencode", *arguments]), 1)
+                    self.assertIn("No ready Splash server", error.getvalue())
+                    self.assertEqual(
+                        "If --port was meant for opencode itself, put it after --."
+                        in error.getvalue(),
+                        mentioned,
+                    )
+        execute.assert_not_called()
 
     def test_client_setup_works_while_status_is_unavailable(self):
         class Handler(BaseHTTPRequestHandler):
@@ -975,6 +1056,50 @@ class LauncherTests(unittest.TestCase):
                 ),
                 ("prepare", MODEL_ID, "v2", True, options["draft_model"]),
             )
+
+    def test_offline_serve_forbids_the_hub_to_installer_refresh_and_server(self):
+        for offline in (False, True):
+            with (
+                self.subTest(offline=offline),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                runtime = Path(temporary)
+                os.environ.pop("HF_HUB_OFFLINE", None)
+                seen = {}
+
+                def install(selection):
+                    seen["installer"] = os.environ.get("HF_HUB_OFFLINE")
+
+                self.refresh.side_effect = lambda: seen.setdefault(
+                    "refresh", os.environ.get("HF_HUB_OFFLINE")
+                )
+                with (
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch.object(launcher.socket, "socket"),
+                    mock.patch.object(
+                        launcher, "_ensure_installed", side_effect=install
+                    ),
+                    mock.patch.object(
+                        launcher.model_artifacts,
+                        "selection_link",
+                        return_value=runtime / "selected",
+                    ),
+                    mock.patch.object(launcher.os, "execve") as execute,
+                ):
+                    launcher.main(
+                        [
+                            "serve",
+                            "--model",
+                            MODEL_ID,
+                            *(["--offline"] if offline else []),
+                        ]
+                    )
+                argv, environment = execute.call_args.args[1:]
+                expected = "1" if offline else None
+                self.assertEqual(seen, {"installer": expected, "refresh": expected})
+                self.assertEqual(environment.get("HF_HUB_OFFLINE"), expected)
+                # The server has no such option: the environment carries it.
+                self.assertNotIn("--offline", argv)
 
     def test_server_holds_the_assembly_it_serves(self):
         with tempfile.TemporaryDirectory() as temporary:

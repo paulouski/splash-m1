@@ -36,6 +36,7 @@ The default listener is `127.0.0.1:8000`; use `--port` or `SPLASH_PORT` for anot
 
 | Option | Default | Purpose |
 | --- | --- | --- |
+| `--offline` | off | Start the installed model without contacting the Hugging Face Hub (as `HF_HUB_OFFLINE=1`). |
 | `--host` | `127.0.0.1` | HTTP bind address; `0.0.0.0` accepts LAN connections (set `--api-key` too). |
 | `--allowed-host NAME` | none | Additional HTTP Host name, e.g. `mymac.local`; repeatable. Does not change the bind address. |
 | `--allowed-origin ORIGIN` | none | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any (set `--api-key` too); repeatable. |
