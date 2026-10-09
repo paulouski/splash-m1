@@ -330,7 +330,7 @@ class Frontend:
         status["latency"] = self.latencies.snapshot()
         return status
 
-    def _prepare_images(self, messages, *, check_context=True):
+    def _prepare_images(self, messages, deadline, *, check_context=True):
         """Prepared images in template render order: content parts in message
         order, images in document order."""
         parts = [
@@ -346,6 +346,9 @@ class Frontend:
         prepared = self.images.request_batch()
         tokens = pixel_bytes = 0
         for part in parts:
+            # An image can take a few hundred milliseconds to decode; an
+            # expired request starts no more of them.
+            remaining_request_time(deadline)
             try:
                 payload = image_input.decode_data_url(part["image_url"]["url"])
                 image = self.images.prepare(payload, self.max_image_pixels)
@@ -847,7 +850,9 @@ class Frontend:
             **prompt.template_kwargs,
         }
         with self.latencies.measure("images"):
-            images = self._prepare_images(prompt.messages, check_context=check_context)
+            images = self._prepare_images(
+                prompt.messages, deadline, check_context=check_context
+            )
         remaining_request_time(deadline)
         if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")

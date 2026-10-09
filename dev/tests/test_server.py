@@ -2288,10 +2288,10 @@ class ServerTest(unittest.TestCase):
         ]
         with mock.patch.object(images, "decode_data_url") as decode:
             with self.assertRaisesRegex(api.APIError, f"at most {limit} images"):
-                app._prepare_images(messages, check_context=False)
+                app._prepare_images(messages, FOREVER, check_context=False)
             decode.assert_not_called()
         self.assertEqual(app.images.stats()["request_bytes"], 0)
-        prepared = app._prepare_images(messages[:1], check_context=False)
+        prepared = app._prepare_images(messages[:1], FOREVER, check_context=False)
         self.assertEqual(len(prepared), limit)
         del prepared
         self.assertEqual(app.images.stats()["request_bytes"], 0)
@@ -2329,8 +2329,31 @@ class ServerTest(unittest.TestCase):
             mock.patch.object(app.images, "prepare", return_value=image) as prepare,
             self.assertRaisesRegex(api.APIError, "request size limit"),
         ):
-            app._prepare_images(messages)
+            app._prepare_images(messages, FOREVER)
         self.assertEqual(prepare.call_count, 2)
+
+    def test_image_preparation_stops_once_the_request_expires(self):
+        app = self.harness(FakeRuntime()).app
+        image = SimpleNamespace(tokens=1, pixels=b"x")
+        part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+        clock = [100.0]
+
+        def prepare(*_args):
+            # Each image takes a second.
+            clock[0] += 1.0
+            return image
+
+        with (
+            mock.patch.object(
+                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+            ),
+            mock.patch.object(app.images, "prepare", side_effect=prepare) as prepared,
+            self.assertRaises(api.APIError) as caught,
+        ):
+            app._prepare_images([{"content": [part] * 3}], 100.5)
+        self.assertEqual(caught.exception.status, 504)
+        self.assertEqual(prepared.call_count, 1)
+        self.assertEqual(app.images.stats()["request_bytes"], 0)
 
     def test_image_request_budget_survives_native_owner_and_recovers(self):
         app = self.harness(
