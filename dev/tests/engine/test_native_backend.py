@@ -850,6 +850,30 @@ class NativeBackendContractTests(unittest.TestCase):
         native.mode = "status_timeout"
         self.assertFalse(transport.status(timeout=0.01)["ready"])
 
+    def test_answer_from_a_replaced_engine_is_not_evidence(self):
+        native = FakeRuntime()
+        transport, _runtime = self.make_transport(native)
+        native.status_event = native_peer.status_event(ready=False)
+        self.assertFalse(transport.status()["ready"])
+        status = native.status
+
+        def relaunched_after_the_answer(*args, **kwargs):
+            event = status(*args, **kwargs)
+            # The engine that answered fails, and a relaunched one is Ready
+            # before the answer is cached.
+            native.restart_count += 1
+            return event
+
+        native.status_event = native_peer.status_event(ready=True)
+        with mock.patch.object(
+            native, "status", side_effect=relaunched_after_the_answer
+        ):
+            self.assertFalse(transport.status()["ready"])
+        self.assertFalse(transport.status_snapshot["ready"])
+        # The relaunched engine is busy: the replaced one's answer is no evidence.
+        native.mode = "status_timeout"
+        self.assertFalse(transport.status(timeout=0.01)["ready"])
+
     def test_skipped_probe_does_not_start_the_unanswered_clock(self):
         native = FakeRuntime()
         transport, _runtime = self.make_transport(native)
@@ -859,11 +883,12 @@ class NativeBackendContractTests(unittest.TestCase):
         self.addCleanup(release.set)
         cache_status = transport._cache_status
 
-        def cache_then_hold_the_refresh(snapshot):
-            cache_status(snapshot)
+        def cache_then_hold_the_refresh(snapshot, restarts):
+            cached_status = cache_status(snapshot, restarts)
             if threading.current_thread() is transport.recovery:
                 cached.set()
                 release.wait(2.0)
+            return cached_status
 
         with (
             mock.patch.object(
