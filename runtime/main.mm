@@ -274,12 +274,16 @@ bool namesDirectory(std::string_view argument) {
   return !argument.empty() && std::filesystem::is_directory(std::filesystem::path(argument), error);
 }
 
-// A directory with its own config.json and no target/ is a lone target.
+// A directory with its own config.json, or GGUF files (whose metadata name the
+// model), and no target/ is a lone target.
 bool isBareTarget(std::string_view argument) {
   std::error_code error;
   const std::filesystem::path path(argument);
-  return std::filesystem::is_regular_file(path / "config.json", error) &&
-         !std::filesystem::exists(path / "target", error);
+  if (std::filesystem::exists(path / "target", error)) return false;
+  if (std::filesystem::is_regular_file(path / "config.json", error)) return true;
+  for (const auto &entry : std::filesystem::directory_iterator(path, error))
+    if (entry.path().extension() == ".gguf") return true;
+  return false;
 }
 
 // A target with no draft decodes without one.
