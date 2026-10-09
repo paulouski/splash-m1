@@ -414,8 +414,6 @@ def _serve(model):
         "--port",
         "8000",
     ]
-    if upstream._memory_bytes() >= upstream.FULL_MEMORY_BYTES:
-        command[-2:-2] = ["--max-context", "32K"]
     os.execv(str(paths.PYTHON), command)
 
 

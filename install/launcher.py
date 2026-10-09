@@ -33,7 +33,7 @@ RUNTIME_DIR = paths.RUNTIME
 PORT = 8000
 COMMAND = "splash-m1" if paths.PACKAGED else "splash"
 MODEL_EXAMPLE = "mlx-community/Qwen3.8-27B-4bit"
-MODEL_EXAMPLE_OPTIONS = " --language-only --max-context 32K"
+MODEL_EXAMPLE_OPTIONS = " --language-only"
 HELP_EXAMPLE = f"{COMMAND} serve --model {MODEL_EXAMPLE}{MODEL_EXAMPLE_OPTIONS}"
 # Macs below 32 GiB run only this 2-bit Prism checkpoint (install/upstream.py).
 BONSAI_MODEL = "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
@@ -400,14 +400,13 @@ def parse_args(argv=None):
         help="run the local server; Ctrl+C stops it",
         description=(
             f"Start {MODEL_EXAMPLE} (or {BONSAI_MODEL} below 32 GB of memory) "
-            "in the foreground with language-only mode and a 32K context "
-            "(automatic below 32 GB)."
+            "in the foreground with language-only mode and an automatic context."
             if simple_start
             else "Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            f"Defaults: --model {MODEL_EXAMPLE} --language-only --max-context 32K;\n"
+            f"Defaults: --model {MODEL_EXAMPLE} --language-only;\n"
             f"below 32 GB of memory: --model {BONSAI_MODEL} --language-only.\n"
             "Override --model or --max-context as needed.\n\n"
             "After Ready, use the browser and API URLs printed below. Keep this terminal open; Ctrl+C stops Splash."
@@ -454,7 +453,6 @@ def parse_args(argv=None):
         server.set_defaults(
             model=MODEL_EXAMPLE if full else BONSAI_MODEL,
             language_only=True,
-            max_context=serve_options.parse_max_context("32K") if full else None,
         )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")

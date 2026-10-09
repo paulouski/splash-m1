@@ -25,7 +25,7 @@ For [Pi](https://pi.dev/) or [OpenCode](https://opencode.ai/docs/), install the 
 
 **First launch of a manually downloaded ZIP:** the app is ad-hoc signed and not notarized, so macOS 15 shows "“Splash M1” is damaged and can't be opened" for a quarantined copy, and Open Anyway may not be offered. Clear the quarantine flag in Terminal: `xattr -dr com.apple.quarantine "/Applications/Splash M1.app"`. The app also checks free disk space before downloading and stops with the needed and available amounts if the model, its prepared weights, and a 2 GiB reserve do not fit.
 
-Python, Xcode, and Terminal are not required for the packaged app. The first setup needs internet access and additional disk space for model weights; download and preparation status appears in the app. Later launches reuse cached weights and settings. The default desktop configuration uses a 32K context and requires 32 GB of memory. Macs with 16 GB can run only the 2-bit Prism checkpoint (Ternary Bonsai 2), with a context sized automatically to the available memory; this 16 GB configuration has not been tested on 16 GB hardware.
+Python, Xcode, and Terminal are not required for the packaged app. The first setup needs internet access and additional disk space for model weights; download and preparation status appears in the app. Later launches reuse cached weights and settings. The default desktop configuration sizes its context automatically to the available memory and requires 32 GB of memory. Macs with 16 GB can run only the 2-bit Prism checkpoint (Ternary Bonsai 2), with a context sized automatically to the available memory; this 16 GB configuration has not been tested on 16 GB hardware.
 
 Local review builds are not Developer ID signed or notarized. A public desktop release still needs signing and a check of the complete first-run flow.
 
@@ -78,7 +78,7 @@ curl -fsSL https://github.com/paulouski/splash-m1/releases/latest/download/insta
 splash-m1 start
 ~~~
 
-Follow any PATH instruction printed by the installer. `start` uses the recommended Qwen3.8-27B Q4 model, text-only mode, and a 32K context. The server stays in the terminal and prints its address and logs; when it reports Ready, open http://127.0.0.1:8000. Press Ctrl+C to stop it.
+Follow any PATH instruction printed by the installer. `start` uses the recommended Qwen3.8-27B Q4 model, text-only mode, and a context sized automatically to the available memory. The server stays in the terminal and prints its address and logs; when it reports Ready, open http://127.0.0.1:8000. Press Ctrl+C to stop it.
 
 To connect an installed coding client, open a second terminal in your project folder and run `splash-m1 pi` or `splash-m1 opencode`. Keep the server terminal open. For another checkpoint or server settings, use `splash-m1 start --model OWNER/REPO --max-context 32K` or `splash-m1 serve --help`. No Homebrew tap is available.
 

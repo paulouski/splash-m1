@@ -109,12 +109,12 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("usage: splash-m1", outputs[0])
         example = (
             "splash-m1 serve --model mlx-community/Qwen3.8-27B-4bit "
-            "--language-only --max-context 32K"
+            "--language-only"
         )
         self.assertIn(example, outputs[0])
         self.assertIn(example, outputs[1])
         self.assertIn("Defaults: --model mlx-community/Qwen3.8-27B-4bit", outputs[2])
-        self.assertIn("--language-only --max-context 32K", outputs[2])
+        self.assertIn("--language-only;", outputs[2])
         self.assertIn("Override --model or --max-context", outputs[2])
         self.assertIn("Ctrl+C stops Splash", outputs[2])
         self.assertNotIn("GGUF", "\n".join(outputs))
@@ -160,7 +160,7 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(args.simple_start)
         self.assertEqual(args.model, "mlx-community/Qwen3.8-27B-4bit")
         self.assertTrue(args.language_only)
-        self.assertEqual(args.max_context, 32_768)
+        self.assertIsNone(args.max_context)
 
         args = launcher.parse_args(
             ["start", "--model", MODEL_ID, "--max-context", "64K"]

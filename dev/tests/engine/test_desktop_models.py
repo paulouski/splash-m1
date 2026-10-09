@@ -658,8 +658,8 @@ class PrismModelTests(unittest.TestCase):
                 self.assertEqual(target.downloads, [])
         self.assertEqual(names, [upstream.PRISM_DRAFT_REPO])
 
-    def test_serve_uses_automatic_context_below_32_gigabytes(self):
-        for memory, expected in ((16 * 1024**3, False), (32 * 1024**3, True)):
+    def test_serve_uses_automatic_context(self):
+        for memory in (16 * 1024**3, 32 * 1024**3):
             commands = []
             with (
                 mock.patch.object(
@@ -674,7 +674,7 @@ class PrismModelTests(unittest.TestCase):
             ):
                 desktop_models._serve(MODEL)
             with self.subTest(memory=memory):
-                self.assertEqual("--max-context" in commands[0], expected)
+                self.assertNotIn("--max-context", commands[0])
                 self.assertEqual(commands[0][-2:], ["--port", "8000"])
 
 
