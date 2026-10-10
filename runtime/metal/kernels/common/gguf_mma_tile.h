@@ -123,22 +123,31 @@ inline void accumulate(device const bfloat *x, device uchar *w0, device uchar *w
                                        c1 + ulong(step_begin) * QUANT_TILE_ROWS * F::P1);
   uint unit = step_begin / F::MetaGroups;
   typename F::Meta hdr = F::loadMeta(cm + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
+  uint2 v[FM][2];
+  load_inputs<FM>(x, input_size, step_begin * kStep, l, v);
   for (uint step = step_begin; step < step_end; ++step) {
-    const uint u = step / F::MetaGroups;
-    if (u != unit) {
-      hdr = F::loadMeta(cm + ulong(u) * QUANT_TILE_ROWS * F::MetaBytes);
-      unit = u;
+    // The next step's weights, header and inputs are in flight while this step dequantizes and multiplies.
+    typename F::Payload next_packed = packed;
+    typename F::Meta next_hdr = hdr;
+    uint next_unit = unit;
+    uint2 next_v[FM][2];
+    if (step + 1 < step_end) {
+      next_packed = F::load(c0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0, c1 + ulong(step + 1) * QUANT_TILE_ROWS * F::P1);
+      next_unit = (step + 1) / F::MetaGroups;
+      if (next_unit != unit) next_hdr = F::loadMeta(cm + ulong(next_unit) * QUANT_TILE_ROWS * F::MetaBytes);
+      load_inputs<FM>(x, input_size, (step + 1) * kStep, l, next_v);
     }
     stage_group<F>(packed, hdr, ushort(step % F::MetaGroups), tl, stage + lane * kStride);
-    if (step + 1 < step_end)
-      packed = F::load(c0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0, c1 + ulong(step + 1) * QUANT_TILE_ROWS * F::P1);
-    uint2 v[FM][2];
-    load_inputs<FM>(x, input_size, step * kStep, l, v);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     mma_group<FM>(v, [&](uint i, uint j) {
       return *reinterpret_cast<threadgroup const half2 *>(stage + (8 * i + l.fm) * kStride + 8 * j + l.fn);
     }, acc);
     simdgroup_barrier(mem_flags::mem_threadgroup);
+    packed = next_packed;
+    hdr = next_hdr;
+    unit = next_unit;
+#pragma unroll
+    for (uint r = 0; r < FM; ++r) v[r][0] = next_v[r][0], v[r][1] = next_v[r][1];
   }
 }
 
