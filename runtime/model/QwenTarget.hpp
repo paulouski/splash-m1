@@ -256,6 +256,9 @@ struct QwenTargetVerifyBuffers final {
       pageTables;
   ops::MoeScratch moe;
   Qwen4Buffers qwen4;
+  // Qwen3.8-Flash-Next: each lane's leading rows that can be retained (empty:
+  // all); the MoE routes no expert for the later ones.
+  std::span<const uint32_t> activeRows;
   // Qwen3.8-Flash-Next: each lane's PLE history before the step (the
   // commit writes the one after it).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistories;

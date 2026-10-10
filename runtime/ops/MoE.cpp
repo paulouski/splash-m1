@@ -281,7 +281,8 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
 }
 
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-              const MoeWeights &weights, const MoePlan &plan) {
+              const MoeWeights &weights, const MoePlan &plan,
+              std::span<const uint32_t> laneActiveRows) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
   const uint32_t tileRows = plan.tileRows();
@@ -297,8 +298,20 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   for (const MoeScratchField &field : kMoeScratchFields)
     if ((scratch.*field.buffer).sizeBytes() < required.*field.bytes)
       throw std::invalid_argument("MoE grouped scratch is smaller than its bound");
+  uint32_t inactiveRows = 0;
+  if (!laneActiveRows.empty()) {
+    constexpr uint32_t laneRows = SPLASH_TARGET_VERIFY_ROWS;
+    if (rows > 32 || rows != laneActiveRows.size() * laneRows)
+      throw std::invalid_argument("MoE active rows do not match the decode lanes");
+    for (size_t lane = 0; lane < laneActiveRows.size(); ++lane) {
+      if (!laneActiveRows[lane] || laneActiveRows[lane] > laneRows)
+        throw std::invalid_argument("invalid MoE active rows");
+      for (uint32_t row = laneActiveRows[lane]; row < laneRows; ++row)
+        inactiveRows |= 1u << (lane * laneRows + row);
+    }
+  }
   const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
-                                   shape.expertsPerToken};
+                                   shape.expertsPerToken, inactiveRows};
   const bool block = weights.layout() == WeightLayout::Block32;
   if (block) {
     // fp32 scores of the F32 router in rows of routerWidth() expert slots, as

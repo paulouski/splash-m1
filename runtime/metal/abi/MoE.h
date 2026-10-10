@@ -12,10 +12,12 @@ struct MoeRouteParams {
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  // Bit r set: row r (of at most 32) selects no expert; 0 routes every row.
+  uint32_t inactive_rows;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 20,
+              "MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the shared expert, whose
 // id is `experts` and whose routing weight is the sigmoid of its scalar gate.

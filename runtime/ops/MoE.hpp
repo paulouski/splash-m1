@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -318,12 +319,16 @@ struct MoeBuffers final {
   MoeScratch scratch;
 };
 
-// Routes and executes grouped experts from immutable weight views.
+// Routes and executes grouped experts from immutable weight views. A decode
+// plan's `laneActiveRows` (empty: all) gives each lane's leading rows that
+// select experts; its later rows contribute only their residual and shared
+// expert, so they must never be retained.
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const MoeWeights &weights, const MoePlan &plan);
+                  const MoeWeights &weights, const MoePlan &plan,
+                  std::span<const uint32_t> laneActiveRows = {});
 };
 
 } // namespace splash::ops

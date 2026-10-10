@@ -605,6 +605,40 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   return result;
 }
 
+// Rows past a lane's active rows select no expert and add nothing routed; the active rows are bit-for-bit those of
+// the all-active dispatch.
+int maskedRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, const std::vector<uint16_t> &all,
+               const std::string &label) {
+  const std::array<uint32_t, 4> active{3, 1, 8, 5};
+  allocate(backend, b, plan);
+  std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+  CommandGraph graph;
+  MoE::add(graph, b.moe, m.weights, plan, active);
+  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+  const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+  int failures = 0;
+  for (uint32_t row = 0; row < plan.rows(); ++row) {
+    const bool live = row % 8 < active[row / 8];
+    const bool same = std::equal(output + uint64_t{row} * kHidden, output + uint64_t{row + 1} * kHidden,
+                                 all.begin() + uint64_t{row} * kHidden);
+    bool routed = false;
+    for (uint32_t rank = 0; rank < kTopK; ++rank) routed |= selected[row * kRoutes + rank] != ~0u;
+    if (live != routed || (live && !same) || (!live && same)) {
+      printf("  %s: masked row %u (live %d, routed %d, same %d) FAIL\n", label.c_str(), row, live, routed, same);
+      ++failures;
+    }
+  }
+  const std::array<uint32_t, 3> mismatched{3, 1, 8};
+  try {
+    MoE::add(graph, b.moe, m.weights, plan, mismatched);
+    printf("  %s: a mismatched active-row span was accepted FAIL\n", label.c_str());
+    ++failures;
+  } catch (const std::invalid_argument &) {
+  }
+  return failures;
+}
+
 int moe(MetalBackend &backend) {
   int failures = 0;
   Buffers b;
@@ -648,6 +682,7 @@ int moe(MetalBackend &backend) {
           printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
           ++failures;
         }
+        if (lanes == 4) failures += maskedRows(backend, m, b, plan, rows, label);
       }
       // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {

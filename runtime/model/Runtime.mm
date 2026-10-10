@@ -1634,7 +1634,8 @@ struct Runtime::Impl {
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
                                       bool singleRow = false,
-                                      bool mtpDraft = false) {
+                                      bool mtpDraft = false,
+                                      std::span<const uint32_t> activeRows = {}) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1687,6 +1688,7 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     buffers.qwen4 = decodeArena->qwen4(storage);
+    buffers.activeRows = activeRows;
     bindQsa(buffers.qwen4, kDecodeRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
@@ -2061,7 +2063,8 @@ struct Runtime::Impl {
       const uint32_t width = static_cast<uint32_t>(lanes_.size());
       impl_.encodeBatchVerifyInput(verify, width);
       impl_.encodeBatchEmbedding(verify, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
-      impl_.encodeTargetVerifyBatchForward(verify, active, items_);
+      impl_.encodeTargetVerifyBatchForward(verify, active, items_, false, false,
+                                           {maximumRetained.data(), lanes_.size()});
       impl_.encodeTargetVerifyBatchPolicy(verify, active);
       impl_.encodeBatchAcceptance(verify, active, {maximumRetained.data(), lanes_.size()});
       impl_.encodeBatchGdnCommit(verify, active);
@@ -2772,7 +2775,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                               DecodeTensor::Hidden0, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items,
-                                        width == 1 && lanes[0].singleRow);
+                                        width == 1 && lanes[0].singleRow, false,
+                                        {maximumRetained.data(), width});
   impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
   impl_->encodeBatchAcceptance(commandGraph, entries,
                                {maximumRetained.data(), width});

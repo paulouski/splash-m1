@@ -349,7 +349,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
         layer.mixer);
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
     addVerifyMix(step, layer.ffnHyper, h.streams, b.normalized);
-    ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
+    ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, b.activeRows);
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
   }
   if (step.gdnLayer != geometry_.stateLayout.layers ||

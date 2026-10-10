@@ -814,7 +814,7 @@ void routerTiles(MetalBackend &backend, const Fixture &fixture) {
   MetalBuffer narrow = shared(backend, scoreBytes, "scores-m8");
   MetalBuffer wide = shared(backend, scoreBytes, "scores-m32");
   for (const uint32_t rows : {8U, 33U, kMaximumRows}) {
-    const MoeRouteParams params{rows, kHidden, kExperts, kTopK};
+    const MoeRouteParams params{rows, kHidden, kExperts, kTopK, 0};
     CommandGraph graph;
     graph.add("moe_route_scores_q8_m8",
               {fixture.buffers.input, router.planes.weights, router.planes.scales,

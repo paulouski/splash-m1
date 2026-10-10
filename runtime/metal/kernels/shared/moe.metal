@@ -316,6 +316,17 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
   const uint row = group;
   if (row >= params.rows)
     return;
+  if (row < 32 && (params.inactive_rows >> row & 1u)) {
+    // Routes no expert; the shared expert's contribution is zero.
+    const ulong inactive_routes = ulong(row) * (params.top_k + 1);
+    if (thread_index < params.top_k)
+      selected[inactive_routes + thread_index] = 0xFFFFFFFFu;
+    if (thread_index == 0) {
+      selected[inactive_routes + params.top_k] = params.experts;
+      routing_weights[inactive_routes + params.top_k] = 0.0f;
+    }
+    return;
+  }
   row_scores[thread_index] =
       thread_index < params.experts
           ? scores[ulong(row) * StorageN + thread_index]
@@ -464,7 +475,7 @@ template <uint Experts>
   atomic_store_explicit(&cursors[thread_index], 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint route = thread_index; route < routes; route += Experts) {
-    if (route % routes_per_row != params.top_k) {
+    if (route % routes_per_row != params.top_k && selected[route] != ~0u) {
       atomic_fetch_add_explicit(&counts[selected[route]], 1u,
                                 memory_order_relaxed);
     }
@@ -500,6 +511,10 @@ template <uint Experts>
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
+    if (expert == ~0u) {
+      route_rows[route] = ~0u;
+      continue;
+    }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     uint row = tile_offsets[expert] * params.tile_rows + slot;
@@ -797,9 +812,11 @@ kernel void moe_combine(
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
+    const uint route_row = route_rows[route + slot];
+    if (route_row == ~0u)
+      continue;
     value += routing_weights[route + slot] *
-             float(expert_output[ulong(route_rows[route + slot]) *
-                                     params.hidden_size +
+             float(expert_output[ulong(route_row) * params.hidden_size +
                                  dimension]);
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
