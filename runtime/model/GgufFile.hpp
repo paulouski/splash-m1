@@ -28,7 +28,7 @@ public:
 // The ggml type ids production names, as stored in GGUF tensor infos; the
 // rest are looked up in kGgmlTypes.
 namespace ggml {
-inline constexpr uint32_t kF32 = 0, kQ5_0 = 6, kQ8_0 = 8, kQ4_K = 12, kIQ4_NL = 20, kBF16 = 30, kPQ2_0 = 142;
+inline constexpr uint32_t kF32 = 0, kF16 = 1, kQ5_0 = 6, kQ8_0 = 8, kQ4_K = 12, kIQ4_NL = 20, kBF16 = 30, kPQ2_0 = 142;
 }
 
 struct GgmlTypeTraits {

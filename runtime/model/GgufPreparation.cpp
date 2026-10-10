@@ -70,15 +70,20 @@ std::span<uint8_t> narrowToBfloat16(std::span<uint8_t> bytes, const std::string 
   return bytes.first(2 * count);
 }
 
-// BF16 values widened in place to the F32 values they equal: bytes holds
-// the BF16 values in its first half.
-std::span<uint8_t> widenToFloat32(std::span<uint8_t> bytes) {
+// BF16 (or F16) values widened in place to the F32 values they equal: bytes
+// holds the 16-bit values in its first half.
+std::span<uint8_t> widenToFloat32(std::span<uint8_t> bytes, bool half) {
   const uint64_t count = bytes.size() / 4;
   for (uint64_t i = count; i-- > 0;) {
     uint16_t value;
     std::memcpy(&value, bytes.data() + 2 * i, 2);
-    const uint32_t widened = uint32_t{value} << 16;
-    std::memcpy(bytes.data() + 4 * i, &widened, 4);
+    if (half) {
+      const float widened = static_cast<float>(std::bit_cast<_Float16>(value));
+      std::memcpy(bytes.data() + 4 * i, &widened, 4);
+    } else {
+      const uint32_t widened = uint32_t{value} << 16;
+      std::memcpy(bytes.data() + 4 * i, &widened, 4);
+    }
   }
   return bytes;
 }
@@ -139,6 +144,25 @@ void q50ToQ80(std::span<const uint8_t> from, uint8_t *to) {
   }
 }
 
+// A BF16 row as Q8_0 blocks (half d, 32 int8 q), ggml's quantize_row_q8_0_ref: d = amax / 127.
+void bf16ToQ80(std::span<const uint8_t> from, uint8_t *to) {
+  for (uint64_t b = 0; b < from.size() / 64; ++b) {
+    float values[32], amax = 0;
+    for (uint32_t i = 0; i < 32; ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, from.data() + b * 64 + 2 * i, 2);
+      const uint32_t widened = uint32_t{bits} << 16;
+      std::memcpy(&values[i], &widened, 4);
+      amax = std::max(amax, std::abs(values[i]));
+    }
+    const float d = amax / 127, inverse = d ? 1 / d : 0;
+    uint8_t *out = to + b * kQ80BlockBytes;
+    const uint16_t half = std::bit_cast<uint16_t>(static_cast<_Float16>(d));
+    std::memcpy(out, &half, 2);
+    for (uint32_t i = 0; i < 32; ++i) out[2 + i] = static_cast<uint8_t>(int8_t(std::lround(values[i] * inverse)));
+  }
+}
+
 // Destination bytes of source bytes: halved when narrowed, doubled when
 // widened, a block's F32 values when dequantized.
 uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
@@ -180,7 +204,7 @@ void writeCopy(GgufSources source, int destination, const gguf::Copy &copy,
       readRows(source, rows, first, count, column, width, bytes.data());
       switch (copy.conversion) {
       case gguf::Conversion::NarrowToBfloat16: bytes = narrowToBfloat16(bytes, rows.name); break;
-      case gguf::Conversion::WidenToFloat32: bytes = widenToFloat32(staging.first(2 * count * width)); break;
+      case gguf::Conversion::WidenToFloat32: bytes = widenToFloat32(staging.first(2 * count * width), rows.type == ggml::kF16); break;
       case gguf::Conversion::DequantizeQ80: {
         const auto out = staging.subspan(bytes.size(), copiedBytes(copy, bytes.size()));
         dequantizeQ80(bytes, out);
@@ -250,9 +274,10 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
   uint64_t sourceRows = 0;
   for (const gguf::TensorRows &rows : repack.sources) {
-    // Q5_0 rows are read as the Q8_0 rows they equal.
+    // Q5_0 rows are read as the Q8_0 rows they equal, BF16 rows as Q8_0 rows rounded from them.
     const bool q50 = repack.format == GGUF_FMT_Q80 && rows.type == ggml::kQ5_0;
-    if (rows.rowBytes != (q50 ? repack.columns / 32 * gguf::kQ50BlockBytes : rowBytes))
+    const bool bf16 = repack.format == GGUF_FMT_Q80 && rows.type == ggml::kBF16;
+    if (rows.rowBytes != (q50 ? repack.columns / 32 * gguf::kQ50BlockBytes : bf16 ? repack.columns * 2 : rowBytes))
       throw GgufError("invalid prepared weight source size");
     sourceRows += rows.rows;
   }
@@ -287,6 +312,12 @@ void writeRepack(metal::MetalBackend &backend, GgufSources source, int destinati
           readRows(source, tensor, begin - start, count, firstColumn / 32 * gguf::kQ50BlockBytes, q50Width, q50.data());
           for (uint64_t r = 0; r < count; ++r)
             q50ToQ80({q50.data() + r * q50Width, q50Width}, host + (begin - firstRow + r) * chunkRowBytes);
+        } else if (begin < end && tensor.type == ggml::kBF16) {
+          const uint64_t count = end - begin, width = columns * 2;
+          std::vector<uint8_t> bf16(count * width);
+          readRows(source, tensor, begin - start, count, firstColumn * 2, width, bf16.data());
+          for (uint64_t r = 0; r < count; ++r)
+            bf16ToQ80({bf16.data() + r * width, width}, host + (begin - firstRow + r) * chunkRowBytes);
         } else if (begin < end) {
           readRows(source, tensor, begin - start, end - begin, column, chunkRowBytes,
                    host + (begin - firstRow) * chunkRowBytes);

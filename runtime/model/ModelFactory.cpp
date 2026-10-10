@@ -194,7 +194,8 @@ uint64_t preparedModelWeightBytes(const ModelPaths &paths, const ModelDescriptor
     std::deque<WeightSource> sources;
     std::vector<WeightSource *> parts;
     for (const std::filesystem::path &path : findTargetGgufs(paths.target)) parts.push_back(&sources.emplace_back(path));
-    const GgufFile file(parts);
+    const char *external = std::getenv("SPLASH_PLE_TABLE");
+    const GgufFile file(parts, external && *external);
     bytes = std::visit(
         [&](const auto &layout) {
           return PreparedImages<gguf::Image>::bytes(gguf::planImages(file, ggufTargetGeometry(layout)));

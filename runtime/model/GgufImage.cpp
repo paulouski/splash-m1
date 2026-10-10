@@ -31,6 +31,8 @@ static_assert([] {
 
 bool quantizedType(uint32_t type) { return gguf_format_of(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
+// F32 or a type widened to F32 exactly.
+bool wideFloatType(uint32_t type) { return type == ggml::kF32 || type == ggml::kBF16 || type == ggml::kF16; }
 // The token rows the embedding kernel gathers.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(type)); }
 // alpha/beta run as one segment of their shared type: any format of the
@@ -55,24 +57,33 @@ public:
     cursor_ = header.size();
   }
 
-  // A norm as stored: F32, which the norm kernels read unrounded, as
-  // llama.cpp does (ops::NormWeights).
+  // A norm as F32, which the norm kernels read unrounded, as llama.cpp does
+  // (ops::NormWeights): as stored, or the F32 values BF16 or F16 equal exactly.
   void floatNorm(const std::string &name, uint64_t elements) {
-    if (const GgufTensor *tensor = floatVector(name, elements)) copy(tensorRows(*tensor, 1, tensor->bytes));
+    const GgufTensor *tensor = find(name, wideFloatType);
+    if (!tensor) return;
+    if (tensor->elements() != elements) throw GgufError("unexpected shape for " + name);
+    copy(tensorRows(*tensor, 1, tensor->bytes), tensor->type == ggml::kF32 ? Conversion::None : Conversion::WidenToFloat32);
   }
 
   // Quantized rows [N, K] repacked into planes, rows in `order`. With `q50`,
-  // Q5_0 rows are accepted and repacked as the Q8_0 rows they equal exactly.
+  // Q5_0 rows are accepted and repacked as the Q8_0 rows they equal exactly,
+  // and BF16 rows as Q8_0 rows rounded from them.
   void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}, bool q50 = false) {
-    const GgufTensor *tensor = q50 ? find(name, [](uint32_t type) { return quantizedType(type) || type == ggml::kQ5_0; })
+    const GgufTensor *tensor = q50 ? find(name, [](uint32_t type) {
+                                       return quantizedType(type) || type == ggml::kQ5_0 || type == ggml::kBF16;
+                                     })
                                    : find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const bool fromQ50 = tensor->type == ggml::kQ5_0;
-    const uint32_t format = fromQ50 ? GGUF_FMT_Q80 : gguf_format_of(tensor->type);
+    const bool fromQ50 = tensor->type == ggml::kQ5_0, fromBf16 = tensor->type == ggml::kBF16;
+    const uint32_t format = fromQ50 || fromBf16 ? GGUF_FMT_Q80 : gguf_format_of(tensor->type);
     Repack repack = planes(format, rows, columns, name);
     repack.sources.push_back(
-        tensorRows(*tensor, rows, fromQ50 ? columns / 32 * kQ50BlockBytes : ggufRowBytes(kQuantFormats[format], columns),
+        tensorRows(*tensor, rows,
+                   fromQ50    ? columns / 32 * kQ50BlockBytes
+                   : fromBf16 ? columns * 2
+                              : ggufRowBytes(kQuantFormats[format], columns),
                    order));
     image_.repacks.push_back(std::move(repack));
   }
@@ -138,15 +149,18 @@ public:
     copiedRows(*tensor);
   }
 
-  // An F32 tensor [rows, columns] as stored (the MoE router and the
-  // shared-expert scalar gate, which llama.cpp keeps unquantized).
+  // An F32 tensor [rows, columns] as stored, or widened from BF16 (the MoE
+  // router and the shared-expert scalar gate, which llama.cpp keeps unquantized).
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
-    const GgufTensor *tensor = find(name, floatType);
+    const GgufTensor *tensor = find(name, wideFloatType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected an F32 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
-    copiedRows(*tensor);
+    if (tensor->type == ggml::kF32) return copiedRows(*tensor);
+    const uint64_t bytes = rows * columns * sizeof(float);
+    descriptor(ggml::kF32, rows, columns, {}, {bytes, 0, 0}, name);
+    copy(tensorRows(*tensor, rows, tensor->bytes / rows), Conversion::WidenToFloat32);
   }
 
   // An F32, BF16, Q8_0 or Q4_K tensor [rows, columns] as F32 rows: as stored, or the
@@ -213,9 +227,11 @@ private:
     return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, tensor.file};
   }
 
-  // Rows written as stored, or narrowed to bf16, into their own section.
+  // Rows written as stored, or narrowed to bf16 or widened to F32, into their own section.
   void copy(TensorRows source, Conversion conversion = Conversion::None) {
-    const uint64_t bytes = source.rows * source.rowBytes / (conversion == Conversion::NarrowToBfloat16 ? 2 : 1);
+    uint64_t bytes = source.rows * source.rowBytes;
+    if (conversion == Conversion::NarrowToBfloat16) bytes /= 2;
+    if (conversion == Conversion::WidenToFloat32) bytes *= 2;
     image_.copies.push_back({section(bytes), std::move(source), conversion});
   }
 
@@ -403,8 +419,8 @@ void ffnImage(Builder &b, const TargetGeometry &g, const std::string &p) {
 // The PLE layer's projections, norms and dilated convolution taps.
 void pleImage(Builder &b, const TargetGeometry &g, const std::string &p) {
   const uint64_t width = uint64_t{g.pleNgram - 1} * g.pleHeadsPerNgram * g.pleHeadDimension;
-  b.quantized(p + "ple_key.weight", g.streamWidth(), width);
-  b.quantized(p + "ple_value.weight", g.hiddenSize, width);
+  b.quantized(p + "ple_key.weight", g.streamWidth(), width, {}, true);
+  b.quantized(p + "ple_value.weight", g.hiddenSize, width, {}, true);
   b.floatNorm(p + "ple_norm_key.weight", g.streamWidth());
   b.floatNorm(p + "ple_norm_query.weight", g.streamWidth());
   b.floatNorm(p + "ple_norm_conv.weight", g.streamWidth());

@@ -442,9 +442,10 @@ uint32_t widerThanStaging(Fmt f) {
 
 // One quantized tensor through the production executor, from a file whose
 // data section starts at kSourceOffset, against the CPU reference's planes.
-// With `q50`, the file holds those Q5_0 rows, which preparation reads as the Q8_0 rows `q80` are.
+// With `q50` (or `bf16`), the file holds those Q5_0 (BF16) rows, which preparation reads as the Q8_0 rows `q80` are.
 void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, Fmt f, const Shape &shape,
-                 uint32_t seed, const std::vector<uint8_t> *q50 = nullptr, const std::vector<uint8_t> *q80 = nullptr) {
+                 uint32_t seed, const std::vector<uint8_t> *q50 = nullptr, const std::vector<uint8_t> *q80 = nullptr,
+                 const std::vector<uint8_t> *bf16 = nullptr) {
   const QuantFormat &layout = kQuantFormats[f];
   const uint32_t rows = shape.rows, K = shape.K, stride = rowBytes(f, K);
   const std::vector<uint8_t> native = q80 ? *q80 : fixture(f, rows, K, seed);
@@ -458,7 +459,8 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   int output = -1;
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
-    input.insert(input.end(), q50 ? q50->begin() : native.begin(), q50 ? q50->end() : native.end());
+    const std::vector<uint8_t> &stored = bf16 ? *bf16 : q50 ? *q50 : native;
+    input.insert(input.end(), stored.begin(), stored.end());
     splash::test::writeFile(inputPath, input);
     output = open(outputPath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (output < 0 || ftruncate(output, bytes)) throw std::runtime_error("cannot create the repack output");
@@ -469,7 +471,8 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     step.plane0 = plane0;
     step.plane1 = layout.plane1_bytes ? plane1 : 0;
     step.meta = meta;
-    step.sources = {q50 ? model::gguf::TensorRows{"fixture", model::ggml::kQ5_0, 0, rows, K / 32 * 22, shape.order}
+    step.sources = {bf16  ? model::gguf::TensorRows{"fixture", model::ggml::kBF16, 0, rows, K * 2, shape.order}
+                    : q50 ? model::gguf::TensorRows{"fixture", model::ggml::kQ5_0, 0, rows, K / 32 * 22, shape.order}
                         : model::gguf::TensorRows{"fixture", layout.ggml_type, 0, rows, stride, shape.order}};
     model::gguf::Image plan;
     plan.bytes = bytes;
@@ -527,6 +530,28 @@ void checkQ50Repack(MetalBackend &backend, const std::filesystem::path &director
     q50.insert(q50.end(), b, b + 22);
   }
   checkRepack(backend, directory, Q80, {rows, K, {}}, 31, &q50, &q8);
+}
+
+// BF16 rows that are exact Q8_0 values (d a power of two, the largest |q| 127) and the Q8_0 rows they requantize to.
+void checkBf16Repack(MetalBackend &backend, const std::filesystem::path &directory) {
+  constexpr uint32_t rows = 320, K = 1024;
+  std::vector<uint8_t> q8 = fixture(Q80, rows, K, 33), bf16;
+  std::mt19937 rng(6);
+  for (uint32_t block = 0; block < rows * K / 32; ++block) {
+    uint8_t *d = q8.data() + block * 34;
+    const uint16_t half = 0x2400;   // 2^-6
+    std::memcpy(d, &half, 2);
+    for (int i = 0; i < 32; ++i) d[2 + i] = uint8_t(int8_t(int(rng() % 255) - 127));
+    d[2 + rng() % 32] = 127;
+    for (int i = 0; i < 32; ++i) {
+      const float value = float(int8_t(d[2 + i])) / 64;
+      uint32_t bits;
+      std::memcpy(&bits, &value, 4);
+      const uint16_t high = uint16_t(bits >> 16);
+      bf16.insert(bf16.end(), {uint8_t(high), uint8_t(high >> 8)});
+    }
+  }
+  checkRepack(backend, directory, Q80, {rows, K, {}}, 33, nullptr, &q8, &bf16);
 }
 
 // Q4_K rows written as the F32 values of ggml's dequantize_row_q4_K.
@@ -740,6 +765,7 @@ int main(int argc, char **argv) {
     guarded("Q8_0 dequantization", [&] { checkDequantizedCopy(backend, directory.path()); });
     guarded("Q4_K dequantization", [&] { checkDequantizedQ4K(backend, directory.path()); });
     guarded("Q5_0 rows repacked as Q8_0", [&] { checkQ50Repack(backend, directory.path()); });
+    guarded("BF16 rows repacked as Q8_0", [&] { checkBf16Repack(backend, directory.path()); });
     guarded("the Flash-Next target loader", [&] { checkQwen4Loader(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
                 failures);
