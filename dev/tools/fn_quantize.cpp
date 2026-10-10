@@ -97,6 +97,50 @@ std::map<std::string, Imatrix> loadImatrix(const std::string &path) {
   return result;
 }
 
+// ggml's Q2_0 reference sets d = amax, so levels {-d, 0, d, 2d} fit poorly; search d (either sign) for the least
+// weighted error instead. Block: fp16 d, then 64 codes (q + 1) in 2 bits, low bits first.
+void quantizeRowQ2_0(const float *x, const float *qw, int64_t n, uint8_t *out) {
+  for (int64_t b = 0; b < n / 64; ++b, x += 64, out += 18) {
+    float weight[64], amax = 0, mean2 = 0;
+    for (int j = 0; j < 64; ++j) {
+      amax = std::max(amax, std::fabs(x[j]));
+      mean2 += x[j] * x[j] / 64;
+    }
+    for (int j = 0; j < 64; ++j) weight[j] = (qw ? qw[b * 64 + j] : 1.0f) * std::sqrt(mean2 + x[j] * x[j]);
+    float bestD = 0, bestError = INFINITY;
+    int8_t best[64] = {};
+    for (const float sign : {1.0f, -1.0f})
+      for (const float divisor : {1.0f, 1.25f, 1.5f, 2.0f, 2.5f, 3.0f}) {
+        float d = amax > 0 ? sign * amax / divisor : 0;
+        int8_t q[64];
+        float error = 0;
+        for (int iteration = 0; iteration < 4; ++iteration) {
+          d = ggml_fp16_to_fp32(ggml_fp32_to_fp16(d));
+          const float inverse = d != 0 ? 1.0f / d : 0.0f;
+          float numerator = 0, denominator = 0;
+          error = 0;
+          for (int j = 0; j < 64; ++j) {
+            q[j] = static_cast<int8_t>(std::clamp<int>(static_cast<int>(std::lround(x[j] * inverse)), -1, 2));
+            numerator += weight[j] * x[j] * q[j];
+            denominator += weight[j] * q[j] * q[j];
+            error += weight[j] * (x[j] - q[j] * d) * (x[j] - q[j] * d);
+          }
+          if (error < bestError) {
+            bestError = error;
+            bestD = d;
+            memcpy(best, q, sizeof(q));
+          }
+          if (denominator <= 0) break;
+          d = numerator / denominator;
+        }
+      }
+    const uint16_t half = ggml_fp32_to_fp16(bestD);
+    memcpy(out, &half, 2);
+    memset(out + 2, 0, 16);
+    for (int j = 0; j < 64; ++j) out[2 + j / 4] |= static_cast<uint8_t>((best[j] + 1) << (2 * (j % 4)));
+  }
+}
+
 void dequantize(const Item &item, int64_t firstRow, int64_t rows, float *out) {
   const ggml_tensor *t = item.tensor;
   const int64_t width = t->ne[0];
@@ -268,7 +312,12 @@ int main(int argc, char **argv) {
                 floats.resize(width * count);
                 dequantize(item, segment + first, count, floats.data());
                 const float *w = weights ? weights->values.data() + ((segment + first) / rowsPerExpert) * width : nullptr;
-                const size_t got = ggml_quantize_chunk(item.type, floats.data(), quantized.data() + first * rowBytes, 0, count, width, w);
+                size_t got = rowBytes * count;
+                if (item.type == GGML_TYPE_Q2_0)
+                  for (int64_t r = 0; r < count; ++r)
+                    quantizeRowQ2_0(floats.data() + r * width, w, width, quantized.data() + (first + r) * rowBytes);
+                else
+                  got = ggml_quantize_chunk(item.type, floats.data(), quantized.data() + first * rowBytes, 0, count, width, w);
                 if (got != rowBytes * count) fail("quantizer returned an unexpected size");
               }
             });
