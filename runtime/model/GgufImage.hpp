@@ -154,7 +154,7 @@ struct PleTable {
 // nullopt for a target without a PLE layer. Checks the table's type and
 // shape and that every head's rows lie inside it. `external`, a GGUF holding
 // a per_layer_token_embd.weight of the same shape (SPLASH_PLE_TABLE), supplies
-// the table's rows instead of `file`.
+// the table's rows instead of `file`; `file` may then omit its own table.
 [[nodiscard]] std::optional<PleTable> readPleTable(const GgufFile &file, const TargetGeometry &geometry,
                                                    const GgufFile *external = nullptr);
 

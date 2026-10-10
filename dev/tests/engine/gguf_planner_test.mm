@@ -412,6 +412,22 @@ void checkQwen4(const std::filesystem::path &directory) {
         "planner names the file each tensor is read from");
   const auto pleSplit = model::gguf::readPleTable(splitFile, g);
   check(pleSplit && pleSplit->path == part1, "planner finds the PLE table in its shard of a split GGUF");
+
+  // A target without its table plans, and takes the table from an external GGUF.
+  std::vector<Tensor> noTable;
+  for (const Tensor &tensor : target.tensors)
+    if (tensor.name != "per_layer_token_embd.weight") noTable.push_back(tensor);
+  const auto bare = directory / "qwen4-no-table.gguf", tableOnly = directory / "qwen4-table-only.gguf";
+  splash::test::writeFile(bare, test_gguf::file(keys, noTable));
+  splash::test::writeFile(tableOnly, test_gguf::file({}, {*std::find_if(target.tensors.begin(), target.tensors.end(), [](const Tensor &t) { return t.name == "per_layer_token_embd.weight"; })}));
+  model::WeightSource bareSource(bare), tableSource(tableOnly);
+  const model::GgufFile bareFile(bareSource), tableFile(tableSource);
+  const auto external = model::gguf::readPleTable(bareFile, g, &tableFile);
+  check(external && external->path == tableOnly && external->rows == 420 && external->hash.heads() == 4,
+        "planner reads the PLE table from an external GGUF when the target has none");
+  bool refused = false;
+  try { static_cast<void>(model::gguf::readPleTable(bareFile, g)); } catch (const model::GgufError &) { refused = true; }
+  check(refused, "planner refuses a target without a PLE table when no external one is given");
 }
 
 // With SPLASH_FLASH_NEXT_GGUF_DIR naming a Qwen3.8-Flash-Next GGUF directory (its split parts, and mtp/*.gguf for
