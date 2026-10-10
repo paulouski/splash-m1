@@ -488,7 +488,11 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   if (!full) return;
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addVerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);
-  ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe);
+  // Only rows before `limit` feed a later step or the logits row.
+  std::array<uint32_t, ExecutionLimits::maximumBatchWidth> active;
+  active.fill(limit);
+  ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe,
+                std::span(active).first(step.lanes));
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addVerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden);
   addVerifyProjection(step, b.finalHidden, weights_.logitsProjection, b.logits);
