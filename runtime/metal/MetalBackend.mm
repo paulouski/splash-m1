@@ -35,7 +35,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <fstream>
 #include <set>
+#include <sys/stat.h>
 namespace {
 // SPLASH_COMMAND_TIMELINE=path: one line per command buffer (commit time, GPU
 // start/end, dispatch count, first/last pipeline). SPLASH_DISPATCH_PROFILE=path:
@@ -56,6 +58,34 @@ FILE *profileLog() {
     return instrumentLog("SPLASH_DISPATCH_PROFILE", file, opened);
 }
 std::mutex &timelineMutex() { static std::mutex m; return m; }
+// SPLASH_ABLATION_FILE=path: re-read when its mtime changes; line 1 = dup list, line 2 = skip list
+// (same syntax as SPLASH_DUP_PIPELINES / SPLASH_SKIP_PIPELINES). The tag (line 1 + line 2, spaces
+// as '_') is printed on every timeline line so one long decode can sweep many ablations.
+struct AblationControl { std::string dup, skip, tag = "base"; };
+AblationControl ablationControl() {
+    static std::mutex mutex; static AblationControl current; static time_t seconds = 0; static long nanos = 0;
+    const char *path = std::getenv("SPLASH_ABLATION_FILE");
+    std::lock_guard lock(mutex);
+    struct stat info;
+    if (path && stat(path, &info) == 0 &&
+        (info.st_mtimespec.tv_sec != seconds || info.st_mtimespec.tv_nsec != nanos)) {
+        seconds = info.st_mtimespec.tv_sec; nanos = info.st_mtimespec.tv_nsec;
+        std::ifstream in(path);
+        std::getline(in, current.dup); std::getline(in, current.skip);
+        current.tag = current.dup + "|" + current.skip;
+        if (current.tag == "|") current.tag = "base";
+        for (char &c : current.tag) if (c == ' ') c = '_';
+    }
+    return current;
+}
+// Set per submission: 1 = this command carries the ablation, 0 = it is the paired baseline.
+std::atomic<int> ablationApplied{-1};
+std::atomic<size_t> ablationBaseCount{0};
+std::string currentTimelineTag() {
+    const std::string tag = ablationControl().tag;
+    const int applied = ablationApplied.load();
+    return tag == "base" || applied < 0 ? tag : tag + (applied ? "/on" : "/off");
+}
 }  // namespace
 #endif
 
@@ -984,11 +1014,13 @@ struct MetalBackend::Impl {
                         const size_t count = std::min(dispatches.size(), first + groupSize) - first;
                         const std::string firstName = dispatches[first].source->pipelineName;
                         const uint64_t sequence = ticketState->sequence;
+                        const std::string tag = currentTimelineTag();
+                        const size_t baseCount = ablationBaseCount;
                         [child addCompletedHandler:^(id<MTLCommandBuffer> completedChild) {
                             std::lock_guard lock(timelineMutex());
-                            std::fprintf(log, "T seq=%llu child=%zu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s\n",
+                            std::fprintf(log, "T seq=%llu child=%zu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s tag=%s n0=%zu\n",
                                          (unsigned long long)sequence, childIndex, count, committed,
-                                         completedChild.GPUStartTime, completedChild.GPUEndTime, firstName.c_str());
+                                         completedChild.GPUStartTime, completedChild.GPUEndTime, firstName.c_str(), tag.c_str(), baseCount);
                             std::fflush(log);
                         }];
                     }
@@ -1058,11 +1090,13 @@ struct MetalBackend::Impl {
                 const std::string first = dispatches.front().source->pipelineName;
                 const std::string last = dispatches.back().source->pipelineName;
                 const uint64_t sequence = ticketState->sequence;
+                const std::string tag = currentTimelineTag();
+                const size_t baseCount = ablationBaseCount;
                 [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
                     std::lock_guard lock(timelineMutex());
-                    std::fprintf(log, "T seq=%llu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s last=%s\n",
+                    std::fprintf(log, "T seq=%llu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s last=%s tag=%s n0=%zu\n",
                                  (unsigned long long)sequence, count, committed, completed.GPUStartTime,
-                                 completed.GPUEndTime, first.c_str(), last.c_str());
+                                 completed.GPUEndTime, first.c_str(), last.c_str(), tag.c_str(), baseCount);
                     std::fflush(log);
                 }];
             }
@@ -1446,6 +1480,18 @@ CommandTicket MetalBackend::submitCommandAsync(
     std::vector<ComputeDispatch> kept;
     const char *skip = std::getenv("SPLASH_SKIP_PIPELINES");
     const char *dup = std::getenv("SPLASH_DUP_PIPELINES");
+    AblationControl ablation;
+    ablationBaseCount = dispatches.size();
+    if (std::getenv("SPLASH_ABLATION_FILE")) {
+        // Commands of equal class (over 1000 dispatches or not) alternate off/on, so every cycle's ablated
+        // command has a neighbour from the same text that is not.
+        static uint64_t calls[2] = {0, 0};
+        ablation = ablationControl();
+        const bool applied = (calls[dispatches.size() > 1000]++ & 1) && (!ablation.dup.empty() || !ablation.skip.empty());
+        ablationApplied = applied ? 1 : 0;
+        skip = applied && !ablation.skip.empty() ? ablation.skip.c_str() : nullptr;
+        dup = applied && !ablation.dup.empty() ? ablation.dup.c_str() : nullptr;
+    }
     // SPLASH_MOE_ROWS=N: 8-row MoE routing covers only the first N rows (experiment; later rows are not routed).
     const char *moeRows = std::getenv("SPLASH_MOE_ROWS");
     if (skip || dup || moeRows) {
@@ -1458,17 +1504,32 @@ CommandTicket MetalBackend::submitCommandAsync(
             }
             return prefixes;
         };
-        const auto matches = [](const std::vector<std::string> &prefixes, const std::string &name) {
-            for (const std::string &prefix : prefixes)
-                if (prefix.back() == '$' ? name == std::string_view(prefix).substr(0, prefix.size() - 1)
-                                         : name.rfind(prefix, 0) == 0)
-                    return true;
+        // "prefix", "name$", and "name$@3+7+8": only the 3rd, 7th and 8th (0-based) dispatch of that name in a
+        // command of over 1000 dispatches.
+        std::unordered_map<std::string, uint32_t> occurrences;
+        const bool large = dispatches.size() > 1000;
+        const auto matches = [&](const std::vector<std::string> &prefixes, const std::string &name) {
+            for (const std::string &item : prefixes) {
+                const size_t at = item.find('@');
+                const std::string_view prefix = std::string_view(item).substr(0, at);
+                if (prefix.back() == '$' ? name != prefix.substr(0, prefix.size() - 1) : name.rfind(prefix, 0) != 0)
+                    continue;
+                if (at == std::string::npos) return true;
+                if (!large) continue;
+                const uint32_t index = occurrences[name];
+                for (std::string_view rest(item.c_str() + at + 1); !rest.empty();) {
+                    const size_t plus = rest.find('+');
+                    if (static_cast<uint32_t>(std::atoi(std::string(rest.substr(0, plus)).c_str())) == index) return true;
+                    rest = plus == std::string_view::npos ? std::string_view{} : rest.substr(plus + 1);
+                }
+            }
             return false;
         };
         const std::vector<std::string> skips = split(skip), dups = split(dup);
         const uint32_t limit = moeRows ? static_cast<uint32_t>(std::atoi(moeRows)) : 0;
         static std::deque<std::array<uint32_t, 4>> groupParams;
         for (const ComputeDispatch &dispatch : dispatches) {
+            struct Count { std::unordered_map<std::string, uint32_t> &m; const std::string &n; ~Count() { ++m[n]; } } count{occurrences, dispatch.pipelineName};
             if (matches(skips, dispatch.pipelineName)) continue;
             kept.push_back(dispatch);
             if (limit && dispatch.pipelineName == "moe_route_select_f32_e512" && dispatch.threadgroups.x == 8)
