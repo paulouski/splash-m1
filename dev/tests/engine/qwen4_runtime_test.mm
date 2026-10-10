@@ -56,7 +56,7 @@ model::Qwen4ExpLayout layoutOfTarget() {
 }
 
 std::vector<uint8_t> tableBytes(const model::Qwen4PleTable &table) {
-  std::vector<uint8_t> bytes(table.rows * pleRowBytes);
+  std::vector<uint8_t> bytes(table.rows * table.rowBytes);
   std::ifstream file(table.path, std::ios::binary);
   file.seekg(static_cast<std::streamoff>(table.dataOffset));
   file.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
@@ -70,12 +70,12 @@ metal::MetalBuffer sharedBuffer(metal::MetalBackend &backend, uint64_t bytes, co
 
 // The rows of 160 values the embedding gather returns for `slots` of a table, as bf16 bits.
 std::vector<uint16_t> gather(metal::MetalBackend &backend, const metal::MetalBuffer &rows, uint32_t tableRows,
-                             const std::vector<uint32_t> &slots) {
+                             const std::vector<uint32_t> &slots, uint32_t format) {
   metal::MetalBuffer indices = sharedBuffer(backend, slots.size() * 4, "ple-test-indices");
   std::memcpy(indices.contents(), slots.data(), slots.size() * 4);
   metal::MetalBuffer output = sharedBuffer(backend, slots.size() * 160 * 2, "ple-test-output");
   metal::CommandGraph graph;
-  ops::Embedding::add(graph, indices, ops::EmbeddingWeights(tableRows, 160, ops::NativeRows(rows, GGUF_FMT_IQ4NL)),
+  ops::Embedding::add(graph, indices, ops::EmbeddingWeights(tableRows, 160, ops::NativeRows(rows, format)),
                       output, static_cast<uint32_t>(slots.size()));
   static_cast<void>(backend.submitCommand(graph.dispatches()));
   const auto *values = static_cast<const uint16_t *>(output.contents());
@@ -94,25 +94,46 @@ void checkPleStaging(metal::MetalBackend &backend, const model::Qwen4PleTable &t
   ids[5] = ids[1];
   ids[11] = ids[1];
   ids[14] = ids[2];
-  PleStore store(PleSource(table.path.string(), table.dataOffset, table.rows), 64 << 10);
+  PleStore store(PleSource(table.path.string(), table.dataOffset, table.rows, table.rowBytes), 64 << 10);
   for (const uint64_t cache : {0, 1}) {
     static_cast<void>(cache);
-    metal::MetalBuffer staging = sharedBuffer(backend, ids.size() * pleRowBytes, "ple-test-staging");
+    metal::MetalBuffer staging = sharedBuffer(backend, ids.size() * table.rowBytes, "ple-test-staging");
     std::vector<uint32_t> slots(ids.size());
     // The second pass answers from the row cache.
     const PleStore::Result result =
-        store.fetch(ids, {static_cast<uint8_t *>(staging.contents()), ids.size() * pleRowBytes}, slots);
+        store.fetch(ids, {static_cast<uint8_t *>(staging.contents()), ids.size() * table.rowBytes}, slots);
     require(result.ok(), "the PLE store failed to fetch: " + result.error);
     require(cache == 0 ? result.stats.misses > 0 : result.stats.hits > 0 && result.stats.misses == 0,
             "the second fetch did not come from the cache");
     require(result.stats.dupes == 3, "the repeated ids were not deduplicated");
-    const auto viaStaging = gather(backend, staging, static_cast<uint32_t>(ids.size()), slots);
-    const auto viaTable = gather(backend, whole, static_cast<uint32_t>(table.rows), ids);
+    const auto viaStaging = gather(backend, staging, static_cast<uint32_t>(ids.size()), slots, table.format);
+    const auto viaTable = gather(backend, whole, static_cast<uint32_t>(table.rows), ids, table.format);
     require(viaStaging == viaTable, "gathering from the staging differs from gathering from the whole table");
     require(std::any_of(viaTable.begin(), viaTable.end(), [](uint16_t v) { return v != 0; }),
             "the gathered PLE rows are all zero");
   }
   std::printf("ple staging gather == full-table gather: ok\n");
+}
+
+// The same check on a Q8_0 table (170-byte rows across page boundaries), written here with random int8 quants.
+void checkQ80PleStaging(metal::MetalBackend &backend) {
+  constexpr uint64_t rows = 600, offset = 4096 + 123;
+  const std::filesystem::path path = std::filesystem::temp_directory_path() / ("ple-q80-" + std::to_string(getpid()));
+  std::mt19937 rng(11);
+  std::vector<uint8_t> bytes(offset + rows * pleMaxRowBytes);
+  for (uint64_t at = offset; at < bytes.size(); ++at) {
+    const uint64_t inBlock = (at - offset) % 34;
+    bytes[at] = inBlock == 0 ? 0x66 : inBlock == 1 ? 0x2E : static_cast<uint8_t>(rng()); // d = 0.1, then quants
+  }
+  std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char *>(bytes.data()), std::streamsize(bytes.size()));
+  model::Qwen4PleTable table;
+  table.path = path;
+  table.dataOffset = offset;
+  table.rows = rows;
+  table.rowBytes = pleMaxRowBytes;
+  table.format = GGUF_FMT_Q80;
+  checkPleStaging(backend, table);
+  std::filesystem::remove(path);
 }
 
 // A family that stages the table's first row for every (row, head): the PLE layer gathers row 0 everywhere,
@@ -534,6 +555,7 @@ void run(const std::string &metallib) {
   const model::Qwen4PleTable table = std::get<model::Qwen4ExpWeights>(package.target).pleTable;
 
   checkPleStaging(backend, table);
+  checkQ80PleStaging(backend);
   {
     ops::ExecutionPlans operators(backend.capabilities());
     const model::ModelMemoryPlan plan = model::plannedRuntimeMemory(backend.capabilities(), package, operators);

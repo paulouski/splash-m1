@@ -27,6 +27,8 @@ struct Qwen4Geometry final {
   uint32_t maximumContextTokens = 0;
   // The MTP head's full-attention blocks (0 or 1), the last of the KV layers.
   uint32_t mtpLayers = 0;
+  // Bytes of a PLE table row (the staging's slot).
+  uint32_t pleRowBytes = 90;
 
   [[nodiscard]] constexpr explicit operator bool() const noexcept { return hyperConnections != 0; }
   [[nodiscard]] constexpr uint32_t streamWidth() const noexcept { return hyperConnections * hiddenSize; }

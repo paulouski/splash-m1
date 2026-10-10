@@ -20,7 +20,8 @@
 
 namespace splash {
 
-inline constexpr uint32_t pleRowBytes = 90; // 160 values = 5 IQ4_NL blocks
+inline constexpr uint32_t pleRowBytes = 90;     // 160 values = 5 IQ4_NL blocks
+inline constexpr uint32_t pleMaxRowBytes = 170; // 5 Q8_0 blocks, the widest row a table may hold
 inline constexpr uint32_t pleMaximumHeads = 16;
 
 struct PleHashParams {
@@ -69,7 +70,8 @@ class PleSource {
 public:
   // validate returns an error message, empty when the shard is acceptable.
   using Validate = std::function<std::string(const PleSource &)>;
-  PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows, const Validate &validate = {});
+  PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows, uint32_t rowBytes = pleRowBytes,
+            const Validate &validate = {});
   PleSource(PleSource &&other) noexcept;
   PleSource(const PleSource &) = delete;
   PleSource &operator=(const PleSource &) = delete;
@@ -78,7 +80,8 @@ public:
 
   int fd() const { return fd_; }
   uint64_t rows() const { return rows_; }
-  uint64_t rowOffset(uint64_t row) const { return dataOffset_ + row * pleRowBytes; }
+  uint32_t rowBytes() const { return rowBytes_; }
+  uint64_t rowOffset(uint64_t row) const { return dataOffset_ + row * rowBytes_; }
   // Empty when the open file and the path still are the shard opened.
   std::string checkIdentity() const;
 
@@ -91,14 +94,15 @@ private:
   std::string path_;
   int fd_ = -1;
   uint64_t dataOffset_ = 0, rows_ = 0;
+  uint32_t rowBytes_ = pleRowBytes;
   Identity identity_;
 };
 
 // CLOCK cache of rows keyed by row id: fixed arrays, linear-probing index at
-// most 60% full, about 100 B per row. No locks.
+// most 60% full, about rowBytes + 10 B per row. No locks.
 class PleRowCache {
 public:
-  explicit PleRowCache(uint64_t bytes); // 0 disables
+  explicit PleRowCache(uint64_t bytes, uint32_t rowBytes = pleRowBytes); // 0 bytes disables
   uint32_t capacity() const { return capacity_; }
   uint32_t size() const { return size_; }
   // The row, marking it referenced, or null.
@@ -115,6 +119,7 @@ private:
   std::vector<uint32_t> keys_;
   std::vector<uint8_t> state_; // 0 free, 1 cold, 2 hot
   std::vector<uint8_t> rows_;
+  uint32_t rowBytes_ = pleRowBytes;
 };
 
 // Reads rows with a pool of threads; the caller works too.
@@ -129,7 +134,7 @@ public:
   PleReader(const PleReader &) = delete;
   PleReader &operator=(const PleReader &) = delete;
   ~PleReader();
-  // Reads each miss's row into out + slot * pleRowBytes. Returns the bytes
+  // Reads each miss's row into out + slot * source.rowBytes(). Returns the bytes
   // read from the device, or an error message in `error`.
   uint64_t read(const PleSource &source, std::span<const Miss> misses, uint8_t *out, std::string &error);
 

@@ -24,7 +24,7 @@ void putQwen4(const RuntimeGeometry &geometry, uint64_t rows, uint64_t scoreRows
   put(Tensor::HyperBranch, bytesFor<uint16_t>(rows * g.hiddenSize));
   put(Tensor::HyperZeros, bytesFor<uint16_t>(rows * g.hiddenSize));
   // The unique PLE rows a step gathers are at most one per (row, head).
-  put(Tensor::PleStaging, rows * q.pleHeads() * pleRowBytes);
+  put(Tensor::PleStaging, rows * q.pleHeads() * q.pleRowBytes);
   put(Tensor::PleSlots, bytesFor<uint32_t>(rows * q.pleHeads()));
   put(Tensor::PleRows, bytesFor<uint16_t>(rows * q.pleWidth()));
   put(Tensor::PleValue, bytesFor<uint16_t>(rows * g.hiddenSize));

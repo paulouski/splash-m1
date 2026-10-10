@@ -2,6 +2,7 @@
 #include "model/GgufPreparation.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <regex>
 #include <string>
 
@@ -75,7 +76,14 @@ void GgufTargetLoader::checkUnchanged() const {
 void GgufTargetLoader::plan(const GgufFile &file, const gguf::TargetGeometry &geometry,
                             std::string_view prismIdentity) {
   rotation_ = file.rotation();
-  ple_ = gguf::readPleTable(file, geometry);
+  // SPLASH_PLE_TABLE: a GGUF whose per_layer_token_embd.weight replaces the model's.
+  if (const char *external = std::getenv("SPLASH_PLE_TABLE"); external && *external) {
+    WeightSource source(external, [this] { backend_.checkOperation(); });
+    const GgufFile table(source);
+    ple_ = gguf::readPleTable(file, geometry, &table);
+  } else {
+    ple_ = gguf::readPleTable(file, geometry);
+  }
   for (gguf::Image &image : gguf::planImages(file, geometry)) {
     backend_.checkOperation();
     PreparedWeight weight = ggufImageWeight(sources_, image);

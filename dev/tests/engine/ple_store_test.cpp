@@ -23,16 +23,16 @@ constexpr uint64_t rows = 1'000'000, dataOffset = 4096 + 123;
 
 uint8_t rowByte(uint64_t row, uint32_t j) { return uint8_t(row * 31 + j * 7 + (row >> 8)); }
 
-void writeTable(const std::filesystem::path &path, uint64_t count) {
+void writeTable(const std::filesystem::path &path, uint64_t count, uint32_t rowBytes = pleRowBytes) {
   std::ofstream file(path, std::ios::binary | std::ios::trunc);
   std::vector<char> header(dataOffset, 'h');
   file.write(header.data(), header.size());
-  std::vector<char> buffer(uint64_t{65536} * pleRowBytes);
+  std::vector<char> buffer(uint64_t{65536} * rowBytes);
   for (uint64_t first = 0; first < count; first += 65536) {
     const uint64_t n = std::min<uint64_t>(65536, count - first);
     for (uint64_t r = 0; r < n; ++r)
-      for (uint32_t j = 0; j < pleRowBytes; ++j) buffer[r * pleRowBytes + j] = char(rowByte(first + r, j));
-    file.write(buffer.data(), n * pleRowBytes);
+      for (uint32_t j = 0; j < rowBytes; ++j) buffer[r * rowBytes + j] = char(rowByte(first + r, j));
+    file.write(buffer.data(), n * rowBytes);
   }
 }
 
@@ -42,15 +42,15 @@ struct Fetched {
   std::vector<uint32_t> slots;
 };
 
-Fetched fetch(PleStore &store, const std::vector<uint32_t> &ids) {
+Fetched fetch(PleStore &store, const std::vector<uint32_t> &ids, uint32_t rowBytes = pleRowBytes) {
   Fetched f;
-  f.staging.assign(ids.size() * pleRowBytes, 0);
+  f.staging.assign(ids.size() * rowBytes, 0);
   f.slots.assign(ids.size(), 0);
   f.result = store.fetch(ids, f.staging, f.slots);
   return f;
 }
 
-void checkRows(const Fetched &f, const std::vector<uint32_t> &ids) {
+void checkRows(const Fetched &f, const std::vector<uint32_t> &ids, uint32_t rowBytes = pleRowBytes) {
   require(f.result.ok(), "fetch failed: " + f.result.error);
   std::set<uint32_t> unique(ids.begin(), ids.end());
   require(f.result.stats.hits + f.result.stats.misses == unique.size(), "hits + misses != unique ids");
@@ -58,8 +58,8 @@ void checkRows(const Fetched &f, const std::vector<uint32_t> &ids) {
   for (size_t k = 0; k < ids.size(); ++k) {
     // Unique rows sit in ascending id order.
     require(uint32_t(std::distance(unique.begin(), unique.find(ids[k]))) == f.slots[k], "slot is not the id's rank");
-    for (uint32_t j = 0; j < pleRowBytes; ++j)
-      require(f.staging[uint64_t{f.slots[k]} * pleRowBytes + j] == rowByte(ids[k], j), "row bytes differ");
+    for (uint32_t j = 0; j < rowBytes; ++j)
+      require(f.staging[uint64_t{f.slots[k]} * rowBytes + j] == rowByte(ids[k], j), "row bytes differ");
   }
 }
 
@@ -184,13 +184,27 @@ int main() {
     {
       // Open-time failures: too short for the rows, validation hook, missing file; a symlinked shard opens.
       rejects([&] { PleSource(path.string(), dataOffset, rows + 1); }, "past the end", "short shard accepted");
-      rejects([&] { PleSource(path.string(), dataOffset, rows, [](const PleSource &) { return std::string("bad shard"); }); },
+      rejects([&] { PleSource(path.string(), dataOffset, rows, pleRowBytes, [](const PleSource &) { return std::string("bad shard"); }); },
               "bad shard", "validation hook ignored");
       rejects([&] { PleSource((dir / "missing").string(), 0, 1); }, "open", "missing file accepted");
       std::filesystem::create_symlink(path, dir / "link.bin");
       PleStore linked(PleSource((dir / "link.bin").string(), dataOffset, rows), 0, 2);
       checkRows(fetch(linked, {7, 8}), {7, 8});
       require(fetch(linked, {9}).result.ok() && !linked.poisoned(), "identity check failed through a symlink");
+    }
+
+    for (const uint32_t width : {pleMaxRowBytes, 100u}) {
+      // Wider rows (Q8_0, Q4_1) straddling pages: exact bytes, cache hits, truncation.
+      const auto wide = dir / "wide.bin";
+      writeTable(wide, rows, width);
+      PleStore store(PleSource(wide.string(), dataOffset, rows, width), 20000 * (width + 10), 8);
+      std::vector<uint32_t> ids = randomIds(rng, 400, rows);
+      ids.insert(ids.end(), {0, uint32_t(rows - 1), ids[5]});
+      checkRows(fetch(store, ids, width), ids, width);
+      Fetched again = fetch(store, ids, width);
+      checkRows(again, ids, width);
+      require(again.result.stats.misses == 0, "wide repeat read the device");
+      rejects([&] { PleSource(wide.string(), dataOffset, rows + 1, width); }, "past the end", "wide short shard accepted");
     }
 
     std::cout << "ple store tests passed\n";

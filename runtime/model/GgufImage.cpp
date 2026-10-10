@@ -531,7 +531,7 @@ Image planMtpImage(const GgufFile &file, const TargetGeometry &target) {
   return b.finish();
 }
 
-std::optional<PleTable> readPleTable(const GgufFile &file, const TargetGeometry &g) {
+std::optional<PleTable> readPleTable(const GgufFile &file, const TargetGeometry &g, const GgufFile *external) {
   if (!g.hasPle()) return std::nullopt;
   const std::string arch = g.architecture();
   const uint32_t heads = (g.pleNgram - 1) * g.pleHeadsPerNgram;
@@ -547,11 +547,26 @@ std::optional<PleTable> readPleTable(const GgufFile &file, const TargetGeometry 
       throw GgufError("GGUF PLE metadata holds an invalid value");
     return static_cast<uint64_t>(value);
   };
-  const GgufTensor &table = file.require("per_layer_token_embd.weight");
-  if (table.type != ggml::kIQ4_NL || table.dims.size() != 2 || table.columns() != g.pleHeadDimension ||
-      table.bytes != table.rows() * pleRowBytes)
-    throw GgufError("per_layer_token_embd must be IQ4_NL rows of " + std::to_string(pleRowBytes) + " bytes");
+  const GgufTensor &modelTable = file.require("per_layer_token_embd.weight");
+  const GgufFile &tableFile = external ? *external : file;
+  const GgufTensor &table = tableFile.require("per_layer_token_embd.weight");
+  // The 32-wide formats the embedding gather reads natively.
+  uint32_t format = GGUF_FMT_COUNT;
+  for (uint32_t i = 0; i < GGUF_FMT_COUNT; ++i)
+    if (kQuantFormats[i].ggml_type == table.type && kQuantFormats[i].block_elements == 32 && gguf_embedding_format(i))
+      format = i;
+  if (format == GGUF_FMT_COUNT || table.dims.size() != 2 || table.columns() != g.pleHeadDimension ||
+      table.columns() % 32 != 0)
+    throw GgufError("per_layer_token_embd must be 2-D rows of " + std::to_string(g.pleHeadDimension) +
+                    " values in a 32-wide format the embedding gather reads (IQ4_NL, Q4_0, Q4_1, Q8_0)");
+  const uint32_t rowBytes = static_cast<uint32_t>(table.columns() / 32 * kQuantFormats[format].block_bytes);
+  if (rowBytes > pleMaxRowBytes || table.bytes != table.rows() * rowBytes)
+    throw GgufError("per_layer_token_embd has an unexpected row size");
+  if (external && (modelTable.rows() != table.rows() || modelTable.columns() != table.columns()))
+    throw GgufError("the external PLE table's shape differs from the model's per_layer_token_embd");
   PleTable result;
+  result.rowBytes = rowBytes;
+  result.format = format;
   result.rows = table.rows();
   result.hash.ngram = g.pleNgram;
   result.hash.headsPerNgram = g.pleHeadsPerNgram;
@@ -567,7 +582,7 @@ std::optional<PleTable> readPleTable(const GgufFile &file, const TargetGeometry 
   result.hash.eos = static_cast<uint32_t>(file.unsignedValue(arch + ".ple.eos_token_id").value_or(0));
   if (!result.hash.eos) throw GgufError("GGUF PLE metadata is missing: ple.eos_token_id");
   if (result.rows > UINT32_MAX) throw GgufError("per_layer_token_embd has more rows than a row id holds");
-  const WeightSource &source = file.source(table.file);
+  const WeightSource &source = tableFile.source(table.file);
   result.path = source.path();
   result.dataOffset = source.dataOffset() + table.offset;
   return result;

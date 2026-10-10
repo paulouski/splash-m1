@@ -130,7 +130,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
     if (!table || table->hash.ngram != layout.pleNgram || table->hash.headsPerNgram != layout.pleHeadsPerNgram ||
         table->hash.eos != layout.pleEosToken)
       throw WeightStoreError("the GGUF's PLE table does not match the layout");
-    result.pleTable = {table->path, table->dataOffset, table->rows, table->hash};
+    result.pleTable = {table->path, table->dataOffset, table->rows, table->rowBytes, table->format, table->hash};
   }
   if ((mtp != nullptr) != (layout.mtpLayers == 1))
     throw WeightStoreError("the MTP head does not match the layout");

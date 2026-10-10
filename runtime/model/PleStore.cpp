@@ -36,8 +36,9 @@ PleHasher::PleHasher(PleHashParams params) : params_(std::move(params)) {
 
 // PleSource
 
-PleSource::PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows, const Validate &validate)
-    : path_(path), dataOffset_(dataOffset), rows_(rows) {
+PleSource::PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows, uint32_t rowBytes,
+                     const Validate &validate)
+    : path_(path), dataOffset_(dataOffset), rows_(rows), rowBytes_(rowBytes) {
   // Open the resolved file: O_NOFOLLOW then guards only its last component.
   if (char *resolved = ::realpath(path.c_str(), nullptr)) {
     path_ = resolved;
@@ -55,7 +56,7 @@ PleSource::PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows
   identity_ = {uint64_t(st.st_dev), uint64_t(st.st_ino), uint64_t(st.st_size), int64_t(st.st_mtimespec.tv_sec),
                int64_t(st.st_mtimespec.tv_nsec)};
   std::string error;
-  if (dataOffset > identity_.size || rows > (identity_.size - dataOffset) / pleRowBytes)
+  if (dataOffset > identity_.size || rows > (identity_.size - dataOffset) / rowBytes_)
     error = "PLE table runs past the end of the shard";
   else if (validate)
     error = validate(*this);
@@ -67,7 +68,7 @@ PleSource::PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows
 
 PleSource::PleSource(PleSource &&other) noexcept
     : path_(std::move(other.path_)), fd_(std::exchange(other.fd_, -1)), dataOffset_(other.dataOffset_),
-      rows_(other.rows_), identity_(other.identity_) {}
+      rows_(other.rows_), rowBytes_(other.rowBytes_), identity_(other.identity_) {}
 
 PleSource::~PleSource() {
   if (fd_ >= 0) ::close(fd_);
@@ -86,9 +87,9 @@ std::string PleSource::checkIdentity() const {
 
 // PleRowCache
 
-PleRowCache::PleRowCache(uint64_t bytes) {
-  // 90 B row + key + state + index slots at 40-60% load.
-  capacity_ = static_cast<uint32_t>(std::min<uint64_t>(bytes / 100, 0x40000000u));
+PleRowCache::PleRowCache(uint64_t bytes, uint32_t rowBytes) : rowBytes_(rowBytes) {
+  // The row + key + state + index slots at 40-60% load.
+  capacity_ = static_cast<uint32_t>(std::min<uint64_t>(bytes / (rowBytes + 10), 0x40000000u));
   if (capacity_ == 0) return;
   uint64_t slots = 4;
   while (slots * 6 < uint64_t{capacity_} * 10) slots *= 2; // capacity <= 0.6 * slots
@@ -96,7 +97,7 @@ PleRowCache::PleRowCache(uint64_t bytes) {
   index_.assign(slots, 0);
   keys_.assign(capacity_, 0);
   state_.assign(capacity_, 0);
-  rows_.assign(uint64_t{capacity_} * pleRowBytes, 0);
+  rows_.assign(uint64_t{capacity_} * rowBytes_, 0);
 }
 
 static uint32_t cacheHome(uint32_t id, uint32_t mask) { return uint32_t((uint64_t{id} * 0x9E3779B97F4A7C15ull) >> 32) & mask; }
@@ -113,7 +114,7 @@ const uint8_t *PleRowCache::find(uint32_t id) {
   const uint32_t entry = index_[probe(id)];
   if (entry == 0) return nullptr;
   state_[entry - 1] = 2;
-  return rows_.data() + uint64_t{entry - 1} * pleRowBytes;
+  return rows_.data() + uint64_t{entry - 1} * rowBytes_;
 }
 
 void PleRowCache::erase(uint32_t slot) {
@@ -154,7 +155,7 @@ void PleRowCache::insert(uint32_t id, const uint8_t *row, bool hot) {
     ++size_;
   }
   state_[slot] = hot ? 2 : 1;
-  std::memcpy(rows_.data() + uint64_t{slot} * pleRowBytes, row, pleRowBytes);
+  std::memcpy(rows_.data() + uint64_t{slot} * rowBytes_, row, rowBytes_);
 }
 
 void PleRowCache::clear() {
@@ -186,10 +187,11 @@ void PleReader::work(Job &job) {
     const Miss miss = job.misses[i];
     const uint64_t offset = job.source->rowOffset(miss.id);
     const uint64_t start = offset & ~(pageBytes - 1), skew = offset - start;
-    const uint64_t length = skew + pleRowBytes > pageBytes ? 2 * pageBytes : pageBytes;
+    const uint32_t rowBytes = job.source->rowBytes();
+    const uint64_t length = skew + rowBytes > pageBytes ? 2 * pageBytes : pageBytes;
     uint64_t have = 0;
     std::string error;
-    while (have < skew + pleRowBytes) {
+    while (have < skew + rowBytes) {
       const ssize_t n = pread(job.source->fd(), window + have, length - have, off_t(start + have));
       if (n < 0 && errno == EINTR) continue;
       if (n <= 0) {
@@ -204,7 +206,7 @@ void PleReader::work(Job &job) {
       job.failed.store(true);
       return;
     }
-    std::memcpy(job.out + uint64_t{miss.slot} * pleRowBytes, window + skew, pleRowBytes);
+    std::memcpy(job.out + uint64_t{miss.slot} * rowBytes, window + skew, rowBytes);
     job.bytes.fetch_add(have, std::memory_order_relaxed);
   }
 }
@@ -251,7 +253,7 @@ uint64_t PleReader::read(const PleSource &source, std::span<const Miss> misses, 
 // PleStore
 
 PleStore::PleStore(PleSource source, uint64_t cacheBytes, uint32_t threads)
-    : source_(std::move(source)), cache_(cacheBytes), reader_(std::max(threads, 1u)) {}
+    : source_(std::move(source)), cache_(cacheBytes, source_.rowBytes()), reader_(std::max(threads, 1u)) {}
 
 PleStore::Result PleStore::fetch(std::span<const uint32_t> ids, std::span<uint8_t> staging,
                                  std::span<uint32_t> slots) {
@@ -276,12 +278,12 @@ PleStore::Result PleStore::fetch(std::span<const uint32_t> ids, std::span<uint8_
     if (uniqueIds_.empty() || uniqueIds_.back() != id) uniqueIds_.push_back(id);
     slots[static_cast<uint32_t>(order_[i])] = static_cast<uint32_t>(uniqueIds_.size() - 1);
   }
-  if (staging.size() < uniqueIds_.size() * pleRowBytes) return fail("PLE staging buffer is too small", false);
+  if (staging.size() < uniqueIds_.size() * source_.rowBytes()) return fail("PLE staging buffer is too small", false);
   result.stats.dupes = static_cast<uint32_t>(ids.size() - uniqueIds_.size());
   misses_.clear();
   for (uint32_t slot = 0; slot < uniqueIds_.size(); ++slot) {
     if (const uint8_t *row = cache_.find(uniqueIds_[slot])) {
-      std::memcpy(staging.data() + uint64_t{slot} * pleRowBytes, row, pleRowBytes);
+      std::memcpy(staging.data() + uint64_t{slot} * source_.rowBytes(), row, source_.rowBytes());
       ++result.stats.hits;
     } else {
       misses_.push_back({uniqueIds_[slot], slot});
@@ -294,7 +296,7 @@ PleStore::Result PleStore::fetch(std::span<const uint32_t> ids, std::span<uint8_
     result.stats.bytes = reader_.read(source_, misses_, staging.data(), error);
     if (!error.empty()) return fail(std::move(error), true);
     for (const PleReader::Miss &miss : misses_)
-      cache_.insert(miss.id, staging.data() + uint64_t{miss.slot} * pleRowBytes, false);
+      cache_.insert(miss.id, staging.data() + uint64_t{miss.slot} * source_.rowBytes(), false);
   }
   result.stats.ns = uint64_t((AwakeClock::now() - begin).count());
   return result;

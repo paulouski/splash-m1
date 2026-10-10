@@ -194,6 +194,7 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
     includeLayerExtras(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
+  if constexpr (requires { weights.pleTable; }) geometry.qwen4.pleRowBytes = weights.pleTable.rowBytes;
   geometry.prefillProjections = geometry.decodeProjections;
   includeProjection(geometry, weights.logitsProjection);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections,

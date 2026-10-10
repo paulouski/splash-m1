@@ -57,10 +57,10 @@ void addIndexerProjection(metal::CommandGraph &graph, const ops::Linear &linear,
 }
 
 // The staged PLE rows as a table the embedding gather reads: one native
-// IQ4_NL row per slot.
-ops::EmbeddingWeights stagedTable(const metal::MetalBuffer &staging, uint32_t rowValues) {
-  return {static_cast<uint32_t>(staging.sizeBytes() / pleRowBytes), rowValues,
-          ops::NativeRows(staging, GGUF_FMT_IQ4NL)};
+// native row per slot, in the table's format.
+ops::EmbeddingWeights stagedTable(const metal::MetalBuffer &staging, uint32_t rowValues, const Qwen4PleTable &table) {
+  return {static_cast<uint32_t>(staging.sizeBytes() / table.rowBytes), rowValues,
+          ops::NativeRows(staging, table.format)};
 }
 
 // The QSA blocks a step's rows complete: those whose last token is one of
@@ -220,7 +220,7 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
     if (layer.ple) {
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape();
-      ops::Embedding::add(graph, h.pleSlots, stagedTable(h.pleStaging, geometry_.qwen4.pleHeadDimension),
+      ops::Embedding::add(graph, h.pleSlots, stagedTable(h.pleStaging, geometry_.qwen4.pleHeadDimension, weights_.pleTable),
                           h.pleRows, rows * geometry_.qwen4.pleHeads());
       project(h.pleRows, ple.key, h.gate);
       project(h.pleRows, ple.value, h.pleValue);
@@ -321,7 +321,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
     if (layer.ple) {
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape();
-      ops::Embedding::add(graph, h.pleSlots, stagedTable(h.pleStaging, geometry_.qwen4.pleHeadDimension), h.pleRows,
+      ops::Embedding::add(graph, h.pleSlots, stagedTable(h.pleStaging, geometry_.qwen4.pleHeadDimension, weights_.pleTable), h.pleRows,
                           rows * geometry_.qwen4.pleHeads());
       addVerifyProjection(step, h.pleRows, ple.key, h.gate);
       addVerifyProjection(step, h.pleRows, ple.value, h.pleValue);

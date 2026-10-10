@@ -35,9 +35,10 @@ class Qwen4Family final : public FamilyRuntime {
 public:
   explicit Qwen4Family(const Qwen4ExpWeights &weights)
       : hasher_(weights.pleTable.hash),
-        store_(PleSource(weights.pleTable.path.string(), weights.pleTable.dataOffset, weights.pleTable.rows),
+        store_(PleSource(weights.pleTable.path.string(), weights.pleTable.dataOffset, weights.pleTable.rows,
+                         weights.pleTable.rowBytes),
                cacheBytesFromEnvironment()),
-        heads_(hasher_.heads()), log_(std::getenv("SPLASH_PLE_LOG") != nullptr) {
+        heads_(hasher_.heads()), rowBytes_(weights.pleTable.rowBytes), log_(std::getenv("SPLASH_PLE_LOG") != nullptr) {
     std::fprintf(stderr, "PLE rows read from %s; row cache %llu MiB of host RAM (outside the Metal budget)\n",
                  weights.pleTable.path.filename().c_str(),
                  static_cast<unsigned long long>(cacheBytesFromEnvironment() >> 20));
@@ -106,7 +107,7 @@ private:
               uint32_t rows, uint32_t real) {
     const uint64_t count = uint64_t{rows} * heads_;
     if (slots.sizeBytes() < (first + count) * sizeof(uint32_t) ||
-        staging.sizeBytes() < (first + count) * pleRowBytes)
+        staging.sizeBytes() < (first + count) * rowBytes_)
       throw std::logic_error("PLE staging is smaller than a step's rows");
     ids_.resize(count);
     for (uint32_t row = 0; row < real; ++row)
@@ -121,8 +122,8 @@ private:
     for (uint32_t row = real; row < rows; ++row)
       std::copy_n(ids_.data(), heads_, ids_.data() + uint64_t{row} * heads_);
     auto *slotWords = static_cast<uint32_t *>(slots.contents()) + first;
-    auto *stagedRows = static_cast<uint8_t *>(staging.contents()) + first * pleRowBytes;
-    const PleStore::Result result = store_.fetch(ids_, {stagedRows, count * pleRowBytes}, {slotWords, count});
+    auto *stagedRows = static_cast<uint8_t *>(staging.contents()) + first * rowBytes_;
+    const PleStore::Result result = store_.fetch(ids_, {stagedRows, count * rowBytes_}, {slotWords, count});
     if (!result.ok()) throw std::runtime_error("PLE rows could not be read: " + result.error);
     if (slotBase)
       for (uint64_t i = 0; i < count; ++i) slotWords[i] += static_cast<uint32_t>(slotBase);
@@ -164,7 +165,7 @@ private:
   };
   PleHasher hasher_;
   PleStore store_;
-  uint32_t heads_;
+  uint32_t heads_, rowBytes_;
   bool log_;
   FamilyScratch scratch_;
   std::unordered_map<uint64_t, std::vector<uint32_t>> history_;

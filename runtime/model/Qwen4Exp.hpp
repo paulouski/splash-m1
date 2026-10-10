@@ -189,6 +189,8 @@ struct Qwen4PleTable final {
   std::filesystem::path path;
   uint64_t dataOffset = 0;
   uint64_t rows = 0;
+  uint32_t rowBytes = pleRowBytes;
+  uint32_t format = 2; // the embedding gather's gguf format (GGUF_FMT_IQ4NL)
   PleHashParams hash;
 };
 
