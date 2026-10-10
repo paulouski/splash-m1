@@ -97,13 +97,56 @@ void dequantizeQ80(std::span<const uint8_t> blocks, std::span<uint8_t> to) {
   }
 }
 
+// Q4_K blocks (half d, half dmin, 12 scale bytes, 128 bytes of 4-bit q) as their 256 F32 values.
+constexpr uint64_t kQ4KBlockBytes = 144, kQ4KFloatBytes = 256 * sizeof(float);
+void dequantizeQ4K(std::span<const uint8_t> blocks, std::span<uint8_t> to) {
+  const auto half = [](const uint8_t *at) {
+    uint16_t bits;
+    std::memcpy(&bits, at, 2);
+    return static_cast<float>(std::bit_cast<_Float16>(bits));
+  };
+  for (uint64_t b = 0; b < blocks.size() / kQ4KBlockBytes; ++b) {
+    const uint8_t *block = blocks.data() + b * kQ4KBlockBytes;
+    const float d = half(block), dmin = half(block + 2);
+    const uint8_t *scales = block + 4, *q = block + 16;
+    float *out = reinterpret_cast<float *>(to.data() + b * kQ4KFloatBytes);
+    for (uint32_t j = 0; j < 8; ++j) {
+      // ggml's get_scale_min_k4.
+      const uint32_t scale = j < 4 ? scales[j] & 63 : (scales[j + 4] & 15) | ((scales[j - 4] >> 6) << 4);
+      const uint32_t min = j < 4 ? scales[j + 4] & 63 : (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+      const uint8_t *codes = q + 32 * (j / 2);
+      for (uint32_t l = 0; l < 32; ++l) {
+        const uint32_t code = j % 2 ? codes[l] >> 4 : codes[l] & 15;
+        out[32 * j + l] = d * float(scale) * float(code) - dmin * float(min);
+      }
+    }
+  }
+}
+
+// A Q5_0 row's blocks (half d, 4 bytes of high bits, 16 bytes of low nibbles) as the Q8_0 blocks
+// (half d, 32 int8 q) they equal exactly: q = the 5-bit code - 16.
+void q50ToQ80(std::span<const uint8_t> from, uint8_t *to) {
+  for (uint64_t b = 0; b < from.size() / gguf::kQ50BlockBytes; ++b) {
+    const uint8_t *block = from.data() + b * gguf::kQ50BlockBytes;
+    uint8_t *out = to + b * kQ80BlockBytes;
+    uint32_t high;
+    std::memcpy(&high, block + 2, 4);
+    std::memcpy(out, block, 2);
+    for (uint32_t j = 0; j < 16; ++j) {
+      out[2 + j] = static_cast<uint8_t>(int8_t(((block[6 + j] & 15) | (((high >> j) & 1) << 4)) - 16));
+      out[2 + j + 16] = static_cast<uint8_t>(int8_t(((block[6 + j] >> 4) | (((high >> (j + 16)) & 1) << 4)) - 16));
+    }
+  }
+}
+
 // Destination bytes of source bytes: halved when narrowed, doubled when
-// widened, a Q8_0 block's 32 F32 values when dequantized.
+// widened, a block's F32 values when dequantized.
 uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
   switch (copy.conversion) {
   case gguf::Conversion::NarrowToBfloat16: return sourceBytes / 2;
   case gguf::Conversion::WidenToFloat32: return sourceBytes * 2;
   case gguf::Conversion::DequantizeQ80: return sourceBytes / kQ80BlockBytes * kQ80FloatBytes;
+  case gguf::Conversion::DequantizeQ4K: return sourceBytes / kQ4KBlockBytes * kQ4KFloatBytes;
   case gguf::Conversion::None: break;
   }
   return sourceBytes;
@@ -119,10 +162,12 @@ void writeCopy(GgufSources source, int destination, const gguf::Copy &copy,
   // Whole rows per read where they fit; a wider row in pieces of whole values.
   // A widened read takes half the staging, which holds its F32 values; a
   // dequantized one a fifth, whole rows of whole blocks.
-  const bool dequantize = copy.conversion == gguf::Conversion::DequantizeQ80;
-  const uint64_t room = copy.conversion == gguf::Conversion::WidenToFloat32 ? staging.size() / 2
-                        : dequantize                                          ? staging.size() / 5
-                                                                              : staging.size();
+  const bool dequantize = copy.conversion == gguf::Conversion::DequantizeQ80 ||
+                          copy.conversion == gguf::Conversion::DequantizeQ4K;
+  const uint64_t room = copy.conversion == gguf::Conversion::WidenToFloat32       ? staging.size() / 2
+                        : copy.conversion == gguf::Conversion::DequantizeQ80      ? staging.size() / 5
+                        : copy.conversion == gguf::Conversion::DequantizeQ4K      ? staging.size() / 9
+                                                                                  : staging.size();
   if (dequantize && rows.rowBytes > (room & ~uint64_t{3})) throw GgufError("weight row exceeds preparation bound");
   const uint64_t span = std::min<uint64_t>(rows.rowBytes, room & ~uint64_t{3});
   const uint64_t batch = span == rows.rowBytes ? room / rows.rowBytes : 1;
@@ -139,6 +184,12 @@ void writeCopy(GgufSources source, int destination, const gguf::Copy &copy,
       case gguf::Conversion::DequantizeQ80: {
         const auto out = staging.subspan(bytes.size(), copiedBytes(copy, bytes.size()));
         dequantizeQ80(bytes, out);
+        bytes = out;
+        break;
+      }
+      case gguf::Conversion::DequantizeQ4K: {
+        const auto out = staging.subspan(bytes.size(), copiedBytes(copy, bytes.size()));
+        dequantizeQ4K(bytes, out);
         bytes = out;
         break;
       }
@@ -199,7 +250,10 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
   uint64_t sourceRows = 0;
   for (const gguf::TensorRows &rows : repack.sources) {
-    if (rows.rowBytes != rowBytes) throw GgufError("invalid prepared weight source size");
+    // Q5_0 rows are read as the Q8_0 rows they equal.
+    const bool q50 = repack.format == GGUF_FMT_Q80 && rows.type == ggml::kQ5_0;
+    if (rows.rowBytes != (q50 ? repack.columns / 32 * gguf::kQ50BlockBytes : rowBytes))
+      throw GgufError("invalid prepared weight source size");
     sourceRows += rows.rows;
   }
   if (sourceRows > repack.rows) throw GgufError("invalid prepared weight source size");
@@ -227,9 +281,16 @@ void writeRepack(metal::MetalBackend &backend, GgufSources source, int destinati
       uint64_t start = 0;
       for (const gguf::TensorRows &tensor : repack.sources) {
         const uint64_t begin = std::max(firstRow, start), end = std::min(firstRow + rows, start + tensor.rows);
-        if (begin < end)
+        if (begin < end && tensor.type == ggml::kQ5_0) {
+          const uint64_t count = end - begin, q50Width = columns / 32 * gguf::kQ50BlockBytes;
+          std::vector<uint8_t> q50(count * q50Width);
+          readRows(source, tensor, begin - start, count, firstColumn / 32 * gguf::kQ50BlockBytes, q50Width, q50.data());
+          for (uint64_t r = 0; r < count; ++r)
+            q50ToQ80({q50.data() + r * q50Width, q50Width}, host + (begin - firstRow + r) * chunkRowBytes);
+        } else if (begin < end) {
           readRows(source, tensor, begin - start, end - begin, column, chunkRowBytes,
                    host + (begin - firstRow) * chunkRowBytes);
+        }
         start += tensor.rows;
       }
       if (start < firstRow + rows) {
@@ -299,16 +360,19 @@ void writeGgufImage(metal::MetalBackend &backend, GgufSources source, int destin
   uint64_t copyStaging = 0;
   for (const gguf::Copy &copy : image.copies) {
     if (!copy.source.rows || !copy.source.rowBytes ||
-        (copy.conversion == gguf::Conversion::DequantizeQ80 ? copy.source.rowBytes % kQ80BlockBytes
-                                                            : copy.conversion != gguf::Conversion::None &&
-                                                                  copy.source.rowBytes % 4))
+        (copy.conversion == gguf::Conversion::DequantizeQ80   ? copy.source.rowBytes % kQ80BlockBytes
+         : copy.conversion == gguf::Conversion::DequantizeQ4K ? copy.source.rowBytes % kQ4KBlockBytes
+                                                              : copy.conversion != gguf::Conversion::None &&
+                                                                    copy.source.rowBytes % 4))
       throw GgufError("invalid prepared weight copy");
     requireRange(copy.destination, copyBytes(copy), image.bytes);
     // A widened copy stages its F32 values, a dequantized one its blocks and them.
     const uint64_t sourceBytes = copy.source.rows * copy.source.rowBytes;
+    const bool dequantized = copy.conversion == gguf::Conversion::DequantizeQ80 ||
+                             copy.conversion == gguf::Conversion::DequantizeQ4K;
     const uint64_t staged = copy.conversion == gguf::Conversion::WidenToFloat32 ? copyBytes(copy)
-                            : copy.conversion == gguf::Conversion::DequantizeQ80 ? sourceBytes + copyBytes(copy)
-                                                                                 : sourceBytes;
+                            : dequantized                                       ? sourceBytes + copyBytes(copy)
+                                                                                : sourceBytes;
     copyStaging = std::max(copyStaging, std::min(staged, kWeightPreparationStagingBytes));
   }
   {

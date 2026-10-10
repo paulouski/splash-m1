@@ -442,11 +442,12 @@ uint32_t widerThanStaging(Fmt f) {
 
 // One quantized tensor through the production executor, from a file whose
 // data section starts at kSourceOffset, against the CPU reference's planes.
+// With `q50`, the file holds those Q5_0 rows, which preparation reads as the Q8_0 rows `q80` are.
 void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, Fmt f, const Shape &shape,
-                 uint32_t seed) {
+                 uint32_t seed, const std::vector<uint8_t> *q50 = nullptr, const std::vector<uint8_t> *q80 = nullptr) {
   const QuantFormat &layout = kQuantFormats[f];
   const uint32_t rows = shape.rows, K = shape.K, stride = rowBytes(f, K);
-  const std::vector<uint8_t> native = fixture(f, rows, K, seed);
+  const std::vector<uint8_t> native = q80 ? *q80 : fixture(f, rows, K, seed);
   const Packed expected = repack(f, orderedRows(native, stride, shape.order), rows, K, nullptr);
   const uint64_t plane0 = model::kWeightFileAlignment, plane1 = model::alignWeightOffset(plane0 + expected.w0.size());
   const uint64_t meta = layout.plane1_bytes ? model::alignWeightOffset(plane1 + expected.w1.size()) : plane1;
@@ -457,7 +458,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   int output = -1;
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
-    input.insert(input.end(), native.begin(), native.end());
+    input.insert(input.end(), q50 ? q50->begin() : native.begin(), q50 ? q50->end() : native.end());
     splash::test::writeFile(inputPath, input);
     output = open(outputPath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (output < 0 || ftruncate(output, bytes)) throw std::runtime_error("cannot create the repack output");
@@ -468,7 +469,8 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     step.plane0 = plane0;
     step.plane1 = layout.plane1_bytes ? plane1 : 0;
     step.meta = meta;
-    step.sources = {{"fixture", layout.ggml_type, 0, rows, stride, shape.order}};
+    step.sources = {q50 ? model::gguf::TensorRows{"fixture", model::ggml::kQ5_0, 0, rows, K / 32 * 22, shape.order}
+                        : model::gguf::TensorRows{"fixture", layout.ggml_type, 0, rows, stride, shape.order}};
     model::gguf::Image plan;
     plan.bytes = bytes;
     plan.repacks.push_back(step);
@@ -504,6 +506,74 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
     checkRepack(backend, directory, format, {8704, 2048, {}}, 741);
     checkRepack(backend, directory, format, {256, widerThanStaging(format), {}}, 742);
   }
+}
+
+// Q5_0 rows (random codes under a Q8_0 fixture's scales) and the Q8_0 rows ggml's decode of them gives.
+void checkQ50Repack(MetalBackend &backend, const std::filesystem::path &directory) {
+  constexpr uint32_t rows = 320, K = 1024;
+  std::vector<uint8_t> q8 = fixture(Q80, rows, K, 31), q50;
+  std::mt19937 rng(5);
+  for (uint32_t block = 0; block < rows * K / 32; ++block) {
+    uint8_t* d = q8.data() + block * 34;
+    uint8_t b[22];
+    std::memcpy(b, d, 2);
+    for (int i = 2; i < 22; ++i) b[i] = uint8_t(rng());
+    uint32_t high;
+    std::memcpy(&high, b + 2, 4);
+    for (uint32_t j = 0; j < 16; ++j) {
+      d[2 + j] = uint8_t(int8_t(((b[6 + j] & 0xF) | (((high >> j) << 4) & 0x10)) - 16));
+      d[2 + j + 16] = uint8_t(int8_t(((b[6 + j] >> 4) | ((high >> (j + 12)) & 0x10)) - 16));
+    }
+    q50.insert(q50.end(), b, b + 22);
+  }
+  checkRepack(backend, directory, Q80, {rows, K, {}}, 31, &q50, &q8);
+}
+
+// Q4_K rows written as the F32 values of ggml's dequantize_row_q4_K.
+void checkDequantizedQ4K(MetalBackend &backend, const std::filesystem::path &directory) {
+  constexpr uint32_t rows = 4, K = 1024;
+  const uint64_t stride = rowBytes(Q4K, K), bytes = rows * K * sizeof(float);
+  const std::vector<uint8_t> native = fixture(Q4K, rows, K, 2025);
+  const auto inputPath = directory / "dequantize-source", outputPath = directory / "dequantize-output";
+  std::vector<uint8_t> input(kSourceOffset, 0);
+  input.insert(input.end(), native.begin(), native.end());
+  splash::test::writeFile(inputPath, input);
+  const int output = open(outputPath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+  if (output < 0 || ftruncate(output, bytes)) throw std::runtime_error("cannot create the dequantize output");
+  model::gguf::Image plan;
+  plan.bytes = bytes;
+  plan.copies.push_back({0, {"fixture", model::ggml::kQ4_K, 0, rows, stride, {}}, model::gguf::Conversion::DequantizeQ4K});
+  model::WeightSource source(inputPath);
+  source.setDataOffset(kSourceOffset);
+  model::writeGgufImage(backend, source, output, plan, [] {});
+  std::vector<uint8_t> actual(bytes);
+  model::readWeightBytes(output, 0, actual);
+  close(output);
+  std::vector<float> reference;
+  for (uint32_t block = 0; block < rows * K / 256; ++block) {
+    const uint8_t *x = native.data() + block * 144, *q = x + 16;
+    uint16_t dBits, mBits;
+    std::memcpy(&dBits, x, 2);
+    std::memcpy(&mBits, x + 2, 2);
+    const float d = h2f(dBits), min = h2f(mBits);
+    const auto scaleMin = [&](int j, uint8_t &sc, uint8_t &m) {
+      const uint8_t *s = x + 4;
+      if (j < 4) { sc = s[j] & 63; m = s[j + 4] & 63; }
+      else { sc = (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4); m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
+    };
+    int is = 0;
+    for (int j = 0; j < 256; j += 64, q += 32, is += 2) {
+      uint8_t sc, m;
+      scaleMin(is, sc, m);
+      const float d1 = d * sc, m1 = min * m;
+      scaleMin(is + 1, sc, m);
+      const float d2 = d * sc, m2 = min * m;
+      for (int l = 0; l < 32; ++l) reference.push_back(d1 * (q[l] & 0xF) - m1);
+      for (int l = 0; l < 32; ++l) reference.push_back(d2 * (q[l] >> 4) - m2);
+    }
+  }
+  check(actual.size() == reference.size() * 4 && std::memcmp(actual.data(), reference.data(), actual.size()) == 0,
+        "Q4_K rows are written as the exact F32 values of ggml's decode");
 }
 
 // Q8_0 rows written as the F32 values d * q they equal (the MTP head's injection
@@ -629,7 +699,7 @@ void checkQwen4Loader(MetalBackend &backend, const std::filesystem::path &direct
   add("blk.4.nextn.hnorm.weight", {streams}, model::ggml::kF32);
   add("blk.4.nextn.hc_head_norm.weight", {streams}, model::ggml::kF32);
   add("blk.4.nextn.hc_head_down.weight", {streams, g.hyperRank}, kQ8_0);
-  add("blk.4.nextn.hc_head_up.weight", {g.hyperRank, streams}, kQ8_0);
+  add("blk.4.nextn.hc_head_up.weight", {g.hyperRank, streams}, model::ggml::kQ5_0);
   std::vector<test_gguf::Key> mtpKeys = metadata(g);
   mtpKeys[1] = test_gguf::uint32Key("qwen4exp.block_count", g.layers + 1);
   model::gguf::TargetGeometry noPle = g;
@@ -645,7 +715,7 @@ void checkQwen4Loader(MetalBackend &backend, const std::filesystem::path &direct
   check(mtpWeights.mtp && mtpWeights.mtp->embedHidden.inputSize == 2 * layout.hiddenSize &&
             mtpWeights.mtp->block.mixerHyper.inject.sizeBytes() == uint64_t{layout.hyperConnections} * streams * 4 &&
             mtpWeights.files.size() == layout.layers + 3,
-        "the MTP head reads, its Q8_0 injection weights as F32");
+        "the MTP head reads, its Q8_0 injection weights as F32 and a Q5_0 up projection");
 }
 
 } // namespace
@@ -668,6 +738,8 @@ int main(int argc, char **argv) {
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
     checkExecutor(backend, directory.path());
     guarded("Q8_0 dequantization", [&] { checkDequantizedCopy(backend, directory.path()); });
+    guarded("Q4_K dequantization", [&] { checkDequantizedQ4K(backend, directory.path()); });
+    guarded("Q5_0 rows repacked as Q8_0", [&] { checkQ50Repack(backend, directory.path()); });
     guarded("the Flash-Next target loader", [&] { checkQwen4Loader(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",
                 failures);

@@ -97,9 +97,11 @@ struct Fill {
 // How a copy writes each value: as stored, narrowed from F32 to the bf16
 // value it equals exactly (rows the kernels read as bf16), or widened from
 // BF16 to the F32 value it equals (rows the kernels read as F32), or
-// dequantized from Q8_0 blocks to the F32 values d * q they equal (exact in
+// dequantized from Q8_0 or Q4_K blocks to the F32 values they equal (exact in
 // F32; the MTP head's small float tensors).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, DequantizeQ80 };
+// Bytes of a Q5_0 block, which a repack reads as the Q8_0 block it equals exactly.
+inline constexpr uint64_t kQ50BlockBytes = 22;
+enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, DequantizeQ80, DequantizeQ4K };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;

@@ -61,14 +61,19 @@ public:
     if (const GgufTensor *tensor = floatVector(name, elements)) copy(tensorRows(*tensor, 1, tensor->bytes));
   }
 
-  // Quantized rows [N, K] repacked into planes, rows in `order`.
-  void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}) {
-    const GgufTensor *tensor = find(name, quantizedType);
+  // Quantized rows [N, K] repacked into planes, rows in `order`. With `q50`,
+  // Q5_0 rows are accepted and repacked as the Q8_0 rows they equal exactly.
+  void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}, bool q50 = false) {
+    const GgufTensor *tensor = q50 ? find(name, [](uint32_t type) { return quantizedType(type) || type == ggml::kQ5_0; })
+                                   : find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const uint32_t format = gguf_format_of(tensor->type);
+    const bool fromQ50 = tensor->type == ggml::kQ5_0;
+    const uint32_t format = fromQ50 ? GGUF_FMT_Q80 : gguf_format_of(tensor->type);
     Repack repack = planes(format, rows, columns, name);
-    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
+    repack.sources.push_back(
+        tensorRows(*tensor, rows, fromQ50 ? columns / 32 * kQ50BlockBytes : ggufRowBytes(kQuantFormats[format], columns),
+                   order));
     image_.repacks.push_back(std::move(repack));
   }
 
@@ -144,24 +149,25 @@ public:
     copiedRows(*tensor);
   }
 
-  // An F32, BF16 or Q8_0 tensor [rows, columns] as F32 rows: as stored, or the
-  // F32 values BF16 or Q8_0 (d * q) equal exactly. With `withDescriptor` it is
+  // An F32, BF16, Q8_0 or Q4_K tensor [rows, columns] as F32 rows: as stored, or the
+  // F32 values BF16, Q8_0 (d * q) or Q4_K equal exactly. With `withDescriptor` it is
   // a float tensor a projection runs (the QSA indexer's projections, which
   // are BF16), else its rows alone (the hyper-connections' injection
   // weights; the MTP head's are Q8_0).
   void floatRows(const std::string &name, uint64_t rows, uint64_t columns, bool withDescriptor) {
     const GgufTensor *tensor = find(name, [](uint32_t type) {
-      return type == ggml::kF32 || type == ggml::kBF16 || type == ggml::kQ8_0;
+      return type == ggml::kF32 || type == ggml::kBF16 || type == ggml::kQ8_0 || type == ggml::kQ4_K;
     });
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
-      throw GgufError("expected an F32, BF16 or Q8_0 [" + std::to_string(rows) + ", " + std::to_string(columns) +
+      throw GgufError("expected an F32, BF16, Q8_0 or Q4_K [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
     const uint64_t bytes = rows * columns * sizeof(float);
     if (withDescriptor) descriptor(ggml::kF32, rows, columns, {}, {bytes, 0, 0}, name);
     image_.copies.push_back({section(bytes), tensorRows(*tensor, rows, tensor->bytes / rows),
                              tensor->type == ggml::kBF16   ? Conversion::WidenToFloat32
                              : tensor->type == ggml::kQ8_0 ? Conversion::DequantizeQ80
+                             : tensor->type == ggml::kQ4_K ? Conversion::DequantizeQ4K
                                                            : Conversion::None});
   }
 
@@ -340,8 +346,8 @@ void requireMetadata(const GgufFile &file, const TargetGeometry &geometry) {
 void hyperImage(Builder &b, const TargetGeometry &g, const std::string &stem, bool inject) {
   const uint64_t streams = g.streamWidth();
   b.floatNorm(stem + "_norm.weight", streams);
-  b.quantized(stem + "_down.weight", g.hyperRank, streams);
-  b.quantized(stem + "_up.weight", streams, g.hyperRank);
+  b.quantized(stem + "_down.weight", g.hyperRank, streams, {}, true);
+  b.quantized(stem + "_up.weight", streams, g.hyperRank, {}, true);
   if (inject) b.floatRows(stem + "_inject.weight", g.hyperConnections, streams, false);
 }
 
