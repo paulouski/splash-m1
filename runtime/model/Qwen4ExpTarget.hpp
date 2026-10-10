@@ -47,6 +47,7 @@ private:
                                       std::span<const kv::ChunkedPrefillParams> chunks, uint32_t lanes) const;
   void addVerifyProjection(VerifyStep &step, metal::MetalBuffer input, const ops::Projection &projection,
                            metal::MetalBuffer output, ops::PreparedInput prepared = {}) const;
+  void addVerifyLogits(VerifyStep &step, uint32_t firstRow, uint32_t rows) const;
   void addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
                     metal::MetalBuffer output) const;
   void addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer, const QwenAttentionWeights &mixer,

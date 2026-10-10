@@ -602,6 +602,29 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
             GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
 }
 
+bool Linear::rowsEligible(const Projection &p, uint32_t rows) const noexcept {
+  if (p.layout() != WeightLayout::Block32 || p.rotation || !mmaTiles(appleGpuFamily_) || !rows || rows > 4 ||
+      p.destination != FloatOutput::Float32)
+    return false;
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  return segments.size() == 1 && segments.front().formatId == GGUF_FMT_Q4K &&
+         segments.front().outputSize % GGUF_TILE_COLUMNS == 0 && segments.front().inputSize % 256 == 0;
+}
+
+void Linear::addRows(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
+                     metal::MetalBuffer output, uint32_t lanes, uint32_t firstRow, uint32_t rows) const {
+  constexpr uint32_t laneRows = SPLASH_TARGET_VERIFY_ROWS;
+  if (!rowsEligible(p, rows) || !lanes || firstRow + rows > laneRows)
+    throw std::invalid_argument("invalid rows projection");
+  const QuantizedSegment &s = p.blocks().segments.front();
+  const uint32_t n = s.outputSize, k = s.inputSize;
+  if (input.sizeBytes() < uint64_t{lanes} * laneRows * k * 2 ||
+      output.sizeBytes() < uint64_t{lanes} * laneRows * p.outputSize * sizeof(float))
+    throw std::invalid_argument("rows projection buffers are smaller than its lanes");
+  graph.add("gguf_rows_q4k_r" + std::to_string(rows), {std::move(input), s.plane0, s.plane1Slot(), s.meta, std::move(output)},
+            GgufRowsParams{k, p.outputSize, firstRow}, {n / GGUF_TILE_COLUMNS, lanes, 1}, {GGUF_STAGED_THREADS, 1, 1});
+}
+
 bool apple9StagesFormat(uint32_t format) noexcept {
   switch (format) {
   case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS: case GGUF_FMT_IQ2S:

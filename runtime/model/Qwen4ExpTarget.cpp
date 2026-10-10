@@ -6,6 +6,7 @@
 #include "ops/Embedding.hpp"
 #include "ops/Qwen4.hpp"
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <stdexcept>
@@ -356,7 +357,9 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
       step.attentionLayer + geometry_.qwen4.mtpLayers != geometry_.kvLayout.attentionLayers)
     throw std::logic_error("Qwen target layer partition mismatch");
   addVerifyMix(step, weights_.finalHyper, h.streams, b.finalHidden);
-  addVerifyProjection(step, b.finalHidden, weights_.logitsProjection, b.logits);
+  uint32_t logitRows = kLaneRows;
+  if (!b.activeRows.empty()) logitRows = *std::max_element(b.activeRows.begin(), b.activeRows.end());
+  addVerifyLogits(step, 0, logitRows);
   // The MTP head's KV at the step's rows: row r pairs the trunk's streams of
   // the position before with the row's token. The head reads them as its
   // context at the next steps; the rows past each lane's accepted ones are
@@ -387,6 +390,17 @@ void Qwen4ExpTarget::addVerifyProjection(VerifyStep &step, metal::MetalBuffer in
              {.input = std::move(input), .output = std::move(output), .scratch = step.buffers.linearScratch,
               .prepared = std::move(prepared)},
              projection, linear.decodePlan(projection, step.lanes));
+}
+
+// The logits of rows firstRow.. firstRow + rows - 1 of each lane's rows, which are the only ones read; the dot-product
+// kernel writes just those and beats the 8-row tile up to three rows.
+void Qwen4ExpTarget::addVerifyLogits(VerifyStep &step, uint32_t firstRow, uint32_t rows) const {
+  const ops::Linear &linear = operators_.linear();
+  if (rows < 4 && linear.rowsEligible(weights_.logitsProjection, rows))
+    linear.addRows(step.graph, step.buffers.finalHidden, weights_.logitsProjection, step.buffers.logits, step.lanes,
+                   firstRow, rows);
+  else
+    addVerifyProjection(step, step.buffers.finalHidden, weights_.logitsProjection, step.buffers.logits);
 }
 
 void Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
@@ -495,7 +509,7 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
                 std::span(active).first(step.lanes));
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addVerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden);
-  addVerifyProjection(step, b.finalHidden, weights_.logitsProjection, b.logits);
+  addVerifyLogits(step, limit - 1, 1);
 }
 
 void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, const QwenTargetVerifyBuffers &b,

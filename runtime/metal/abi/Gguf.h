@@ -76,6 +76,15 @@ struct GgufDecodeFusedParams {
 };
 static_assert(sizeof(GgufDecodeFusedParams) == 48, "GGUF fused decode parameters are 48 bytes on both sides");
 
+// A few rows of a decode projection by dot products over the packed planes (kernels/decode/linear_gguf_rows.metal):
+// rows first_row .. first_row + R - 1 of each of grid.y lanes' SPLASH_TARGET_VERIFY_ROWS rows, fp32 out[row][column].
+struct GgufRowsParams {
+  uint32_t input_size; // K
+  uint32_t out_stride; // columns of a destination row
+  uint32_t first_row;  // within a lane's rows
+};
+static_assert(sizeof(GgufRowsParams) == 12, "GGUF rows parameters are 12 bytes on both sides");
+
 struct GgufEmbedParams {
   uint32_t rows;
   uint32_t vocabulary;

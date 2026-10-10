@@ -648,6 +648,60 @@ void flashNextShapes(MetalBackend &backend, const Linear &linear) {
           std::to_string(checks) + " decode and prefill runs within fp64, padding columns untouched");
 }
 
+// ---------------------------------------------------------------- rows
+// The dot-product kernel of the vocabulary head (Linear::addRows, Q4_K into fp32) on [512, 2560] with padding columns:
+// every lane count, first row and one to three rows, on dense and sparse inputs. The rows asked for lie within fp64
+// and the rows and padding columns not asked for, the guards and the counters stay as they were; outside its domain
+// the projection is not eligible.
+void rowsKernel(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, K = 2560, columns = N + kPadding;
+  const Tensor w = tensor(backend, Q4K, N, K);
+  Projection p = projection({&w}, columns);
+  p.destination = FloatOutput::Float32;
+  if (!linear.rowsEligible(p, 1) || !linear.rowsEligible(p, 4) || linear.rowsEligible(p, 0) || linear.rowsEligible(p, 5)) {
+    fail("rows eligibility of a Q4_K fp32 projection");
+    return;
+  }
+  Projection narrow = p;
+  narrow.destination = FloatOutput::BFloat16;
+  if (linear.rowsEligible(narrow, 1)) fail("a bf16 destination is not eligible for the rows kernel");
+  size_t checks = 0;
+  for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse}) {
+    const std::vector<float> x = activations(inputs, kMaximumRows, K);
+    const std::vector<Dot> dots = products({&w}, columns, x, kMaximumRows);
+    for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
+      for (uint32_t first = 0; first < kLaneRows; first += 3)
+        for (uint32_t rows = 1; rows <= 3 && first + rows <= kLaneRows; ++rows) {
+          const std::string label = std::string(inputs == Inputs::Sparse ? "sparse" : "dense") + " L=" +
+                                    std::to_string(lanes) + " rows " + std::to_string(first) + ".." +
+                                    std::to_string(first + rows - 1);
+          const Guarded input = bfloats(backend, storageRows(x, K, lanes * kLaneRows, lanes * kLaneRows));
+          const Guarded output(backend, uint64_t{lanes} * kLaneRows * columns * sizeof(float), 0xFF);
+          CommandGraph graph;
+          linear.addRows(graph, input.view, p, output.view, lanes, first, rows);
+          static_cast<void>(backend.submitCommand(graph.dispatches()));
+          if (!input.intact() || !output.intact()) fail(label + ": a write past a buffer");
+          const auto *values = static_cast<const uint32_t *>(output.view.contents());
+          uint64_t wrong = 0;
+          for (uint32_t lane = 0; lane < lanes; ++lane)
+            for (uint32_t row = 0; row < kLaneRows; ++row)
+              for (uint32_t c = 0; c < columns; ++c) {
+                const uint64_t o = (uint64_t{lane} * kLaneRows + row) * columns + c;
+                if (row >= first && row < first + rows && c < N) {
+                  const Dot &d = dots[uint64_t{lane} * kLaneRows * columns + uint64_t{row} * columns + c];
+                  wrong += !(std::fabs(std::bit_cast<float>(values[o]) - d.value) <= projectionBound(d, true));
+                } else {
+                  wrong += values[o] != 0xFFFFFFFFu;
+                }
+              }
+          if (wrong) fail(label + ": " + std::to_string(wrong) + " values outside fp64 or written unasked");
+          ++checks;
+        }
+  }
+  section("rows kernel: Q4_K fp32 dot products of one to three rows, 1-4 lanes, any first row, dense and sparse inputs, " +
+          std::to_string(checks) + " runs within fp64, other rows and padding untouched");
+}
+
 // ---------------------------------------------------------------- split visibility
 // Two projections of a decode step run back to back and share one split scratch, as every GGUF projection of a step
 // does, at each pair of K splits the tile's policy (Apple9: register, Apple10: staged) picks for 8-80 cores. The
@@ -931,6 +985,7 @@ int main(int argc, char **argv) {
       }
       prefill(backend, linear);
       flashNextShapes(backend, linear);
+      rowsKernel(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
