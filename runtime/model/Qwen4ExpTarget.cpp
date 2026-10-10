@@ -1,6 +1,7 @@
 #include "model/Qwen4ExpTarget.hpp"
 
 #include "metal/abi/Gguf.h"
+#include "metal/abi/MoE.h"
 #include "metal/abi/Qwen4.h"
 #include "model/PleStore.hpp"
 #include "ops/Embedding.hpp"
@@ -34,6 +35,14 @@ metal::MetalBuffer rowsFrom(metal::MetalBackend &backend, const metal::MetalBuff
                             uint32_t width) {
   const uint64_t offset = uint64_t{begin} * width * sizeof(T);
   return backend.view(buffer, offset, buffer.sizeBytes() - offset);
+}
+
+// SPLASH_MOE_STATS: the layer's routed experts of the step's rows, kept for the host.
+void addMoeStats(metal::CommandGraph &graph, const Qwen4Buffers &h, const ops::MoeScratch &moe,
+                 const ops::MoeShape &shape, uint32_t layer, uint32_t rows) {
+  const MoeStatsParams params{layer, rows, shape.expertsPerToken, shape.routesPerToken(), h.moeStatsRows};
+  graph.add("moe_stats_record", {moe.selectedExperts, moe.routingWeights, h.moeStats}, params,
+            {(rows * shape.expertsPerToken + 63) / 64, 1, 1}, {64, 1, 1});
 }
 
 // The QSA indexer's fp32 projections of `rows` rows: one float segment each
@@ -259,6 +268,7 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
     mix(layer.ffnHyper, b.normalized, h.streams);
     ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
+    if (h.moeStats) addMoeStats(graph, h, b.moe, geometry_.moeShape(), index, rows);
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
   }
   if (step.gdnLayer != geometry_.stateLayout.layers ||
@@ -351,6 +361,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
     addVerifyMix(step, layer.ffnHyper, h.streams, b.normalized);
     ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, b.activeRows);
+    if (h.moeStats) addMoeStats(graph, h, b.moe, geometry_.moeShape(), index, rows);
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
   }
   if (step.gdnLayer != geometry_.stateLayout.layers ||

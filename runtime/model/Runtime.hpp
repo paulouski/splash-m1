@@ -19,6 +19,12 @@ inline std::FILE *gAcceptLog = std::getenv("SPLASH_ACCEPT_LOG")
                                    ? std::fopen(std::getenv("SPLASH_ACCEPT_LOG"), "a")
                                    : nullptr;
 
+// Analysis tooling only: SPLASH_MOE_STATS=<path> writes the routed experts of
+// every retained row (Runtime.mm recordMoeStats; Qwen3.8-Flash-Next only).
+inline std::FILE *gMoeStats = std::getenv("SPLASH_MOE_STATS")
+                                  ? std::fopen(std::getenv("SPLASH_MOE_STATS"), "wb")
+                                  : nullptr;
+
 class Runtime final : public RuntimeModel {
 public:
   explicit Runtime(RuntimeContext context);

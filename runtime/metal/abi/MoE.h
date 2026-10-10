@@ -52,6 +52,20 @@ struct MoeGatherParams {
 static_assert(sizeof(MoeGatherParams) == 12,
               "MoE gather parameters are 12 bytes on both sides");
 
+// SPLASH_MOE_STATS: copies a layer's routed expert ids and routing weights
+// (rows x top_k of the rows x routes_per_row select output) to slot
+// [layer][row][route] of a stats buffer that holds capacity rows per layer.
+struct MoeStatsParams {
+  uint32_t layer;
+  uint32_t rows;
+  uint32_t top_k;
+  uint32_t routes_per_row;
+  uint32_t capacity;
+};
+
+static_assert(sizeof(MoeStatsParams) == 20,
+              "MoE stats parameters are 20 bytes on both sides");
+
 struct MoeExpertParams {
   uint32_t input_size;
   uint32_t output_size;

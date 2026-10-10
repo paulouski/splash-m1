@@ -455,6 +455,22 @@ kernel void moe_route_select_f32_e512(
                                           simd_group, row_scores, ordered, scalar_partials);
 }
 
+// SPLASH_MOE_STATS only: one thread per routed (row, route) pair.
+kernel void moe_stats_record(
+    device const uint *selected [[buffer(0)]],
+    device const float *routing_weights [[buffer(1)]],
+    device uint2 *stats [[buffer(2)]],
+    constant MoeStatsParams &params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index >= params.rows * params.top_k)
+    return;
+  const uint row = index / params.top_k;
+  const uint route = index % params.top_k;
+  const uint source = row * params.routes_per_row + route;
+  stats[(params.layer * params.capacity + row) * params.top_k + route] =
+      uint2(selected[source], as_type<uint>(routing_weights[source]));
+}
+
 // Sorts one command's routes by expert. Tile t covers grouped rows
 // [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
 // that expert's last route that its last tile's matmul reads

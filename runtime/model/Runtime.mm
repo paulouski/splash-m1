@@ -327,6 +327,9 @@ struct Runtime::Impl {
     const char *raw = std::getenv("SPLASH_DECODE_M1");
     return raw && std::string_view(raw) == "1";
   }();
+  // SPLASH_MOE_STATS: the buffers the target graphs keep each layer's routes in.
+  MetalBuffer moeStatsPrefill;
+  MetalBuffer moeStatsDecode;
   MetalBuffer gemvStaged;
   MetalBuffer gemvPartials;
   explicit Impl(RuntimeContext value)
@@ -370,6 +373,13 @@ struct Runtime::Impl {
     decodeArena =
         std::make_unique<DecodeArena>(backend, geometry, operators, decodeLanes);
     penaltyTable = decodeArena->packed(DecodeTensor::PenaltyState, decodeArena->laneCount());
+    if (gMoeStats && geometry.target.qwen4) {
+      const uint64_t routes = uint64_t{geometry.target.layers} * geometry.target.moeShape().expertsPerToken;
+      moeStatsPrefill = backend.allocateBuffer(routes * prefillRows * sizeof(uint64_t), BufferStorage::Shared,
+                                               "moe-stats-prefill");
+      moeStatsDecode = backend.allocateBuffer(routes * kDecodeRows * decodeLanes * sizeof(uint64_t),
+                                              BufferStorage::Shared, "moe-stats-decode");
+    }
     if (kvPages.layout().indexDimension)
       for (uint32_t layer = 0; layer < kvPages.layout().attentionLayers; ++layer) {
         const kv::PageStorage::IndexPlacement placement = kvPages.indexPlacement(layer);
@@ -844,6 +854,30 @@ struct Runtime::Impl {
         decodeArena->get(lane, DecodeTensor::ProposalProbs), "reject q probs");
     std::fill(ids, ids + SPLASH_DRAFT_CANDIDATES, kNoToken);
     std::fill(probs, probs + SPLASH_DRAFT_CANDIDATES, std::numeric_limits<float>::max());
+  }
+
+  // One record per row: kind ('P' prefill, 'D' decode), token, request, position, then every
+  // layer's routed (expert id, fp32 weight) pairs; the file starts with "MOES", layers, routes.
+  void recordMoeStats(char kind, uint64_t request, uint64_t firstPosition, std::span<const uint32_t> tokens,
+                      const MetalBuffer &stats, uint32_t firstRow, uint32_t capacity) const {
+    const uint32_t layers = geometry.target.layers, routes = geometry.target.moeShape().expertsPerToken;
+    static bool started = false;
+    if (!started) {
+      started = true;
+      const uint32_t header[4] = {0x534f454d, 1, layers, routes};
+      std::fwrite(header, sizeof header, 1, gMoeStats);
+    }
+    const auto *pairs = contents<uint64_t>(stats, "moe stats");
+    for (uint32_t row = 0; row < tokens.size(); ++row) {
+      const uint32_t head[2] = {static_cast<uint32_t>(kind), tokens[row]};
+      const uint64_t ids[2] = {request, firstPosition + row};
+      std::fwrite(head, sizeof head, 1, gMoeStats);
+      std::fwrite(ids, sizeof ids, 1, gMoeStats);
+      for (uint32_t layer = 0; layer < layers; ++layer)
+        std::fwrite(pairs + (uint64_t{layer} * capacity + firstRow + row) * routes, sizeof(uint64_t), routes,
+                    gMoeStats);
+    }
+    std::fflush(gMoeStats);
   }
 
   void dumpLogits(uint32_t lane, uint32_t firstRow, uint32_t rows) const {
@@ -1433,6 +1467,8 @@ struct Runtime::Impl {
     buffers.moe = prefillArena->moeScratch();
     buffers.qwen4 = prefillArena->qwen4();
     bindQsa(buffers.qwen4, kQsaPrefillScoreRows);
+    buffers.qwen4.moeStats = moeStatsPrefill;
+    buffers.qwen4.moeStatsRows = prefillRows;
     const MetalBuffer finalHidden = targetModel.addPrefill(
         graph, std::move(buffers),
         std::span(modelSequences).first(batch.sequences.size()), batch.rows,
@@ -1689,6 +1725,8 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     buffers.qwen4 = decodeArena->qwen4(storage);
+    buffers.qwen4.moeStats = moeStatsDecode;
+    buffers.qwen4.moeStatsRows = kDecodeRows * decodeLanes;
     buffers.activeRows = activeRows;
     bindQsa(buffers.qwen4, kDecodeRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
@@ -1944,6 +1982,10 @@ struct Runtime::Impl {
             entry, lane, laneResult.retained - 1, targetTokens[laneResult.retained - 1]);
       }
       dumpLogits(lane, 0, laneResult.retained);
+      if (gMoeStats && moeStatsDecode) {
+        recordMoeStats('D', entry.id, items[lane].logicalPosition, output, moeStatsDecode, lane * kDecodeRows,
+                       kDecodeRows * decodeLanes);
+      }
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
       entry.verifyMaskInFlight = false;
@@ -2507,8 +2549,20 @@ Runtime::prefillAsync(const BatchPlan &plan,
   CommandTicket command = impl_->backend.submitCommandAsync(
       graph.dispatches(), std::move(completion), maxDispatchesPerCommandBuffer);
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, captures,
+  std::vector<std::vector<uint32_t>> statsTokens;
+  if (gMoeStats)
+    for (const ModelBatchItem &item : items)
+      statsTokens.emplace_back(item.inputTokens.begin(), item.inputTokens.end());
+  auto finish = [impl, entries, captures, statsTokens = std::move(statsTokens),
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
+    if (gMoeStats && impl->moeStatsPrefill) {
+      uint32_t rowBegin = 0;
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        impl->recordMoeStats('P', entries[lane]->id, items[lane].logicalPosition, statsTokens[lane],
+                             impl->moeStatsPrefill, rowBegin, impl->prefillRows);
+        rowBegin += items[lane].tokenCount;
+      }
+    }
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const uint64_t chunkEnd = items[lane].logicalPosition + items[lane].tokenCount;
       for (Impl::ImageState &image : entries[lane]->images) {

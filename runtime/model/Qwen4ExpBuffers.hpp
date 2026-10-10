@@ -45,6 +45,10 @@ struct Qwen4Geometry final {
 // slot indices into them), projections, gated values and convolution inputs,
 // and the QSA indexer's scratch.
 struct Qwen4Buffers final {
+  // SPLASH_MOE_STATS only: where each layer's routed expert ids and weights are
+  // kept (uint2 per route, [layer][row][route]) for moeStatsRows rows a layer.
+  metal::MetalBuffer moeStats;
+  uint32_t moeStatsRows = 0;
   metal::MetalBuffer streams;
   metal::MetalBuffer normalized;
   metal::MetalBuffer low;
