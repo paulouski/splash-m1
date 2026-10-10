@@ -1,0 +1,9 @@
+# B1-uniform: experts 38.97 GiB, non-expert 3.89 GiB (no PLE table). First match wins; unlisted tensors are copied.
+# IQ2_S on the three most concentrated mid/late layers (routing stats r8) to bring the experts under 39 GiB.
+blk\.(31|43|44)\.ffn_(gate|up)_exps\.weight = IQ2_S
+blk\.[0-9]+\.ffn_(gate|up)_exps\.weight = IQ3_XXS
+blk\.[0-9]+\.ffn_down_exps\.weight = Q2_0
+blk\.[0-9]+\.(attn_q|attn_output|attn_qkv|attn_gate|ffn_gate_shexp|ffn_up_shexp)\.weight = Q5_K
+blk\.[0-9]+\.(attn_k|attn_v|ssm_out)\.weight = Q6_K
+output\.weight = Q6_K
+token_embd\.weight = Q6_K
