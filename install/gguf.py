@@ -402,6 +402,7 @@ TENSOR_TYPES = {
     29: "IQ1_M",
     30: "BF16",
     39: "MXFP4",
+    42: "Q2_0",
     142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
@@ -424,6 +425,7 @@ QUANTIZED_TYPES = {
     "IQ4_XS",
     "MXFP4",
     "PQ2_0",
+    "Q2_0",
 }
 # The token rows the embedding kernels gather (gguf_embedding_format in
 # runtime/metal/abi/Gguf.h).
@@ -440,6 +442,7 @@ EMBEDDING_TYPES = {
     "IQ4_NL",
     "IQ4_XS",
     "PQ2_0",
+    "Q2_0",
 }
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,

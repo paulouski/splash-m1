@@ -409,12 +409,14 @@ struct Model {
 // test rotates through every format (gate, up and down in formats f, f + 1, f + 2
 // and the shared expert's in f + 3, f + 4, f + 5); Flash-Next's has the UD-IQ1_S
 // and UD-Q2_K_XL checkpoints' (each gate/up format of the routed experts, IQ4_NL
-// down, Q5_K (a few layers Q6_K) gate/up and Q8_0 down of the shared expert).
+// down, Q5_K (a few layers Q6_K) gate/up and Q8_0 down of the shared expert), and ISTA's IQ3_XXS ones (IQ3_XXS,
+// IQ3_S or IQ2_S gate/up, Q2_0 down, whose 640 inputs forbid a 256-block type).
 #ifdef GGUF_MOE_FLASH_NEXT
 const std::vector<std::array<Fmt, 6>> kFormatSets = {
     {IQ1S, IQ1S, IQ4NL, Q5K, Q5K, Q80}, {IQ2XXS, IQ2XXS, IQ4NL, Q5K, Q5K, Q80},
     {IQ2XS, IQ2XS, IQ4NL, Q5K, Q5K, Q80}, {IQ3XXS, IQ3XXS, IQ4NL, Q5K, Q5K, Q80},
-    {IQ1S, IQ1S, IQ4NL, Q6K, Q6K, Q80}};
+    {IQ1S, IQ1S, IQ4NL, Q6K, Q6K, Q80}, {IQ3XXS, IQ3XXS, Q20, Q5K, Q5K, Q80}, {IQ3S, IQ3S, Q20, Q5K, Q5K, Q80},
+    {IQ2S, IQ2S, Q20, Q5K, Q5K, Q80}, {IQ3XXS, IQ2S, Q20, Q5K, Q5K, Q80}};
 #else
 std::vector<std::array<Fmt, 6>> rotatingFormats() {
   std::vector<std::array<Fmt, 6>> sets;

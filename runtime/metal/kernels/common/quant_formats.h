@@ -438,6 +438,17 @@ struct FmtPQ20 {
   static uint4 codes(Chunk q) { return (uint4(q) >> uint4(0, 4, 8, 12)) & 0x00030003u; }
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
 };
+// Q2_0 (ggml type 42): PQ2_0's codes and value d * (q - 1) over blocks of 64 elements, two groups.
+struct FmtQ20 {
+  QUANT_FORMAT(GGUF_FMT_Q20, QuantLinear, 1, 32, false);
+  struct Payload { uint2 a; }; typedef uint Chunk; typedef ushort Meta;
+  static Payload load(device uchar *p0, device uchar *) { return {*((device uint2 *)p0)}; }
+  static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
+  static Chunk chunk(Payload w, ushort c) { return quant_spread2(w.a[c >> 1] >> (16 * (c & 1))); }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return quant_spread2(*((device ushort *)(p0 + 2 * c))); }
+  static uint4 codes(Chunk q) { return (uint4(q) >> uint4(0, 4, 8, 12)) & 0x00030003u; }
+  static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
+};
 
 #undef QUANT_FORMAT
 
@@ -445,7 +456,7 @@ struct FmtPQ20 {
 #define QUANT_FORMATS(X)                                                                                            \
   X(FmtQ4K, q4k) X(FmtIQ4XS, iq4xs) X(FmtIQ4NL, iq4nl) X(FmtQ5K, q5k) X(FmtQ6K, q6k) X(FmtQ3K, q3k) X(FmtQ80, q80) \
   X(FmtIQ3S, iq3s) X(FmtQ2K, q2k) X(FmtIQ3XXS, iq3xxs) X(FmtIQ2XXS, iq2xxs) X(FmtIQ2XS, iq2xs) X(FmtIQ2S, iq2s)      \
-  X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20)
+  X(FmtIQ1S, iq1s) X(FmtIQ1M, iq1m) X(FmtQ40, q40) X(FmtQ41, q41) X(FmtMXFP4, mxfp4) X(FmtPQ20, pq20) X(FmtQ20, q20)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids

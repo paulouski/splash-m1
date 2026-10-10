@@ -27,7 +27,7 @@
 //     16 + 4p.
 //   Every other field is a little-endian bit string of the 32 slots: IQ4 and
 //     MXFP4 indices (4 bits, so byte p of word c is pair p), Q8_0 values (8),
-//     Q6_K high, Q3_K low, Q2_K and PQ2_0 bits (2), Q5_K fifth and Q3_K hmask
+//     Q6_K high, Q3_K low, Q2_K, Q2_0 and PQ2_0 bits (2), Q5_K fifth and Q3_K hmask
 //     bits (1).
 //   IQ3_S word c: bits 0..7 and 8..15 the low grid index bits of elements
 //     4c..4c+3 and 16+4c..16+4c+3, 16..23 the sign bits of slots 8c..8c+7,
@@ -65,7 +65,8 @@
 #define GGUF_FMT_Q41 16u
 #define GGUF_FMT_MXFP4 17u
 #define GGUF_FMT_PQ20 18u
-#define GGUF_FMT_COUNT 19u
+#define GGUF_FMT_Q20 19u
+#define GGUF_FMT_COUNT 20u
 
 struct QuantFormat {
   uint32_t ggml_type;      // GGUF tensor type
@@ -98,6 +99,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {3, 32, 20, 16, 0, 4, 1, "q41"},      // meta: d, m
     {39, 32, 17, 16, 0, 1, 1, "mxfp4"},   // meta: e
     {142, 128, 34, 8, 0, 2, 4, "pq20"},   // Prism's block_pq2_0, one d per 128 elements; meta: d
+    {42, 64, 18, 8, 0, 2, 2, "q20"},      // block_q2_0, one d per 64 elements; meta: d
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.
