@@ -188,6 +188,46 @@ void hyperTest(MetalBackend &backend) {
   check(okI, "hyper init: every stream the embedding");
 }
 
+// The hyper norm over widths and stream counts the main test does not reach: a hidden size off the
+// threads' stride, fewer streams, the model's width.
+void hyperNormShapeTest(MetalBackend &backend, uint32_t rows, uint32_t hidden, uint32_t streams) {
+  std::mt19937 rng(hidden + streams);
+  const uint32_t width = hidden * streams;
+  const ops::HyperShape shape{hidden, streams, 64};
+  const auto x = randoms(rng, rows * width, 1.5f), norm = randoms(rng, width, 0.3f),
+             inject = randoms(rng, streams * width, 0.02f);
+  MetalBuffer xs = upload(backend, x), normalized = scratch(backend, rows * width * 2),
+              weights = scratch(backend, rows * streams * 4);
+  CommandGraph graph;
+  ops::Qwen4::addNorm(graph, xs, NormWeights{upload(backend, norm), true}, upload(backend, inject), normalized, weights,
+                      shape, rows);
+  run(backend, graph);
+  const auto gotN = download<uint16_t>(normalized, rows * width);
+  const auto gotW = download<float>(weights, rows * streams);
+  bool okN = true, okW = true;
+  for (uint32_t r = 0; r < rows; ++r) {
+    std::vector<double> xn(width);
+    for (uint32_t s = 0; s < streams; ++s) {
+      double sum = 0;
+      for (uint32_t d = 0; d < hidden; ++d) sum += double(x[r * width + s * hidden + d]) * x[r * width + s * hidden + d];
+      const double scale = 1.0 / std::sqrt(sum / hidden + 1e-6);
+      for (uint32_t d = 0; d < hidden; ++d) {
+        const uint32_t c = s * hidden + d;
+        xn[c] = x[r * width + c] * scale * norm[c];
+        okN &= closeBf16(f32(gotN[r * width + c]), xn[c]);
+      }
+    }
+    for (uint32_t j = 0; j < streams; ++j) {
+      double dot = 0;
+      for (uint32_t c = 0; c < width; ++c) dot += inject[j * width + c] * xn[c];
+      okW &= std::fabs(gotW[r * streams + j] - 2 * sigmoid(dot / streams)) <= 1e-4;
+    }
+  }
+  const std::string shapeName = " (" + std::to_string(hidden) + " x " + std::to_string(streams) + ")";
+  check(okN, "hyper norm" + shapeName + ": normalized streams");
+  check(okW, "hyper norm" + shapeName + ": injection weights");
+}
+
 void pleTest(MetalBackend &backend) {
   std::mt19937 rng(11);
   const uint32_t rows = 7, hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
@@ -569,6 +609,8 @@ int main(int argc, const char *argv[]) {
       if (argc != 2) throw std::runtime_error("usage: qwen4-kernels METALLIB");
       MetalBackend backend(argv[1]);
       hyperTest(backend);
+      hyperNormShapeTest(backend, 3, 300, 2);
+      hyperNormShapeTest(backend, 8, 2560, 4);
       pleTest(backend);
       qsaTest(backend);
       mtpTest(backend);

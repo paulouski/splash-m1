@@ -36,7 +36,13 @@ inline void reduce_streams(thread float (&values)[kStreams], uint streams, threa
 // The first mix step of a row: each stream's RMS norm times the mix's norm
 // weights (the GGUF stores 1 + w) into bf16 rows of streams * hidden, and,
 // when it injects, the injection weights 2 sigmoid(inject(normalized) /
-// streams) of the block's output into each stream.
+// streams) of the block's output into each stream. One threadgroup of
+// kStreams * kRowThreads threads per row, kRowThreads to a stream: a thread
+// holds values t, t + 256, ... of its stream in registers and loads them
+// unconditionally (past the end it reads the last value and drops it), so its
+// loads issue together.
+constant constexpr uint kNormPerThread = QWEN4_NORM_MAXIMUM_HIDDEN / kRowThreads;
+[[max_total_threads_per_threadgroup(kStreams * kRowThreads)]]
 kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
                              device const float *norm [[buffer(1)]],
                              device const float *inject [[buffer(2)]],
@@ -47,32 +53,53 @@ kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
                              uint tid [[thread_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float scratch[kSimdgroups * kStreams];
+  threadgroup float sum_scratch[kStreams * kSimdgroups], dot_scratch[kStreams * kStreams * kSimdgroups];
   if (row >= p.rows) return;
-  const uint width = p.streams * p.hidden;
-  device const float *x = streams + ulong(row) * width;
-  float sums[kStreams] = {0.0f, 0.0f, 0.0f, 0.0f};
-  for (uint s = 0; s < p.streams; ++s)
-    for (uint d = tid; d < p.hidden; d += kRowThreads) {
-      const float v = x[s * p.hidden + d];
-      sums[s] += v * v;
-    }
-  reduce_streams(sums, p.streams, scratch, lane, sg);
-  float scale[kStreams];
-  for (uint s = 0; s < p.streams; ++s) scale[s] = rsqrt(sums[s] / p.hidden + QWEN4_RMS_EPSILON);
-  float dots[kStreams] = {0.0f, 0.0f, 0.0f, 0.0f};
-  device bfloat *out = normalized + ulong(row) * width;
-  for (uint s = 0; s < p.streams; ++s)
-    for (uint d = tid; d < p.hidden; d += kRowThreads) {
-      const uint c = s * p.hidden + d;
-      const float v = x[c] * scale[s] * norm[c];
-      out[c] = bfloat(v);
-      if (p.inject)
-        for (uint j = 0; j < p.streams; ++j) dots[j] += inject[ulong(j) * width + c] * v;
-    }
+  const uint s = tid / kRowThreads, t = tid % kRowThreads;
+  const bool active = s < p.streams;
+  const uint stream = active ? s : 0, width = p.streams * p.hidden;
+  float values[kNormPerThread];
+  float sum = 0.0f;
+#pragma unroll
+  for (uint i = 0; i < kNormPerThread; ++i) {
+    const uint d = t + i * kRowThreads;
+    const float loaded = streams[ulong(row) * width + stream * p.hidden + min(d, p.hidden - 1)];
+    values[i] = active && d < p.hidden ? loaded : 0.0f;
+  }
+#pragma unroll
+  for (uint i = 0; i < kNormPerThread; ++i) sum += values[i] * values[i];
+  sum = simd_sum(sum);
+  if (lane == 0) sum_scratch[sg] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint g = 0; g < kSimdgroups; ++g) total += sum_scratch[s * kSimdgroups + g];
+  const float scale = rsqrt(total / p.hidden + QWEN4_RMS_EPSILON);
+  float v[kNormPerThread];
+#pragma unroll
+  for (uint i = 0; i < kNormPerThread; ++i) {
+    const uint d = t + i * kRowThreads;
+    v[i] = values[i] * scale * norm[stream * p.hidden + min(d, p.hidden - 1)];
+    if (active && d < p.hidden) normalized[ulong(row) * width + s * p.hidden + d] = bfloat(v[i]);
+    if (!active || d >= p.hidden) v[i] = 0.0f;
+  }
   if (!p.inject) return;
-  reduce_streams(dots, p.streams, scratch, lane, sg);
-  if (tid < p.streams) weights[row * p.streams + tid] = 2.0f * sigmoid_of(dots[tid] / p.streams);
+  // The thread's terms of every injection weight; each threadgroup of 256
+  // reduces its stream's terms and the weight adds the streams' in order.
+#pragma clang loop unroll(disable)
+  for (uint j = 0; j < kStreams; ++j) {
+    float dot = 0.0f;
+#pragma unroll
+    for (uint i = 0; i < kNormPerThread; ++i)
+      dot += inject[ulong(min(j, p.streams - 1)) * width + stream * p.hidden + min(t + i * kRowThreads, p.hidden - 1)] * v[i];
+    dot = simd_sum(dot);
+    if (lane == 0) dot_scratch[j * kStreams * kSimdgroups + sg] = dot;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < p.streams) {
+    float dot = 0.0f;
+    for (uint g = 0; g < kStreams * kSimdgroups; ++g) dot += dot_scratch[tid * kStreams * kSimdgroups + g];
+    weights[row * p.streams + tid] = 2.0f * sigmoid_of(dot / p.streams);
+  }
 }
 
 // silu(low / streams) of the mix's low-rank projection, in place.
@@ -405,3 +432,4 @@ kernel void qwen4_ple_hash(device const uint *tokens [[buffer(0)]],
     }
   }
 }
+

@@ -10,8 +10,10 @@
 
 // The RMS epsilon of every Flash-Next norm (attention.layer_norm_rms_epsilon).
 #define QWEN4_RMS_EPSILON 1e-6f
-// Threads of the per-row kernels: one threadgroup per row.
+// Threads of the per-row kernels: one threadgroup per row (hyper_norm: per stream).
 #define QWEN4_ROW_THREADS 256u
+// The widest stream a norm holds in registers.
+#define QWEN4_NORM_MAXIMUM_HIDDEN 3072u
 // The most streams a mix reads.
 #define QWEN4_MAXIMUM_STREAMS 4u
 

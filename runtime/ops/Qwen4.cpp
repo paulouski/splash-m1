@@ -39,12 +39,13 @@ void Qwen4::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, cons
                     metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
                     HyperShape shape, uint32_t rows) {
   requireShape(shape);
+  if (shape.hidden > QWEN4_NORM_MAXIMUM_HIDDEN) throw std::invalid_argument("hyper-connection streams too wide for the norm");
   const bool injects = static_cast<bool>(inject);
   // A mix without injection binds its norm in the unused slots.
   graph.add("qwen4_hyper_norm",
             {std::move(streams), norm.buffer, injects ? inject : norm.buffer, std::move(normalized),
              injects ? weights : norm.buffer},
-            hyperParams(shape, rows, injects), {rows, 1, 1}, {kThreads, 1, 1});
+            hyperParams(shape, rows, injects), {rows, 1, 1}, {kThreads * QWEN4_MAXIMUM_STREAMS, 1, 1});
 }
 
 void Qwen4::addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows) {
