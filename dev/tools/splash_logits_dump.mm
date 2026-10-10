@@ -81,8 +81,13 @@ int main(int argc, char **argv) {
       // One lane's pages: contiguous ids 0..need-1 backed by whole extents.
       const uint32_t need = 2048 / kv::kPageTokens + 2;
       const uint32_t extent = context.kvPages.extentPages();
-      for (uint32_t e = 0; e < (need + extent - 1) / extent; ++e)
-        if (!context.kvPages.allocateExtent(e)) throw std::runtime_error("KV extent refused");
+      for (uint32_t e = 0; e < (need + extent - 1) / extent; ++e) {
+        try {
+          if (!context.kvPages.allocateExtent(e)) throw std::runtime_error("KV extent refused");
+        } catch (const std::logic_error &) {
+          // The warm-up already backs it.
+        }
+      }
       std::vector<uint32_t> pageTable(need);
       std::iota(pageTable.begin(), pageTable.end(), 0);
 
