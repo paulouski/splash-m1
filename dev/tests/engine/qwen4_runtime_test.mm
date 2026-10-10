@@ -658,6 +658,24 @@ void run(const std::string &metallib) {
   }
   std::printf("MTP decode == draft-less decode (or a near tie)\n");
 
+  // A budget that ends mid-cycle leaves the last cycle's later rows inactive in the MoE (they select no expert):
+  // the tokens and logprobs it retains are the long run's.
+  const auto samePrefix = [&](Session &run, const Run &whole, const char *what) {
+    for (const uint32_t budget : {2U, 3U, 5U, 6U, 9U, 11U}) {
+      const Run part = run.generate(prompt, budget, 8);
+      require(part.tokens.size() == budget && part.logprobs.size() >= budget &&
+                  std::equal(part.tokens.begin(), part.tokens.end(), whole.tokens.begin()),
+              std::string(what) + " with a budget of " + std::to_string(budget) + " selects other tokens");
+      for (uint32_t i = 0; i < budget; ++i)
+        require(part.logprobs[i].topIds == whole.logprobs[i].topIds &&
+                    part.logprobs[i].topLogprobs == whole.logprobs[i].topLogprobs,
+                std::string(what) + " with a budget of " + std::to_string(budget) + " reports other logprobs");
+    }
+  };
+  samePrefix(session, decoded, "draft-less decode");
+  samePrefix(drafting, mtp, "MTP decode");
+  std::printf("budgets ending mid-cycle == the long run's prefix\n");
+
   // Chunked prefill carries the head's streams and KV across chunks, and a batch keeps each lane's own: the same
   // prompts propose the same tokens.
   const size_t spyBefore = spy.calls.size();
