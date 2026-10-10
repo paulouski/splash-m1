@@ -150,6 +150,7 @@ public:
     uint64_t position = 0;
     std::vector<uint32_t> tokens, slots;
     std::vector<uint8_t> staged;
+    uint32_t retained = 0;
   };
 
   SpyFamily(std::unique_ptr<model::FamilyRuntime> inner, uint32_t heads) : inner_(std::move(inner)), heads_(heads) {}
@@ -169,10 +170,10 @@ public:
                         uint32_t anchor) override {
     inner_->beforeDecodeLane(request, lane, stateLane, position, anchor);
   }
-  void beforeVerifyLane(uint64_t request, uint32_t lane, uint64_t position,
-                        std::span<const uint32_t> rowTokens) override {
-    inner_->beforeVerifyLane(request, lane, position, rowTokens);
-    Call call{request, lane, position, {rowTokens.begin(), rowTokens.end()}, {}, {}};
+  void beforeVerifyLane(uint64_t request, uint32_t lane, uint64_t position, std::span<const uint32_t> rowTokens,
+                        uint32_t retainedRows) override {
+    inner_->beforeVerifyLane(request, lane, position, rowTokens, retainedRows);
+    Call call{request, lane, position, {rowTokens.begin(), rowTokens.end()}, {}, {}, retainedRows};
     const uint64_t count = uint64_t{heads_} * rowTokens.size();
     const auto *slots = static_cast<const uint32_t *>(scratch_.decodeSlots.at(lane).contents());
     call.slots.assign(slots, slots + count);
@@ -435,6 +436,13 @@ void checkStaging(const std::vector<SpyFamily::Call> &calls, const std::vector<R
     const uint64_t base = uint64_t{call.lane} * verifyRows * heads;
     std::vector<uint32_t> ids(heads);
     for (uint32_t row = 0; row < verifyRows; ++row) {
+      // Rows past the retained ones are never read; they only point into the staging.
+      if (row >= call.retained) {
+        for (uint32_t head = 0; head < heads; ++head)
+          require((call.slots[uint64_t{row} * heads + head] - base + 1) * pleRowBytes <= call.staged.size(),
+                  "a staged slot lies outside the staging");
+        continue;
+      }
       hasher.rows(
           call.position + row, call.tokens[row],
           [&](uint64_t at) -> std::optional<uint32_t> {

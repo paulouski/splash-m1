@@ -59,9 +59,10 @@ public:
                                 uint32_t /*stateLane*/, uint64_t /*position*/,
                                 uint32_t /*anchor*/) {}
   // The verify step of a decode lane is final: `rowTokens` are the tokens its
-  // rows read (the anchor, then the proposals, clamped into the vocabulary).
+  // rows read (the anchor, then the proposals, clamped into the vocabulary);
+  // only its first `retainedRows` rows can be retained.
   virtual void beforeVerifyLane(uint64_t /*requestId*/, uint32_t /*lane*/, uint64_t /*position*/,
-                                std::span<const uint32_t> /*rowTokens*/) {}
+                                std::span<const uint32_t> /*rowTokens*/, uint32_t /*retainedRows*/) {}
   // The target selected `selected` (the new anchor last) while
   // `previousAnchor` was pending, if any; the lane has read the old anchor
   // and every selection before the new one.

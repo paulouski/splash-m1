@@ -1481,7 +1481,8 @@ struct Runtime::Impl {
   // The verify rows' tokens of a lane as verify_input_tokens reads them (the
   // anchor, then the proposals, clamped into the vocabulary), handed to the
   // family once the proposals are final.
-  void stageFamilyVerifyLane(const Request &entry, const ModelBatchItem &item, uint32_t lane) {
+  void stageFamilyVerifyLane(const Request &entry, const ModelBatchItem &item, uint32_t lane,
+                             uint32_t retainedRows) {
     if (!family)
       return;
     std::array<uint32_t, kDecodeRows> rowTokens;
@@ -1490,7 +1491,7 @@ struct Runtime::Impl {
     rowTokens[0] = std::min(*entry.pendingToken, last);
     for (uint32_t row = 1; row < kDecodeRows; ++row)
       rowTokens[row] = std::min(proposals[row - 1], last);
-    family->beforeVerifyLane(entry.id, lane, item.logicalPosition, rowTokens);
+    family->beforeVerifyLane(entry.id, lane, item.logicalPosition, rowTokens, retainedRows);
   }
 
   // The MTP head's proposals are written by the GPU: a lane's sparse
@@ -2056,7 +2057,7 @@ struct Runtime::Impl {
       for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
         entries[lane] = lanes_[lane].request;
         maximumRetained[lane] = lanes_[lane].maximumRetained;
-        impl_.stageFamilyVerifyLane(*entries[lane], items_[lane], lane);
+        impl_.stageFamilyVerifyLane(*entries[lane], items_[lane], lane, maximumRetained[lane]);
       }
       const std::span<Request *const> active(entries.data(), lanes_.size());
       CommandGraph verify;
@@ -2736,7 +2737,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     // The MTP head's proposals are not known yet: its lanes stage after the
     // draft command.
     if (!laneResult.mtp)
-      impl_->stageFamilyVerifyLane(entry, item, lane);
+      impl_->stageFamilyVerifyLane(entry, item, lane, laneResult.maximumRetained);
     requests[lane] = &entry;
     logicalPositions[lane] = item.logicalPosition;
     maximumRetained[lane] = laneResult.maximumRetained;

@@ -60,7 +60,7 @@ public:
     const auto rows = static_cast<uint32_t>(inputTokens.size());
     const std::vector<uint32_t> &history = historyOf(requestId);
     gather(position, inputTokens, history, scratch_.prefillRows, scratch_.prefillSlots,
-           uint64_t{rowBegin} * heads_, uint64_t{rowBegin} * heads_, rows);
+           uint64_t{rowBegin} * heads_, uint64_t{rowBegin} * heads_, rows, rows);
     writeBlocks(scratch_.prefillBlocks, uint64_t{rowBegin} * sizeof(Qwen4QsaBlock), position, rows);
   }
 
@@ -71,11 +71,11 @@ public:
     writeBlocks(scratch_.decodeBlocks.at(lane), 0, position, ExecutionLimits::targetVerifyRows);
   }
 
-  void beforeVerifyLane(uint64_t requestId, uint32_t lane, uint64_t position,
-                        std::span<const uint32_t> rowTokens) override {
+  void beforeVerifyLane(uint64_t requestId, uint32_t lane, uint64_t position, std::span<const uint32_t> rowTokens,
+                        uint32_t retainedRows) override {
     const auto rows = static_cast<uint32_t>(rowTokens.size());
     gather(position, rowTokens, historyOf(requestId), scratch_.decodeRows.at(lane), scratch_.decodeSlots.at(lane), 0,
-           uint64_t{lane} * rows * heads_, rows);
+           uint64_t{lane} * rows * heads_, rows, std::min(retainedRows, rows));
   }
 
   void afterCommit(uint64_t requestId, std::optional<uint32_t> previousAnchor,
@@ -99,16 +99,17 @@ private:
   // `history` (the tokens before the first row) and the rows themselves: the
   // table's unique rows into `rows * heads` slots of `staging` from slot
   // `first`, and each (row, head)'s slot, plus `slotBase` (the staging's
-  // place in the buffer the graph gathers from), into `slots`.
+  // place in the buffer the graph gathers from), into `slots`. Rows from `real` on are never read: they take their
+  // first row's rows, which costs no further fetch.
   void gather(uint64_t position, std::span<const uint32_t> tokens, const std::vector<uint32_t> &history,
               const metal::MetalBuffer &staging, const metal::MetalBuffer &slots, uint64_t first, uint64_t slotBase,
-              uint32_t rows) {
+              uint32_t rows, uint32_t real) {
     const uint64_t count = uint64_t{rows} * heads_;
     if (slots.sizeBytes() < (first + count) * sizeof(uint32_t) ||
         staging.sizeBytes() < (first + count) * pleRowBytes)
       throw std::logic_error("PLE staging is smaller than a step's rows");
     ids_.resize(count);
-    for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t row = 0; row < real; ++row)
       hasher_.rows(
           position + row, tokens[row],
           [&](uint64_t at) -> std::optional<uint32_t> {
@@ -117,6 +118,8 @@ private:
             return std::nullopt;
           },
           ids_.data() + uint64_t{row} * heads_);
+    for (uint32_t row = real; row < rows; ++row)
+      std::copy_n(ids_.data(), heads_, ids_.data() + uint64_t{row} * heads_);
     auto *slotWords = static_cast<uint32_t *>(slots.contents()) + first;
     auto *stagedRows = static_cast<uint8_t *>(staging.contents()) + first * pleRowBytes;
     const PleStore::Result result = store_.fetch(ids_, {stagedRows, count * pleRowBytes}, {slotWords, count});
