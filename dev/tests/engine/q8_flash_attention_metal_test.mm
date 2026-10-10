@@ -748,6 +748,20 @@ Bitmaps onlyBlocks(uint32_t rows, uint32_t words, std::initializer_list<uint32_t
   return bits;
 }
 
+// Whole pages kept with probability `keep`/16 per row (or none of its tokens
+// admitted), block 0 and the row's last page always.
+Bitmaps sparsePageBitmaps(uint32_t rows, uint32_t words, uint32_t keep, uint32_t seed) {
+  std::mt19937 random(seed);
+  Bitmaps bits(uint64_t{rows} * words);
+  for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t page = 0; page < words * 4; ++page)
+      if (random() % 16 < keep)
+        bits[uint64_t{row} * words + page / 4] |= (random() & 0xFFu) << (8 * (page % 4));
+  for (uint32_t row = 0; row < rows; ++row)
+    bits[uint64_t{row} * words] |= 1u;
+  return bits;
+}
+
 // Blocks [first, last) cleared in every row (block 0 stays).
 void clearBlocks(Bitmaps &bits, uint32_t words, uint32_t first, uint32_t last) {
   for (uint64_t row = 0; row < bits.size() / words; ++row)
@@ -805,6 +819,15 @@ void runMasked(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines 
     checkOutput(data, 1, expected, expected, output, false, name + " lane=" + std::to_string(lane));
   }
   requireIdentical(name, data, width, first, run(), "masked attention repeat");
+  if (std::getenv("SPLASH_TEST_DIGEST")) {
+    // Compare two builds of the kernel byte for byte: the same line per case.
+    uint64_t hash = 1469598103934665603ull;
+    for (const auto *bytes : {&first.output, &first.partials, &first.statistics})
+      for (const uint8_t byte : *bytes)
+        hash = (hash ^ byte) * 1099511628211ull;
+    std::cout << "digest " << name << " committed=" << committed << " rows=" << rows
+              << " " << std::hex << hash << std::dec << '\n';
+  }
   if (emptySplit >= 0) {
     // Nothing of the split is admitted: it leaves no maximum and no sum.
     require(uint32_t(emptySplit) < splits, "invalid empty split");
@@ -884,6 +907,20 @@ void runMaskedCases(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipel
               {onlyBlocks(8, maskWordsFor(committed, 8), {277})}, " tail_block");
     runMasked(device, queue, pipelines, shape, committed, 3, kVerifySplits, 0,
               {onlyBlocks(3, maskWordsFor(committed, 3), {275})}, " tail_block_prefill");
+  }
+  // Mostly empty pages, as QSA leaves them: rows keep a few pages each, so
+  // most pages are skipped by every row and some by only part of the rows.
+  for (const uint32_t keep : {0U, 1U, 3U}) {
+    for (const uint32_t committed : {1'100U, 4'093U, 9'000U}) {
+      std::vector<Bitmaps> lanes;
+      for (uint32_t lane = 0; lane < 2; ++lane)
+        lanes.push_back(sparsePageBitmaps(8, maskWordsFor(committed, 8), keep, 70 + keep * 3 + lane));
+      runMasked(device, queue, pipelines, shape, committed, 8, kVerifySplits, 0, lanes,
+                " sparse_pages_" + std::to_string(keep));
+    }
+    runMasked(device, queue, pipelines, shape, 2'000, 5, SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS, 2,
+              {sparsePageBitmaps(5, maskWordsFor(2'000, 5), keep, 90 + keep)},
+              " sparse_pages_prefill_" + std::to_string(keep));
   }
   // A split with nothing admitted by any row (pages 15 .. 19 of split 3).
   {

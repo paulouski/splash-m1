@@ -214,6 +214,20 @@ __attribute__((always_inline)) inline void tile(
   const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
 
   for (uint page = page_begin; page < page_end; ++page) {
+    // The block bits of this lane's two token pairs. A page is eight blocks
+    // and the pair's first block is even, so both bits lie in one word.
+    uint2 blocks(3u);
+    if constexpr (Masked) {
+      if (mask_words) {
+        const uint first = page * 8 + (scale_base >> 2);
+        blocks = uint2((mask_row0[first >> 5] >> (first & 31)) & 3u,
+                       (mask_row1[first >> 5] >> (first & 31)) & 3u);
+        // No admitted token in the simdgroup's rows: the page leaves the
+        // statistics and the output exactly as they are.
+        if (simd_all(blocks.x == 0 && blocks.y == 0))
+          continue;
+      }
+    }
     const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
     device const CacheElement *keys = tensors.keys;
     device const CacheElement *values = tensors.values;
@@ -229,17 +243,6 @@ __attribute__((always_inline)) inline void tile(
       key_scale[0] = k01.x, key_scale[1] = k01.y, key_scale[2] = k45.x, key_scale[3] = k45.y;
       value_scale[0] = v01.x, value_scale[1] = v01.y, value_scale[2] = v45.x,
       value_scale[3] = v45.y;
-    }
-
-    // The block bits of this lane's two token pairs. A page is eight blocks
-    // and the pair's first block is even, so both bits lie in one word.
-    uint2 blocks(3u);
-    if constexpr (Masked) {
-      if (mask_words) {
-        const uint first = page * 8 + (scale_base >> 2);
-        blocks = uint2((mask_row0[first >> 5] >> (first & 31)) & 3u,
-                       (mask_row1[first >> 5] >> (first & 31)) & 3u);
-      }
     }
 
     // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1).
