@@ -1111,15 +1111,16 @@ struct MetalBackend::Impl {
                     const auto *ids = selected ? static_cast<const uint32_t *>(selected->contents()) : nullptr;
                     const auto *tiles = count ? static_cast<const uint32_t *>(count->contents()) : nullptr;
                     if (ids && tiles) {
-                        std::set<uint32_t> distinct(ids, ids + uint64_t{rows} * topK);
-                        // Distinct experts among the first r rows, r = 1, 2, 3, 4, 6.
-                        size_t prefix[5];
-                        const uint32_t cuts[5] = {1, 2, 3, 4, 6};
-                        for (int c = 0; c < 5; ++c)
-                            prefix[c] = std::set<uint32_t>(ids, ids + uint64_t{std::min(cuts[c], rows)} * topK).size();
+                        // A row holds topK routed ids and then the shared expert's slot.
+                        const auto distinctOver = [&](uint32_t count) {
+                            std::set<uint32_t> experts;
+                            for (uint32_t row = 0; row < std::min(count, rows); ++row)
+                                experts.insert(ids + uint64_t{row} * (topK + 1), ids + uint64_t{row} * (topK + 1) + topK);
+                            return experts.size();
+                        };
                         std::fprintf(log, "M rows=%u topk=%u distinct=%zu tiles=%u d1=%zu d2=%zu d3=%zu d4=%zu d6=%zu\n",
-                                     rows, topK, distinct.size(), tiles[0], prefix[0], prefix[1], prefix[2],
-                                     prefix[3], prefix[4]);
+                                     rows, topK, distinctOver(rows), tiles[0], distinctOver(1), distinctOver(2),
+                                     distinctOver(3), distinctOver(4), distinctOver(6));
                     } else {
                         std::fprintf(log, "M private\n");
                     }
