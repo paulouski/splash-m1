@@ -737,7 +737,8 @@ struct MetalBackend::Impl {
     std::function<void()> operationGuard;
 
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
-    bool dispatchProfiling = profileLog() != nullptr;
+    // SPLASH_PROFILE_WHEN_FILE=path: profile only while that file exists (decode after a long prefill).
+    bool dispatchProfiling = profileLog() != nullptr && !std::getenv("SPLASH_PROFILE_WHEN_FILE");
     std::vector<DispatchTiming> dispatchProfile;
 #endif
     __strong id<MTLDevice> device = nil;
@@ -1130,6 +1131,38 @@ struct MetalBackend::Impl {
                 std::fprintf(log, "D %s %.1f %llu\n", item.source->pipelineName.c_str(),
                              timing.gpuSeconds * 1e6,
                              (unsigned long long)(item.groups.width * item.groups.height * item.groups.depth));
+                if (item.source->pipelineName == "verify_attention_q8_split_sgf_kv2_g12") {
+                    // QSA coverage of the layer just run: 32-token pages holding a block some row of the tile admits.
+                    const MetalBuffer *mask = nullptr;
+                    uint32_t words = 0;
+                    for (const BufferBinding &b : item.source->buffers)
+                        if (b.index == 8) mask = &b.buffer;
+                    for (const BytesBinding &b : item.source->bytes)
+                        if (b.index == 9 && b.sizeBytes >= 8) words = static_cast<const uint32_t *>(b.data)[0];
+                    const auto *bits = mask ? static_cast<const uint32_t *>(mask->contents()) : nullptr;
+                    if (bits && words) {
+                        std::vector<uint8_t> seen(words * 4, 0);
+                        uint32_t top = 0, counts[9] = {0}, blocksRow0 = 0;
+                        for (uint32_t row = 0; row < 8; ++row)
+                            for (uint32_t w = 0; w < words; ++w) {
+                                uint32_t word = bits[uint64_t{row} * words + w];
+                                if (!word) continue;
+                                top = std::max(top, w * 32 + 32 - static_cast<uint32_t>(std::countl_zero(word)));
+                                if (row == 0) blocksRow0 += std::popcount(word);
+                                for (; word; word &= word - 1) {
+                                    const uint32_t page = (w * 32 + std::countr_zero(word)) / 8;
+                                    if (!(seen[page] & (1u << row))) { seen[page] |= 1u << row; }
+                                }
+                            }
+                        for (uint32_t page = 0; page < words * 4; ++page)
+                            for (uint32_t rows = 1; rows <= 8; ++rows)
+                                if (seen[page] & ((1u << rows) - 1u)) ++counts[rows];
+                        std::fprintf(log, "Q words=%u pages=%u blocks_r0=%u r1=%u r2=%u r3=%u r4=%u r8=%u\n", words,
+                                     (top + 7) / 8, blocksRow0, counts[1], counts[2], counts[3], counts[4], counts[8]);
+                    } else {
+                        std::fprintf(log, "Q none\n");
+                    }
+                }
                 if (item.source->pipelineName.rfind("moe_group_routes", 0) == 0) {
                     const MetalBuffer *selected = nullptr, *count = nullptr;
                     for (const BufferBinding &b : item.source->buffers) {
@@ -1545,6 +1578,10 @@ CommandTicket MetalBackend::submitCommandAsync(
             if (matches(dups, dispatch.pipelineName)) kept.push_back(dispatch);
         }
         dispatches = kept;
+    }
+    if (const char *gate = std::getenv("SPLASH_PROFILE_WHEN_FILE")) {
+        struct stat info;
+        impl_->dispatchProfiling = stat(gate, &info) == 0 && profileLog() != nullptr;
     }
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(dispatches, std::move(completion));
