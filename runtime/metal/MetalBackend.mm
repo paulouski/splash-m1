@@ -29,6 +29,36 @@
 
 #include <unistd.h>
 
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+#include <QuartzCore/QuartzCore.h>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
+#include <set>
+namespace {
+// SPLASH_COMMAND_TIMELINE=path: one line per command buffer (commit time, GPU
+// start/end, dispatch count, first/last pipeline). SPLASH_DISPATCH_PROFILE=path:
+// every dispatch committed alone, GPU time and MoE routing counts.
+FILE *instrumentLog(const char *variable, FILE *&file, bool &opened) {
+    if (!opened) {
+        opened = true;
+        if (const char *path = std::getenv(variable)) file = std::fopen(path, "w");
+    }
+    return file;
+}
+FILE *timelineLog() {
+    static FILE *file = nullptr; static bool opened = false;
+    return instrumentLog("SPLASH_COMMAND_TIMELINE", file, opened);
+}
+FILE *profileLog() {
+    static FILE *file = nullptr; static bool opened = false;
+    return instrumentLog("SPLASH_DISPATCH_PROFILE", file, opened);
+}
+std::mutex &timelineMutex() { static std::mutex m; return m; }
+}  // namespace
+#endif
+
 namespace splash::metal {
 namespace {
 
@@ -677,7 +707,7 @@ struct MetalBackend::Impl {
     std::function<void()> operationGuard;
 
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
-    bool dispatchProfiling = false;
+    bool dispatchProfiling = profileLog() != nullptr;
     std::vector<DispatchTiming> dispatchProfile;
 #endif
     __strong id<MTLDevice> device = nil;
@@ -948,6 +978,21 @@ struct MetalBackend::Impl {
                         if (auto ticket = weakTicket.lock())
                             ticket->completeGroupedChild(childIndex, completedChild);
                     }];
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+                    if (FILE *log = timelineLog()) {
+                        const double committed = CACurrentMediaTime();
+                        const size_t count = std::min(dispatches.size(), first + groupSize) - first;
+                        const std::string firstName = dispatches[first].source->pipelineName;
+                        const uint64_t sequence = ticketState->sequence;
+                        [child addCompletedHandler:^(id<MTLCommandBuffer> completedChild) {
+                            std::lock_guard lock(timelineMutex());
+                            std::fprintf(log, "T seq=%llu child=%zu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s\n",
+                                         (unsigned long long)sequence, childIndex, count, committed,
+                                         completedChild.GPUStartTime, completedChild.GPUEndTime, firstName.c_str());
+                            std::fflush(log);
+                        }];
+                    }
+#endif
                 }
                 residency->use();
                 const std::weak_ptr<CommandTicket::State> weakTicket = ticketState;
@@ -1006,6 +1051,22 @@ struct MetalBackend::Impl {
             [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
                 ticketState->finishCommand(completed);
             }];
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+            if (FILE *log = timelineLog()) {
+                const double committed = CACurrentMediaTime();
+                const size_t count = dispatches.size();
+                const std::string first = dispatches.front().source->pipelineName;
+                const std::string last = dispatches.back().source->pipelineName;
+                const uint64_t sequence = ticketState->sequence;
+                [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                    std::lock_guard lock(timelineMutex());
+                    std::fprintf(log, "T seq=%llu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s last=%s\n",
+                                 (unsigned long long)sequence, count, committed, completed.GPUStartTime,
+                                 completed.GPUEndTime, first.c_str(), last.c_str());
+                    std::fflush(log);
+                }];
+            }
+#endif
             residency->use();
             asyncState->commitSubmission(ticketState->sequence, command,
                 [weakTicket = std::weak_ptr(ticketState)](
@@ -1025,14 +1086,52 @@ struct MetalBackend::Impl {
                                  CommandCompletion completion) {
         const PreparedCommand command = prepare(dispatches);
         CommandTiming total;
+        FILE *log = profileLog();
+        static uint64_t commandIndex = 0;
+        if (log) std::fprintf(log, "C %llu %zu\n", (unsigned long long)commandIndex++, command.dispatches.size());
         for (const PreparedDispatch &item : command.dispatches) {
             const CommandTiming timing =
                 commit({&item, 1}, command.retainedAllocations, {}).wait();
-            dispatchProfile.push_back(
-                {item.source->pipelineName, timing.gpuSeconds});
+            if (log) {
+                std::fprintf(log, "D %s %.1f %llu\n", item.source->pipelineName.c_str(),
+                             timing.gpuSeconds * 1e6,
+                             (unsigned long long)(item.groups.width * item.groups.height * item.groups.depth));
+                if (item.source->pipelineName.rfind("moe_group_routes", 0) == 0) {
+                    const MetalBuffer *selected = nullptr, *count = nullptr;
+                    for (const BufferBinding &b : item.source->buffers) {
+                        if (b.index == 0) selected = &b.buffer;
+                        if (b.index == 2) count = &b.buffer;
+                    }
+                    uint32_t rows = 0, topK = 0;
+                    for (const BytesBinding &b : item.source->bytes)
+                        if (b.index == 5 && b.sizeBytes >= 8) {
+                            rows = static_cast<const uint32_t *>(b.data)[0];
+                            topK = static_cast<const uint32_t *>(b.data)[1];
+                        }
+                    const auto *ids = selected ? static_cast<const uint32_t *>(selected->contents()) : nullptr;
+                    const auto *tiles = count ? static_cast<const uint32_t *>(count->contents()) : nullptr;
+                    if (ids && tiles) {
+                        std::set<uint32_t> distinct(ids, ids + uint64_t{rows} * topK);
+                        // Distinct experts among the first r rows, r = 1, 2, 3, 4, 6.
+                        size_t prefix[5];
+                        const uint32_t cuts[5] = {1, 2, 3, 4, 6};
+                        for (int c = 0; c < 5; ++c)
+                            prefix[c] = std::set<uint32_t>(ids, ids + uint64_t{std::min(cuts[c], rows)} * topK).size();
+                        std::fprintf(log, "M rows=%u topk=%u distinct=%zu tiles=%u d1=%zu d2=%zu d3=%zu d4=%zu d6=%zu\n",
+                                     rows, topK, distinct.size(), tiles[0], prefix[0], prefix[1], prefix[2],
+                                     prefix[3], prefix[4]);
+                    } else {
+                        std::fprintf(log, "M private\n");
+                    }
+                }
+            }
+            if (!log)
+                dispatchProfile.push_back(
+                    {item.source->pipelineName, timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
             total.wallSeconds += timing.wallSeconds;
         }
+        if (log) std::fflush(log);
         auto ticketState = std::make_shared<CommandTicket::State>();
         ticketState->backend = asyncState;
         ticketState->sequence =
@@ -1341,6 +1440,50 @@ CommandTicket MetalBackend::submitCommandAsync(
     size_t maxDispatchesPerCommandBuffer) {
     checkOperation();
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
+    // SPLASH_SKIP_PIPELINES / SPLASH_DUP_PIPELINES=prefix,name$: drop or run twice the matching
+    // dispatches (ablation; a skip makes outputs garbage, a dup keeps them).
+    std::vector<ComputeDispatch> kept;
+    const char *skip = std::getenv("SPLASH_SKIP_PIPELINES");
+    const char *dup = std::getenv("SPLASH_DUP_PIPELINES");
+    // SPLASH_MOE_ROWS=N: 8-row MoE routing covers only the first N rows (experiment; later rows are not routed).
+    const char *moeRows = std::getenv("SPLASH_MOE_ROWS");
+    if (skip || dup || moeRows) {
+        const auto split = [](const char *list) {
+            std::vector<std::string> prefixes;
+            for (std::string_view rest(list ? list : ""); !rest.empty();) {
+                const size_t comma = rest.find(',');
+                prefixes.emplace_back(rest.substr(0, comma));
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            }
+            return prefixes;
+        };
+        const auto matches = [](const std::vector<std::string> &prefixes, const std::string &name) {
+            for (const std::string &prefix : prefixes)
+                if (prefix.back() == '$' ? name == std::string_view(prefix).substr(0, prefix.size() - 1)
+                                         : name.rfind(prefix, 0) == 0)
+                    return true;
+            return false;
+        };
+        const std::vector<std::string> skips = split(skip), dups = split(dup);
+        const uint32_t limit = moeRows ? static_cast<uint32_t>(std::atoi(moeRows)) : 0;
+        static std::deque<std::array<uint32_t, 4>> groupParams;
+        for (const ComputeDispatch &dispatch : dispatches) {
+            if (matches(skips, dispatch.pipelineName)) continue;
+            kept.push_back(dispatch);
+            if (limit && dispatch.pipelineName == "moe_route_select_f32_e512" && dispatch.threadgroups.x == 8)
+                kept.back().threadgroups.x = limit;
+            if (limit && dispatch.pipelineName == "moe_group_routes_e512")
+                for (BytesBinding &bytes : kept.back().bytes)
+                    if (bytes.index == 5 && bytes.sizeBytes == 16 && static_cast<const uint32_t *>(bytes.data)[0] == 8) {
+                        groupParams.push_back(*static_cast<const std::array<uint32_t, 4> *>(bytes.data));
+                        groupParams.back()[0] = limit;
+                        bytes.data = groupParams.back().data();
+                        if (groupParams.size() > 4096) groupParams.pop_front();
+                    }
+            if (matches(dups, dispatch.pipelineName)) kept.push_back(dispatch);
+        }
+        dispatches = kept;
+    }
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(dispatches, std::move(completion));
 #endif
