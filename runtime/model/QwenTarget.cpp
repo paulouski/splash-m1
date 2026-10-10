@@ -194,7 +194,6 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
     includeLayerExtras(geometry, layer);
   }
   geometry.moeExpertFormat = routedExpertFormat(weights.layers);
-  if constexpr (requires { weights.pleTable; }) geometry.qwen4.pleRowBytes = weights.pleTable.rowBytes;
   geometry.prefillProjections = geometry.decodeProjections;
   includeProjection(geometry, weights.logitsProjection);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections,
@@ -212,6 +211,7 @@ template QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Qwen4ExpL
 QwenTargetGeometry qwenTargetGeometry(const Qwen4ExpWeights &weights) {
   QwenTargetGeometry geometry =
       qwenTargetGeometry(static_cast<const QwenTargetWeights<Qwen4ExpLayout, Qwen4ExpLayerWeights> &>(weights));
+  geometry.qwen4.pleRowBytes = weights.pleTable.rowBytes;
   QwenTargetGeometry head;
   includeHyper(head, weights.finalHyper);
   // The MTP head's projections, run at the target's decode and prefill widths.

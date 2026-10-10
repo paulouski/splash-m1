@@ -108,7 +108,8 @@ private:
     const uint64_t count = uint64_t{rows} * heads_;
     if (slots.sizeBytes() < (first + count) * sizeof(uint32_t) ||
         staging.sizeBytes() < (first + count) * rowBytes_)
-      throw std::logic_error("PLE staging is smaller than a step's rows");
+      throw std::logic_error("PLE staging is smaller than a step's rows (" + std::to_string(staging.sizeBytes()) + " B for " +
+                             std::to_string(first + count) + " rows of " + std::to_string(rowBytes_) + " B)");
     ids_.resize(count);
     for (uint32_t row = 0; row < real; ++row)
       hasher_.rows(
