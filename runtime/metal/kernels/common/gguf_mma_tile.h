@@ -24,6 +24,7 @@ namespace gguf_mma {
 
 constant constexpr uint kStep = 32;           // inputs per step: one group
 constant constexpr uint kStride = kStep + 8;  // halves per staged column: a fragment's 8 columns hit distinct banks
+constant constexpr uint kMaximumSplits = 8;   // as LinearConfig::kMaximumSplits
 constant constexpr uint kColumns = 32;        // columns per simdgroup
 constant constexpr uint FN = kColumns / 8;    // column fragments per simdgroup
 constant constexpr uint kSimdgroupStage = kColumns * kStride;
@@ -256,9 +257,24 @@ inline void store_sums(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint spli
   const auto at = [&](uint s, uint row, uint column) { return (ulong(s) * Rows + row) * stride + column0 + column; };
   elements(acc, l, [&](uint row, uint column, float v) { partials[at(split, row, column)] = v; });
   if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
-  elements(acc, l, [&](uint row, uint column, float v) {
-    store(row, column, split_sum(v, split, splits, [&](uint s) { return partials[at(s, row, column)]; }));
-  });
+  // Each fragment's partials are all read before they are added in split order, so the reads overlap.
+#pragma unroll
+  for (uint i = 0; i < FN; ++i)
+#pragma unroll
+    for (uint r = 0; r < FM; ++r)
+#pragma unroll
+      for (uint e = 0; e < 2; ++e) {
+        const uint row = 8 * r + l.fn + e, column = 8 * i + l.fm;
+        float parts[kMaximumSplits];
+#pragma unroll
+        for (uint s = 0; s < kMaximumSplits; ++s)
+          parts[s] = s < splits && s != split ? partials[at(s, row, column)] : 0.0f;
+        float total = 0.0f;
+#pragma unroll
+        for (uint s = 0; s < kMaximumSplits; ++s)
+          if (s < splits) total += s == split ? acc[i][r][e] : parts[s];
+        store(row, column, total);
+      }
   split_release(counter, thread_index);
 }
 
