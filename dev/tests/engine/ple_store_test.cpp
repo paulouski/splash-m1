@@ -182,13 +182,15 @@ int main() {
     }
 
     {
-      // Open-time failures: too short for the rows, validation hook, missing file, symlink.
+      // Open-time failures: too short for the rows, validation hook, missing file; a symlinked shard opens.
       rejects([&] { PleSource(path.string(), dataOffset, rows + 1); }, "past the end", "short shard accepted");
       rejects([&] { PleSource(path.string(), dataOffset, rows, [](const PleSource &) { return std::string("bad shard"); }); },
               "bad shard", "validation hook ignored");
       rejects([&] { PleSource((dir / "missing").string(), 0, 1); }, "open", "missing file accepted");
       std::filesystem::create_symlink(path, dir / "link.bin");
-      rejects([&] { PleSource((dir / "link.bin").string(), dataOffset, rows); }, "open", "symlink followed");
+      PleStore linked(PleSource((dir / "link.bin").string(), dataOffset, rows), 0, 2);
+      checkRows(fetch(linked, {7, 8}), {7, 8});
+      require(fetch(linked, {9}).result.ok() && !linked.poisoned(), "identity check failed through a symlink");
     }
 
     std::cout << "ple store tests passed\n";

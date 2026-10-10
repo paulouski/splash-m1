@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -37,7 +38,12 @@ PleHasher::PleHasher(PleHashParams params) : params_(std::move(params)) {
 
 PleSource::PleSource(const std::string &path, uint64_t dataOffset, uint64_t rows, const Validate &validate)
     : path_(path), dataOffset_(dataOffset), rows_(rows) {
-  fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  // Open the resolved file: O_NOFOLLOW then guards only its last component.
+  if (char *resolved = ::realpath(path.c_str(), nullptr)) {
+    path_ = resolved;
+    std::free(resolved);
+  }
+  fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (fd_ < 0) throw std::runtime_error("PLE shard " + errnoMessage("open"));
   fcntl(fd_, F_NOCACHE, 1);
   fcntl(fd_, F_RDAHEAD, 0);
