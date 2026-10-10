@@ -165,12 +165,12 @@ GgufFile::GgufFile(WeightSource &source) : sources_{&source} {
   rotation_ = readRotation();
 }
 
-GgufFile::GgufFile(std::span<WeightSource *const> sources) : sources_(sources.begin(), sources.end()) {
+GgufFile::GgufFile(std::span<WeightSource *const> sources, bool lastFileMissing) : sources_(sources.begin(), sources.end()) {
   if (sources_.empty()) throw GgufError("a GGUF needs at least one file");
   for (uint32_t file = 0; file < sources_.size(); ++file) parse(*sources[file], file);
-  if (unsignedValue("split.count").value_or(1) != sources_.size())
+  if (unsignedValue("split.count").value_or(1) != sources_.size() + (lastFileMissing ? 1 : 0))
     throw GgufError("the GGUF's split.count does not match its " + std::to_string(sources_.size()) + " files");
-  if (sources_.size() > 1 && unsignedValue("split.tensors.count") != tensors_.size())
+  if (sources_.size() > 1 && !lastFileMissing && unsignedValue("split.tensors.count") != tensors_.size())
     throw GgufError("the GGUF's split files hold another number of tensors than split.tensors.count");
   rotation_ = readRotation();
 }

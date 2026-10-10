@@ -45,7 +45,8 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, const std::vect
     parsed.push_back(&files_.back());
     sources_.push_back(&files_.back());
   }
-  const GgufFile file(parsed);
+  const char *external = std::getenv("SPLASH_PLE_TABLE");
+  const GgufFile file(parsed, external && *external);
   checkUnchanged();
   // Validates the whole source before its tensor data is hashed.
   plan(file, geometry, {});

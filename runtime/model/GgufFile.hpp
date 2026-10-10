@@ -109,8 +109,9 @@ public:
   explicit GgufFile(WeightSource &source);
   // The files of a split GGUF (llama.cpp's gguf-split), in split order: the
   // first one's metadata, whose split.* keys must describe these files, and
-  // every file's tensors, each tagged with its file.
-  explicit GgufFile(std::span<WeightSource *const> sources);
+  // every file's tensors, each tagged with its file. lastFileMissing: the split's last
+  // file (the table SPLASH_PLE_TABLE supplies) is not among sources.
+  explicit GgufFile(std::span<WeightSource *const> sources, bool lastFileMissing = false);
   // The header held in memory; source serves the tensors' bytes.
   GgufFile(WeightSource &source, GgufMemoryHeader header);
 
