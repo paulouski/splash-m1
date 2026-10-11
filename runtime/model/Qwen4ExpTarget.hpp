@@ -49,7 +49,7 @@ private:
                            metal::MetalBuffer output, ops::PreparedInput prepared = {}) const;
   void addVerifyLogits(VerifyStep &step, uint32_t firstRow, uint32_t rows) const;
   void addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
-                    metal::MetalBuffer output) const;
+                    metal::MetalBuffer output, bool combine = false) const;
   void addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer, const QwenAttentionWeights &mixer,
                           uint32_t attentionLayer, bool attend = true) const;
   void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history, uint32_t limit,

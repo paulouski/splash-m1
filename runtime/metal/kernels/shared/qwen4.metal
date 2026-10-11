@@ -42,29 +42,39 @@ inline void reduce_streams(thread float (&values)[kStreams], uint streams, threa
 // unconditionally (past the end it reads the last value and drops it), so its
 // loads issue together.
 constant constexpr uint kNormPerThread = QWEN4_NORM_MAXIMUM_HIDDEN / kRowThreads;
-[[max_total_threads_per_threadgroup(kStreams * kRowThreads)]]
-kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
-                             device const float *norm [[buffer(1)]],
-                             device const float *inject [[buffer(2)]],
-                             device bfloat *normalized [[buffer(3)]],
-                             device float *weights [[buffer(4)]],
-                             constant Qwen4HyperParams &p [[buffer(5)]],
-                             uint row [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]],
-                             uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float sum_scratch[kStreams * kSimdgroups], dot_scratch[kStreams * kStreams * kSimdgroups];
+
+// With Combine, the previous block's combine runs first: every stream gains
+// the block's output (branch) scaled by the stream's old injection weight
+// (read before `weights` is rewritten) and is stored back.
+template <bool Combine>
+inline void hyper_norm(device float *streams, device const float *norm, device const float *inject,
+                       device bfloat *normalized, device float *weights, device const bfloat *branch,
+                       device const float *old_weights, constant Qwen4HyperParams &p, threadgroup float *sum_scratch,
+                       threadgroup float *dot_scratch, uint row, uint tid, uint lane, uint sg) {
   if (row >= p.rows) return;
   const uint s = tid / kRowThreads, t = tid % kRowThreads;
   const bool active = s < p.streams;
   const uint stream = active ? s : 0, width = p.streams * p.hidden;
   float values[kNormPerThread];
   float sum = 0.0f;
+  float combine_weight = 0.0f;
+  if constexpr (Combine) combine_weight = old_weights[row * p.streams + stream];
 #pragma unroll
   for (uint i = 0; i < kNormPerThread; ++i) {
     const uint d = t + i * kRowThreads;
-    const float loaded = streams[ulong(row) * width + stream * p.hidden + min(d, p.hidden - 1)];
-    values[i] = active && d < p.hidden ? loaded : 0.0f;
+    const bool live = active && d < p.hidden;
+    device float *slot = streams + ulong(row) * width + stream * p.hidden + min(d, p.hidden - 1);
+    float loaded = 0.0f;
+    if constexpr (Combine) {
+      // The in-place update reads only the thread's own values.
+      if (live) {
+        loaded = *slot + float(branch[ulong(row) * p.hidden + d]) * combine_weight;
+        *slot = loaded;
+      }
+    } else {
+      loaded = *slot;
+    }
+    values[i] = live ? loaded : 0.0f;
   }
 #pragma unroll
   for (uint i = 0; i < kNormPerThread; ++i) sum += values[i] * values[i];
@@ -100,6 +110,40 @@ kernel void qwen4_hyper_norm(device const float *streams [[buffer(0)]],
     for (uint g = 0; g < kStreams * kSimdgroups; ++g) dot += dot_scratch[tid * kStreams * kSimdgroups + g];
     weights[row * p.streams + tid] = 2.0f * sigmoid_of(dot / p.streams);
   }
+}
+
+[[max_total_threads_per_threadgroup(kStreams * kRowThreads)]]
+kernel void qwen4_hyper_norm(device float *streams [[buffer(0)]],
+                             device const float *norm [[buffer(1)]],
+                             device const float *inject [[buffer(2)]],
+                             device bfloat *normalized [[buffer(3)]],
+                             device float *weights [[buffer(4)]],
+                             constant Qwen4HyperParams &p [[buffer(5)]],
+                             uint row [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float sum_scratch[kStreams * kSimdgroups], dot_scratch[kStreams * kStreams * kSimdgroups];
+  hyper_norm<false>(streams, norm, inject, normalized, weights, nullptr, nullptr, p, sum_scratch, dot_scratch, row, tid,
+                    lane, sg);
+}
+
+[[max_total_threads_per_threadgroup(kStreams * kRowThreads)]]
+kernel void qwen4_hyper_combine_norm(device float *streams [[buffer(0)]],
+                                     device const float *norm [[buffer(1)]],
+                                     device const float *inject [[buffer(2)]],
+                                     device bfloat *normalized [[buffer(3)]],
+                                     device float *weights [[buffer(4)]],
+                                     device const bfloat *branch [[buffer(5)]],
+                                     device const float *old_weights [[buffer(6)]],
+                                     constant Qwen4HyperParams &p [[buffer(7)]],
+                                     uint row [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float sum_scratch[kStreams * kSimdgroups], dot_scratch[kStreams * kStreams * kSimdgroups];
+  hyper_norm<true>(streams, norm, inject, normalized, weights, branch, old_weights, p, sum_scratch, dot_scratch, row,
+                   tid, lane, sg);
 }
 
 // silu(low / streams) of the mix's low-rank projection, in place.

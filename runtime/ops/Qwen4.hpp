@@ -78,6 +78,12 @@ struct Qwen4 final {
   static void addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
                       metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
                       HyperShape shape, uint32_t rows);
+  // addCombine(streams, branch, weights) followed by addNorm, in one dispatch; `weights` is read (the
+  // combine's) before the norm's injection overwrites it, or left alone without inject.
+  static void addCombineNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer branch,
+                             metal::MetalBuffer combineWeights, const NormWeights &norm, metal::MetalBuffer inject,
+                             metal::MetalBuffer normalized, metal::MetalBuffer weights, HyperShape shape,
+                             uint32_t rows);
   // silu(low / streams) in place.
   static void addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows);
   static void addMix(metal::CommandGraph &graph, metal::MetalBuffer normalized, metal::MetalBuffer gate,

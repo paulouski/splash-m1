@@ -228,6 +228,32 @@ void hyperNormShapeTest(MetalBackend &backend, uint32_t rows, uint32_t hidden, u
   check(okW, "hyper norm" + shapeName + ": injection weights");
 }
 
+// The fused combine + norm against the two dispatches, bit for bit: streams, normalized rows and injection
+// weights, with and without injection, over widths off the threads' stride.
+void hyperCombineNormTest(MetalBackend &backend, uint32_t rows, uint32_t hidden, uint32_t streams, bool inject) {
+  std::mt19937 rng(hidden + streams + inject);
+  const uint32_t width = hidden * streams;
+  const ops::HyperShape shape{hidden, streams, 64};
+  const auto x = randoms(rng, rows * width, 1.5f), norm = randoms(rng, width, 0.3f),
+             injection = randoms(rng, streams * width, 0.02f), branch = randoms(rng, rows * hidden, 1.0f),
+             old = randoms(rng, rows * streams, 1.0f);
+  const NormWeights nw{upload(backend, norm), true};
+  MetalBuffer branchBuffer = upload(backend, bf16s(branch)), injectBuffer = inject ? upload(backend, injection) : MetalBuffer{};
+  MetalBuffer xsA = upload(backend, x), xsB = upload(backend, x), normA = scratch(backend, rows * width * 2),
+              normB = scratch(backend, rows * width * 2), wA = upload(backend, old), wB = upload(backend, old);
+  CommandGraph separate, fused;
+  ops::Qwen4::addCombine(separate, xsA, branchBuffer, wA, shape, rows);
+  ops::Qwen4::addNorm(separate, xsA, nw, injectBuffer, normA, wA, shape, rows);
+  ops::Qwen4::addCombineNorm(fused, xsB, branchBuffer, wB, nw, injectBuffer, normB, wB, shape, rows);
+  run(backend, separate);
+  run(backend, fused);
+  const std::string name = " (" + std::to_string(hidden) + " x " + std::to_string(streams) + (inject ? ", inject)" : ")");
+  check(download<float>(xsA, rows * width) == download<float>(xsB, rows * width), "hyper combine+norm" + name + ": streams");
+  check(download<uint16_t>(normA, rows * width) == download<uint16_t>(normB, rows * width),
+        "hyper combine+norm" + name + ": normalized");
+  check(download<float>(wA, rows * streams) == download<float>(wB, rows * streams), "hyper combine+norm" + name + ": weights");
+}
+
 void pleTest(MetalBackend &backend) {
   std::mt19937 rng(11);
   const uint32_t rows = 7, hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
@@ -611,6 +637,11 @@ int main(int argc, const char *argv[]) {
       hyperTest(backend);
       hyperNormShapeTest(backend, 3, 300, 2);
       hyperNormShapeTest(backend, 8, 2560, 4);
+      for (const bool inject : {false, true}) {
+        hyperCombineNormTest(backend, 5, 512, 4, inject);
+        hyperCombineNormTest(backend, 3, 300, 2, inject);
+        hyperCombineNormTest(backend, 8, 2560, 4, inject);
+      }
       pleTest(backend);
       qsaTest(backend);
       mtpTest(backend);

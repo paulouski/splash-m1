@@ -48,6 +48,19 @@ void Qwen4::addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, cons
             hyperParams(shape, rows, injects), {rows, 1, 1}, {kThreads * QWEN4_MAXIMUM_STREAMS, 1, 1});
 }
 
+void Qwen4::addCombineNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer branch,
+                           metal::MetalBuffer combineWeights, const NormWeights &norm, metal::MetalBuffer inject,
+                           metal::MetalBuffer normalized, metal::MetalBuffer weights, HyperShape shape,
+                           uint32_t rows) {
+  requireShape(shape);
+  if (shape.hidden > QWEN4_NORM_MAXIMUM_HIDDEN) throw std::invalid_argument("hyper-connection streams too wide for the norm");
+  const bool injects = static_cast<bool>(inject);
+  graph.add("qwen4_hyper_combine_norm",
+            {std::move(streams), norm.buffer, injects ? inject : norm.buffer, std::move(normalized),
+             injects ? weights : norm.buffer, std::move(branch), std::move(combineWeights)},
+            hyperParams(shape, rows, injects), {rows, 1, 1}, {kThreads * QWEN4_MAXIMUM_STREAMS, 1, 1});
+}
+
 void Qwen4::addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows) {
   requireShape(shape);
   graph.add("qwen4_hyper_low", {std::move(low)}, hyperParams(shape, rows), {groups(rows * shape.rank), 1, 1},

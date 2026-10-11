@@ -316,9 +316,12 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
   const ops::HyperShape hs = hyperShape();
   const uint32_t rows = step.rows;
   ops::Qwen4::addInit(graph, b.hidden[0], h.streams, hs, rows);
+  // The previous layer's FFN combine, folded into the next norm unless the PLE reads the streams first.
+  bool combinePending = false;
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
     const Qwen4ExpLayerWeights &layer = weights_.layers[index];
     if (layer.ple) {
+      if (std::exchange(combinePending, false)) ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape();
       ops::Embedding::add(graph, h.pleSlots, stagedTable(h.pleStaging, geometry_.qwen4.pleHeadDimension, weights_.pleTable), h.pleRows,
@@ -336,7 +339,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
             rowsOf<float>(backend_, h.pleGated, lane * kLaneRows, kLaneRows, ps.width()),
             rowsOf<float>(backend_, h.streams, lane * kLaneRows, kLaneRows, ps.width()), ps, kLaneRows);
     }
-    addVerifyMix(step, layer.mixerHyper, h.streams, b.normalized);
+    addVerifyMix(step, layer.mixerHyper, h.streams, b.normalized, std::exchange(combinePending, false));
     std::visit(
         [&](const auto &mixer) {
           using Mixer = std::remove_cvref_t<decltype(mixer)>;
@@ -358,16 +361,15 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
           }
         },
         layer.mixer);
-    ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
-    addVerifyMix(step, layer.ffnHyper, h.streams, b.normalized);
+    addVerifyMix(step, layer.ffnHyper, h.streams, b.normalized, true);
     ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, b.activeRows);
     if (h.moeStats) addMoeStats(graph, h, b.moe, geometry_.moeShape(), index, rows);
-    ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
+    combinePending = true;
   }
   if (step.gdnLayer != geometry_.stateLayout.layers ||
       step.attentionLayer + geometry_.qwen4.mtpLayers != geometry_.kvLayout.attentionLayers)
     throw std::logic_error("Qwen target layer partition mismatch");
-  addVerifyMix(step, weights_.finalHyper, h.streams, b.finalHidden);
+  addVerifyMix(step, weights_.finalHyper, h.streams, b.finalHidden, combinePending);
   uint32_t logitRows = kLaneRows;
   if (!b.activeRows.empty()) logitRows = *std::max_element(b.activeRows.begin(), b.activeRows.end());
   addVerifyLogits(step, 0, logitRows);
@@ -414,12 +416,17 @@ void Qwen4ExpTarget::addVerifyLogits(VerifyStep &step, uint32_t firstRow, uint32
     addVerifyProjection(step, step.buffers.finalHidden, weights_.logitsProjection, step.buffers.logits);
 }
 
+// With `combine`, the previous block's combine of h.branch into the streams runs inside the norm.
 void Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
-                                  metal::MetalBuffer output) const {
+                                  metal::MetalBuffer output, bool combine) const {
   const Qwen4Buffers &h = step.buffers.qwen4;
   const ops::HyperShape hs = hyperShape();
-  ops::Qwen4::addNorm(step.graph, std::move(streams), hyper.norm, hyper.inject, h.normalized, h.weights, hs,
-                      step.rows);
+  if (combine)
+    ops::Qwen4::addCombineNorm(step.graph, std::move(streams), h.branch, h.weights, hyper.norm, hyper.inject,
+                               h.normalized, h.weights, hs, step.rows);
+  else
+    ops::Qwen4::addNorm(step.graph, std::move(streams), hyper.norm, hyper.inject, h.normalized, h.weights, hs,
+                        step.rows);
   addVerifyProjection(step, h.normalized, hyper.down, h.low);
   ops::Qwen4::addLow(step.graph, h.low, hs, step.rows);
   addVerifyProjection(step, h.low, hyper.up, h.gate);
@@ -514,11 +521,9 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   addVerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized);
   addVerifyAttention(step, mtp.block, std::get<QwenAttentionWeights>(mtp.block.mixer), attentionLayer, full);
   if (!full) return;
-  ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
-  addVerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);
+  addVerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized, true);
   ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe}, mtp.block.ffn, *step.moe);
-  ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
-  addVerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden);
+  addVerifyMix(step, mtp.head, h.mtpStreams, b.finalHidden, true);
   addVerifyLogits(step, limit - 1, 1);
 }
 
