@@ -2066,6 +2066,7 @@ struct Runtime::Impl {
                     const CommandGraph &draft, std::function<void()> completion)
         : impl_(impl), lanes_(std::move(lanes)), items_(items.begin(), items.end()), wake_(std::move(completion)) {
       submit(draft);
+      encodeVerify();
     }
 
     std::vector<ModelMaskRequest> takeMaskRequests() override {
@@ -2088,28 +2089,32 @@ struct Runtime::Impl {
   private:
     enum class Stage : uint8_t { Draft, Verify, Done };
 
-    // The draft is done: stage the verify rows of every lane from its
-    // proposals and submit the verify, policy, acceptance and commit.
-    void stageVerify() {
-      addTiming(command_.wait());
+    // The verify graph reads no proposal: it is encoded while the draft runs.
+    void encodeVerify() {
       std::array<Request *, kLaneCount> entries{};
       std::array<uint32_t, kLaneCount> maximumRetained{};
       for (uint32_t lane = 0; lane < lanes_.size(); ++lane) {
         entries[lane] = lanes_[lane].request;
         maximumRetained[lane] = lanes_[lane].maximumRetained;
-        impl_.stageFamilyVerifyLane(*entries[lane], items_[lane], lane, maximumRetained[lane]);
       }
       const std::span<Request *const> active(entries.data(), lanes_.size());
-      CommandGraph verify;
       const uint32_t width = static_cast<uint32_t>(lanes_.size());
-      impl_.encodeBatchVerifyInput(verify, width);
-      impl_.encodeBatchEmbedding(verify, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
-      impl_.encodeTargetVerifyBatchForward(verify, active, items_, false, false,
+      impl_.encodeBatchVerifyInput(verify_, width);
+      impl_.encodeBatchEmbedding(verify_, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+      impl_.encodeTargetVerifyBatchForward(verify_, active, items_, false, false,
                                            {maximumRetained.data(), lanes_.size()});
-      impl_.encodeTargetVerifyBatchPolicy(verify, active);
-      impl_.encodeBatchAcceptance(verify, active, {maximumRetained.data(), lanes_.size()});
-      impl_.encodeBatchGdnCommit(verify, active);
-      submit(verify);
+      impl_.encodeTargetVerifyBatchPolicy(verify_, active);
+      impl_.encodeBatchAcceptance(verify_, active, {maximumRetained.data(), lanes_.size()});
+      impl_.encodeBatchGdnCommit(verify_, active);
+    }
+
+    // The draft is done: stage the verify rows of every lane from its
+    // proposals and submit the verify, policy, acceptance and commit.
+    void stageVerify() {
+      addTiming(command_.wait());
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+        impl_.stageFamilyVerifyLane(*lanes_[lane].request, items_[lane], lane, lanes_[lane].maximumRetained);
+      submit(verify_);
       stage_ = Stage::Verify;
     }
 
@@ -2129,6 +2134,7 @@ struct Runtime::Impl {
     CommandTicket command_;
     CommandTiming timing_;
     std::function<void()> wake_;
+    CommandGraph verify_;
   };
 
   // A constrained DFlash cycle has one host dependency between three Metal
