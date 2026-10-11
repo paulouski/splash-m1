@@ -394,6 +394,8 @@ void qsaTest(MetalBackend &backend) {
                          upload(backend, invFreq), pageTable, qsaIndex);
   MetalBuffer scores = scratch(backend, 8 * stride * 4), mask = scratch(backend, rows * words * 4);
   ops::Qwen4::addQsaSelect(graph, queries, qsaIndex, pageTable, scores, 8, mask, qsaRows);
+  MetalBuffer list = scratch(backend, (pages + 1) * 4);
+  ops::Qwen4::addQsaPages(graph, mask, list, qsaRows);
   run(backend, graph);
 
   auto rotate = [&](std::vector<double> v, double position) {
@@ -464,6 +466,18 @@ void qsaTest(MetalBackend &backend) {
     for (uint32_t b = 0; b < words * 32; ++b) okMask &= bool((gotMask[r * words + b / 32] >> (b % 32)) & 1) == want[b];
   }
   check(okMask, "QSA select: dense below the budget, top blocks and the row's block above it");
+  // The page list: in order, the pages holding a block some row attends.
+  const auto gotList = download<uint32_t>(list, pages + 1);
+  std::vector<uint32_t> wantList;
+  for (uint32_t pg = 0; pg < pages; ++pg) {
+    bool kept = false;
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t b = 8 * pg; b < 8 * pg + 8; ++b) kept |= bool((gotMask[r * words + b / 32] >> (b % 32)) & 1);
+    if (kept) wantList.push_back(pg);
+  }
+  bool okList = gotList[0] == wantList.size() && !wantList.empty();
+  for (uint32_t i = 0; i < wantList.size(); ++i) okList &= gotList[1 + i] == wantList[i];
+  check(okList, "QSA pages: count, then the kept pages in order");
 }
 
 void mtpTest(MetalBackend &backend) {

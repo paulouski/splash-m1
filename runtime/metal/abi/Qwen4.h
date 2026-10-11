@@ -78,10 +78,16 @@ struct Qwen4QsaBlock {
 
 // The QSA bitmaps the GQA-12 attention kernels read: words per row (0 for
 // none: every row attends causally) and the bitmap row of the dispatch's
-// first query row.
+// first query row. The verify kernels also read each lane's compacted page
+// list (count, then the pages in order) at lane * list_stride + list_offset
+// words of the list buffer (list_stride 0: none) and split it into splits of
+// at least min_pages pages.
 struct Qwen4QsaMaskParams {
   uint32_t mask_words;
   uint32_t row0;
+  uint32_t list_stride;
+  uint32_t list_offset;
+  uint32_t min_pages;
 };
 
 // The MTP head (model/Qwen4Exp.hpp Qwen4MtpWeights) over a lane's verify

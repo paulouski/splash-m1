@@ -167,11 +167,17 @@ private:
 
 // The QSA block bitmaps of a step (Qwen3.8-Flash-Next): words per row, 0 when
 // every row attends causally, and the bitmap row of the dispatch's first query
-// row. Only the group-of-twelve register-tile kernels read them.
+// row. Only the group-of-twelve register-tile kernels read them. A verify step
+// also binds its lanes' compacted page lists (Qwen4QsaMaskParams), `pages` at
+// listOffset words into each lane's listStride, split into at least minPages.
 struct QsaMask final {
   metal::MetalBuffer bits;
   uint32_t words = 0;
   uint32_t row0 = 0;
+  metal::MetalBuffer pages;
+  uint32_t listStride = 0;
+  uint32_t listOffset = 0;
+  uint32_t minPages = 0;
 };
 
 struct PagedVerifyBuffers final {

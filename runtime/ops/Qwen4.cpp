@@ -208,4 +208,13 @@ void Qwen4::addQsaSelect(metal::CommandGraph &graph, metal::MetalBuffer queries,
   }
 }
 
+void Qwen4::addQsaPages(metal::CommandGraph &graph, metal::MetalBuffer mask, metal::MetalBuffer list,
+                        QsaRows rows) {
+  if (!rows.rows || !rows.maskWords) throw std::invalid_argument("invalid QSA page list");
+  const Qwen4QsaParams params{rows.rows, rows.firstPosition, rows.topBlocks, rows.maskWords, rows.scoreStride,
+                              0, 0, 0, 0, 0};
+  graph.add("qwen4_qsa_pages", {std::move(mask), std::move(list)}, params, {1, 1, 1},
+            {QWEN4_QSA_SELECT_THREADS, 1, 1});
+}
+
 } // namespace splash::ops

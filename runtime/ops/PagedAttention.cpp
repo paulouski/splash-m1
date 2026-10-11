@@ -366,7 +366,7 @@ void PagedAttention::addPrefill(
   if (masked(plan.splitPipeline))
     graph.add(std::string(plan.splitPipeline),
               {std::move(queries), partials, statistics, std::move(pageTable)}, params,
-              {mask.words ? mask.bits : partials}, Qwen4QsaMaskParams{mask.words, mask.row0},
+              {mask.words ? mask.bits : partials}, Qwen4QsaMaskParams{mask.words, mask.row0, 0, 0, 0},
               plan.splitGroups, plan.splitThreads);
   else
     graph.add(std::string(plan.splitPipeline),
@@ -408,20 +408,29 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
   if (!attend) return;
-  if (masked(plan.splitPipeline))
+  const bool lists = masked(plan.splitPipeline);
+  const Qwen4QsaMaskParams maskParams{mask.words, mask.row0, mask.words ? mask.listStride : 0,
+                                      mask.listOffset, mask.minPages};
+  const metal::MetalBuffer &bits = mask.words ? mask.bits : buffers.partials;
+  const metal::MetalBuffer &pages = mask.words && mask.pages ? mask.pages : buffers.partials;
+  if (lists)
     graph.add(std::string(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3]},
-              attention, {mask.words ? mask.bits : buffers.partials},
-              Qwen4QsaMaskParams{mask.words, mask.row0}, plan.splitGroups, plan.splitThreads);
+              attention, {bits, pages}, maskParams, plan.splitGroups, plan.splitThreads);
   else
     graph.add(std::string(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
                tables[1], tables[2], tables[3]},
               attention, plan.splitGroups, plan.splitThreads);
-  graph.add(std::string(plan.reducePipeline),
-            {buffers.partials, buffers.statistics, buffers.output},
-            attention, plan.reduceGroups);
+  if (lists)
+    graph.add(std::string(plan.reducePipeline),
+              {buffers.partials, buffers.statistics, buffers.output}, attention, {pages}, maskParams,
+              plan.reduceGroups);
+  else
+    graph.add(std::string(plan.reducePipeline),
+              {buffers.partials, buffers.statistics, buffers.output},
+              attention, plan.reduceGroups);
 }
 
 } // namespace splash::ops

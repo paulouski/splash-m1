@@ -206,7 +206,7 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
       ops::PagedAttention::addPrefill(
           graph, kvLayers[attentionLayer], attentionQueries, attentionRows, b.attentionPartials,
           b.attentionStatistics, sequence.pageTable, sequence.chunk, step.attention[s],
-          ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, sequence.rowBegin});
+          ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, sequence.rowBegin, {}, 0, 0, 0});
       ops::PagedAttention::addPrefillGate(
           graph, u16Rows(b.fullPacked, sequence.rowBegin, sequence.rows, geometry_.packedFullWidth),
           attentionRows, u16Rows(b.attentionHidden, sequence.rowBegin, sequence.rows, geometry_.attentionWidth),
@@ -433,6 +433,11 @@ void Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyp
   ops::Qwen4::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows);
 }
 
+namespace {
+// Pages per split of a lane's compacted QSA page list, at least (a split count of 128 at 72K to 123K).
+constexpr uint32_t qsaMinPagesPerSplit() { return 8; }
+} // namespace
+
 // A full-attention block's mixer over the step's rows (the QSA indexer, the
 // attention and its output projection) into h.branch. Without `attend` only the
 // KV-writing parts run: the projection, the QSA index project and pool, the store.
@@ -465,13 +470,20 @@ void Qwen4ExpTarget::addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWei
                            qsaBlockCount(first, kLaneRows), indexer.keyNorm, h.inverseFrequencies, b.pageTables[lane],
                            h.qsaIndex[attentionLayer]);
   }
+  // A lane's page list is the row past its slice's score rows.
+  const uint32_t scoreStride = h.qsaMaskWords * 32;
   if (attend && sparse)
-    for (uint32_t lane = 0; lane < step.lanes; ++lane)
-      ops::Qwen4::addQsaSelect(
-          step.graph, rowsOf<float>(backend_, h.qsaQueries, lane * kLaneRows, kLaneRows, kIndexWidth),
-          h.qsaIndex[attentionLayer], b.pageTables[lane], h.qsaScores, h.qsaScoreRows,
-          rowsOf<uint32_t>(backend_, h.qsaMask, lane * kLaneRows, kLaneRows, h.qsaMaskWords),
-          {kLaneRows, step.chunks[lane].committed_tokens, topBlocks, h.qsaMaskWords, h.qsaMaskWords * 32});
+    for (uint32_t lane = 0; lane < step.lanes; ++lane) {
+      const ops::QsaRows qsa{kLaneRows, step.chunks[lane].committed_tokens, topBlocks, h.qsaMaskWords, scoreStride};
+      const metal::MetalBuffer mask = rowsOf<uint32_t>(backend_, h.qsaMask, lane * kLaneRows, kLaneRows, h.qsaMaskWords);
+      ops::Qwen4::addQsaSelect(step.graph,
+                               rowsOf<float>(backend_, h.qsaQueries, lane * kLaneRows, kLaneRows, kIndexWidth),
+                               h.qsaIndex[attentionLayer], b.pageTables[lane], h.qsaScores, h.qsaScoreRows, mask, qsa);
+      ops::Qwen4::addQsaPages(step.graph, mask,
+                              rowsOf<uint32_t>(backend_, h.qsaScores, lane * (h.qsaScoreRows + 1) + h.qsaScoreRows, 1,
+                                               scoreStride),
+                              qsa);
+    }
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[attentionLayer],
                                            b.chunkValues[attentionLayer], geometry_.attentionQueryHeads,
@@ -480,7 +492,10 @@ void Qwen4ExpTarget::addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWei
       step.graph, step.kvLayers[attentionLayer],
       {b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer], b.fullQueries, b.attentionPartials,
        b.attentionStatistics, b.fullAttention, b.pageTables},
-      step.chunks, step.attention, ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, 0}, attend);
+      step.chunks, step.attention,
+      ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, 0, h.qsaScores, (h.qsaScoreRows + 1) * scoreStride,
+                   h.qsaScoreRows * scoreStride, qsaMinPagesPerSplit()},
+      attend);
   if (!attend) return;
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads, geometry_.kvLayout,

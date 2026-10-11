@@ -1,3 +1,4 @@
+#include "metal/abi/Qwen4.h"
 #include "metal/kernels/common/paged_verify_tile.h"
 
 // Verify tiles process one lane's eight rows per KV head and history split.
@@ -117,15 +118,33 @@ kernel void verify_attention_reduce_kv2_g8(
       partials, statistics, output, params, group, thread_index, weights, group_values);
 }
 
+// With the page lists bound (list_stride != 0), the splits of the compacted list.
 kernel void verify_attention_reduce_kv2_g12(
     device const float *partials [[buffer(0)]],
     device const float *statistics [[buffer(1)]],
     device bfloat *output [[buffer(2)]],
     constant SplashVerifyAttentionParams *params [[buffer(3)]],
+    device const uint *page_lists [[buffer(4)]],
+    constant Qwen4QsaMaskParams &mask [[buffer(5)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
   threadgroup float weights[SplashVerifyMaximumSplits];
   threadgroup float group_values[8];
-  splash_verify_attention_reduce_phase<2, 12>(
-      partials, statistics, output, params, group, thread_index, weights, group_values);
+  if (!mask.list_stride) {
+    splash_verify_attention_reduce_phase<2, 12>(
+        partials, statistics, output, params, group, thread_index, weights, group_values);
+    return;
+  }
+  constexpr ushort M = SPLASH_TARGET_VERIFY_ROWS * 12;
+  constexpr ushort D = SplashKvHeadDimension;
+  const uint kv_head = group.x, fused_row = group.y, batch = group.z;
+  constant SplashVerifyAttentionParams &lane_params = params[batch];
+  if (!splash_verify_attention_contract_valid(lane_params) || kv_head >= 2 || fused_row >= M ||
+      thread_index >= D)
+    return;
+  constexpr ulong group_stride = ulong(SPLASH_VERIFY_CHUNK_STRIDE) * 12 * D;
+  splash_attention_reduce_row_listed<12, SPLASH_TARGET_VERIFY_ROWS>(
+      partials, statistics, output + (ulong(batch) * 2 + kv_head) * group_stride,
+      page_lists[ulong(batch) * mask.list_stride + mask.list_offset], lane_params.split_count, mask.min_pages,
+      (ulong(batch) * 2 + kv_head) * lane_params.slot_splits, fused_row, thread_index, weights, group_values);
 }

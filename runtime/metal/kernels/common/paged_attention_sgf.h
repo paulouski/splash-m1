@@ -141,7 +141,9 @@ __attribute__((always_inline)) inline bool admitted(uint token, uint limit, uint
 // simdgroups and query_words of (G / Halves) * 1024 words. Masked tiles admit
 // a token only when its four-token block's bit is set in the bitmap of its
 // query row (block_mask: the tile's first row, mask_words words per row;
-// mask_words == 0: every row attends causally).
+// mask_words == 0: every row attends causally). With a page_list (count, then
+// the pages some row admits, in order) the splits share that list equally,
+// each at least min_pages long, rather than the contiguous pages.
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, uint Halves = 1,
           bool Masked = false>
 __attribute__((always_inline)) inline void tile(
@@ -149,7 +151,8 @@ __attribute__((always_inline)) inline void tile(
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
     uint sg, uint lane, threadgroup uint *query_words, uint half_index = 0,
-    device const uint *block_mask = nullptr, uint mask_words = 0) {
+    device const uint *block_mask = nullptr, uint mask_words = 0,
+    device const uint *page_list = nullptr, uint min_pages = 0) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint Rows = 8;
@@ -162,7 +165,13 @@ __attribute__((always_inline)) inline void tile(
                     SPLASH_PREFILL_ATTENTION_TILE_ROWS == Rows,
                 "one simdgroup per G fused rows of an eight-row tile");
   const uint visible = committed_tokens + active_rows;
-  const uint pages = splash_attention_pages(visible);
+  uint pages = splash_attention_pages(visible);
+  if constexpr (Masked) {
+    if (page_list) {
+      pages = page_list[0];
+      splits = splash_compact_splits(pages, splits, min_pages);
+    }
+  }
   const uint per_split = splash_attention_pages_per_split(pages, splits);
   const uint page_begin = split * per_split;
   if (page_begin >= pages)
@@ -213,7 +222,12 @@ __attribute__((always_inline)) inline void tile(
   const uint scale_base = page_token(fm, 0);
   const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
 
-  for (uint page = page_begin; page < page_end; ++page) {
+  for (uint index = page_begin; index < page_end; ++index) {
+    uint page = index;
+    if constexpr (Masked) {
+      if (page_list)
+        page = page_list[1 + index];
+    }
     // The block bits of this lane's two token pairs. A page is eight blocks
     // and the pair's first block is even, so both bits lie in one word.
     uint2 blocks(3u);

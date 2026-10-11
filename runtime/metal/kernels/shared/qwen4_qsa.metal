@@ -263,3 +263,37 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid == 0) bits[complete / 32] |= 1u << (complete % 32);
 }
+
+// One threadgroup per lane: the lane's page list, the pages (32 tokens, eight
+// blocks) where any of its rows' bitmaps has a block set, in order, after their
+// count: the verify attention divides it equally among its splits.
+kernel void qwen4_qsa_pages(device const uint *mask [[buffer(0)]],
+                            device uint *list [[buffer(1)]],
+                            constant Qwen4QsaParams &p [[buffer(2)]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kThreads = QWEN4_QSA_SELECT_THREADS;
+  threadgroup uint simd_counts[kThreads / 32];
+  const uint pages = (p.first_position + p.rows + kPageTokens - 1) / kPageTokens;
+  const uint per = (pages + kThreads - 1) / kThreads;
+  const uint p0 = min(tid * per, pages), p1 = min(p0 + per, pages);
+  uint kept = 0;
+  for (uint page = p0; page < p1; ++page) {
+    uint bits = 0;
+    for (uint r = 0; r < p.rows; ++r) bits |= mask[ulong(r) * p.mask_words + page / 4];
+    kept += ((bits >> (8 * (page % 4))) & 0xFFu) != 0 ? 1u : 0u;
+  }
+  const uint inclusive = simd_prefix_inclusive_sum(kept);
+  if (lane == 31) simd_counts[sg] = inclusive;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint before = inclusive - kept;
+  for (uint g = 0; g < sg; ++g) before += simd_counts[g];
+  for (uint page = p0; page < p1; ++page) {
+    uint bits = 0;
+    for (uint r = 0; r < p.rows; ++r) bits |= mask[ulong(r) * p.mask_words + page / 4];
+    if (((bits >> (8 * (page % 4))) & 0xFFu) != 0) list[1 + before++] = page;
+  }
+  // The last thread's running position is the count.
+  if (tid == kThreads - 1) list[0] = before;
+}

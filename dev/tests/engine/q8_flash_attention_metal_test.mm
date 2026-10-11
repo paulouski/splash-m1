@@ -387,19 +387,30 @@ struct MaskArgs {
   id<MTLBuffer> buffer = nil;
   uint32_t words = 0;
   uint32_t row0 = 0;
+  // The verify kernels' compacted page lists (none: contiguous splits).
+  id<MTLBuffer> pages = nil;
+  uint32_t listStride = 0;
+  uint32_t listOffset = 0;
+  uint32_t minPages = 0;
 };
 
 // The group-of-twelve kernels always read their mask bindings: no bitmaps are
-// words = 0 and a placeholder buffer.
+// words = 0 and a placeholder buffer. The verify kernels (`lists`) bind the page
+// lists after the bitmaps; the prefill kernels have none.
 void bindMask(id<MTLDevice> device, id<MTLComputeCommandEncoder> encoder,
-              const Pipelines &pipelines, const MaskArgs *mask, uint32_t index) {
+              const Pipelines &pipelines, const MaskArgs *mask, uint32_t index, bool lists = false) {
   if (!pipelines.group12) {
     require(!mask, "only the group-of-twelve kernels read QSA bitmaps");
     return;
   }
-  const Qwen4QsaMaskParams params{mask ? mask->words : 0, mask ? mask->row0 : 0};
+  const bool compact = mask && mask->pages;
+  const Qwen4QsaMaskParams params{mask ? mask->words : 0, mask ? mask->row0 : 0,
+                                  compact ? mask->listStride : 0, compact ? mask->listOffset : 0,
+                                  compact ? mask->minPages : 0};
   [encoder setBuffer:mask ? mask->buffer : makeBuffer(device, 16) offset:0 atIndex:index];
-  [encoder setBytes:&params length:sizeof(params) atIndex:index + 1];
+  if (lists)
+    [encoder setBuffer:compact ? mask->pages : makeBuffer(device, 16) offset:0 atIndex:index + 1];
+  [encoder setBytes:&params length:sizeof(params) atIndex:index + (lists ? 2 : 1)];
 }
 
 // The Apple7/8 register tile (_sgf, 32 x G threads) shares the reductions.
@@ -490,7 +501,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:params.data()
               length:sizeof(VerifyAttentionParams) * params.size()
              atIndex:7];
-  bindMask(device, encoder, pipelines, mask, 8);
+  bindMask(device, encoder, pipelines, mask, 8, true);
   // The kernel reaches the extents only through the page entries.
   for (id<MTLBuffer> extent : data.extents)
     [encoder useResource:extent usage:MTLResourceUsageRead];
@@ -503,6 +514,15 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   [encoder setBytes:params.data()
               length:sizeof(VerifyAttentionParams) * params.size()
              atIndex:3];
+  if (pipelines.group12) {
+    // The group-of-twelve reduce reads the page lists (buffer 4, parameters 5).
+    const bool compact = mask && mask->pages;
+    const Qwen4QsaMaskParams params{mask ? mask->words : 0, mask ? mask->row0 : 0,
+                                    compact ? mask->listStride : 0, compact ? mask->listOffset : 0,
+                                    compact ? mask->minPages : 0};
+    [encoder setBuffer:compact ? mask->pages : makeBuffer(device, 16) offset:0 atIndex:4];
+    [encoder setBytes:&params length:sizeof(params) atIndex:5];
+  }
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, shape.fusedRows(), width)
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   [encoder endEncoding];
@@ -788,6 +808,31 @@ MaskArgs makeMask(id<MTLDevice> device, uint32_t words, uint32_t row0, uint32_t 
   return mask;
 }
 
+// Each lane's page list at listOffset words into its listStride (count, then the
+// pages some row's bitmap holds a block of, in order), among junk.
+MaskArgs withPageLists(id<MTLDevice> device, MaskArgs mask, const std::vector<Bitmaps> &lanes,
+                       uint32_t committed, uint32_t rows, uint32_t minPages) {
+  const uint32_t pages = (committed + rows + kPageTokens - 1) / kPageTokens;
+  mask.listOffset = 3;
+  mask.listStride = mask.listOffset + pages + 5;
+  mask.minPages = minPages;
+  mask.pages = makeBuffer(device, uint64_t{lanes.size()} * mask.listStride * 4);
+  auto *list = static_cast<uint32_t *>(mask.pages.contents);
+  std::fill_n(list, lanes.size() * mask.listStride, ~0u);
+  for (size_t lane = 0; lane < lanes.size(); ++lane) {
+    uint32_t count = 0;
+    for (uint32_t page = 0; page < pages; ++page) {
+      uint32_t bits = 0;
+      for (uint32_t row = 0; row < rows; ++row)
+        bits |= lanes[lane][uint64_t{row} * mask.words + page / 4];
+      if ((bits >> (8 * (page % 4))) & 0xFFu)
+        list[lane * mask.listStride + mask.listOffset + 1 + count++] = page;
+    }
+    list[lane * mask.listStride + mask.listOffset] = count;
+  }
+  return mask;
+}
+
 // Eight rows run a verify step with one bitmap set per lane, fewer (or more:
 // several query tiles) a prefill chunk of one. Every lane must match the
 // reference over its own bitmaps, which differ, and a repeat the bytes.
@@ -819,6 +864,24 @@ void runMasked(id<MTLDevice> device, id<MTLCommandQueue> queue, const Pipelines 
     checkOutput(data, 1, expected, expected, output, false, name + " lane=" + std::to_string(lane));
   }
   requireIdentical(name, data, width, first, run(), "masked attention repeat");
+  if (verify && pipelines.group12) {
+    // The same lanes over their compacted page lists, in splits of one to many pages.
+    for (const uint32_t minPages : {1u, 3u, 1000u}) {
+      const MaskArgs compact = withPageLists(device, mask, lanes, committed, rows, minPages);
+      const auto runCompact = [&] { return dispatch(device, queue, pipelines, data, width, &compact); };
+      const Dispatch listed = runCompact();
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        data.referenceMask = lanes[lane];
+        const std::vector<BFloat16Bits> expected = cpuReference(data, shape.int8());
+        const uint64_t laneBytes = expected.size() * sizeof(BFloat16Bits);
+        const std::vector<uint8_t> output(listed.output.begin() + lane * laneBytes,
+                                          listed.output.begin() + (lane + 1) * laneBytes);
+        checkOutput(data, 1, expected, expected, output, false,
+                    name + " page list min=" + std::to_string(minPages) + " lane=" + std::to_string(lane));
+      }
+      requireIdentical(name, data, width, listed, runCompact(), "page-list attention repeat");
+    }
+  }
   if (std::getenv("SPLASH_TEST_DIGEST")) {
     // Compare two builds of the kernel byte for byte: the same line per case.
     uint64_t hash = 1469598103934665603ull;

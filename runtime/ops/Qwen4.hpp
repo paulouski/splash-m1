@@ -69,6 +69,10 @@ struct Qwen4 final {
   static void addQsaSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, QsaIndex index,
                            metal::MetalBuffer pageTable, metal::MetalBuffer scores, uint32_t scoreRows,
                            metal::MetalBuffer mask, QsaRows rows);
+  // The page list of a lane's rows' bitmaps (`mask` holds just those rows): the
+  // count, then the pages some row attends, in `list`.
+  static void addQsaPages(metal::CommandGraph &graph, metal::MetalBuffer mask, metal::MetalBuffer list,
+                          QsaRows rows);
 
   // streams[r] = rows of fp32 [streams][hidden], each a copy of embedding[r].
   static void addInit(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer streams,

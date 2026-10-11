@@ -222,7 +222,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
-  putQwen4<DecodeTensor>(geometry, r, r, r / 4 + 1, put);
+  // One score row past the lane's r rows holds its QSA page list.
+  putQwen4<DecodeTensor>(geometry, r, r + 1, r / 4 + 1, put);
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,

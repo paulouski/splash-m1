@@ -73,6 +73,12 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
   return (pages + splits - 1) / splits;
 }
 
+// The splits a compacted page list of `count` pages uses: at most `splits`,
+// each holding at least min_pages pages of the list when there are enough.
+inline uint splash_compact_splits(uint count, uint splits, uint min_pages) {
+  return min(splits, max(1u, (count + min_pages - 1) / min_pages));
+}
+
 // One Page32 block of one tile: key-scaled scores become value-scaled bf16
 // probabilities and the row statistics advance. Four lanes own one fused row,
 // eight consecutive tokens each, so the row maximum and sum are two xor
@@ -335,6 +341,42 @@ inline void splash_attention_reduce_row(
   float numerator = 0.0f, denominator = 0.0f;
   // Keep both accumulations in the original split order. A parallel sum of
   // the denominator changes speculative acceptance on real model prompts.
+  for (uint split = 0; split < written; ++split) {
+    const float weight = weights[split];
+    const ulong stat = ((head_slot + split) * M + fused_row) * 2;
+    numerator += weight *
+        partials[((head_slot + split) * M + fused_row) * D + thread_index];
+    denominator += weight * statistics[stat + 1];
+  }
+  tile_output[fused_row * D + thread_index] =
+      bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+}
+
+// splash_attention_reduce_row over the splits of a compacted page list of
+// `count` pages (the group-of-twelve verify attention), written separately so
+// that the other kernels' reduce is unchanged.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile>
+inline void splash_attention_reduce_row_listed(
+    device const float *partials, device const float *statistics,
+    device bfloat *tile_output, uint count, uint splits, uint min_pages,
+    ulong head_slot, uint fused_row, uint thread_index,
+    threadgroup float *weights, threadgroup float *group_values) {
+  constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
+  constexpr uint D = SplashKvHeadDimension;
+  const uint per_split = splash_attention_pages_per_split(
+      count, splash_compact_splits(count, splits, min_pages));
+  const uint written = (count + per_split - 1) / per_split;
+  const uint lane = thread_index % 32, sg = thread_index / 32;
+  const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
+  const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
+  const float group_maximum = simd_max(maximum);
+  if (lane == 0) group_values[sg] = group_maximum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float row_maximum = simd_max(lane < 8 ? group_values[lane] : -INFINITY);
+  if (thread_index < written)
+    weights[thread_index] = fast::exp(maximum - row_maximum);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float numerator = 0.0f, denominator = 0.0f;
   for (uint split = 0; split < written; ++split) {
     const float weight = weights[split];
     const ulong stat = ((head_slot + split) * M + fused_row) * 2;

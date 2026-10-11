@@ -67,7 +67,8 @@ struct Qwen4Buffers final {
   metal::MetalBuffer pleGated;
   metal::MetalBuffer pleConvolution;
   // QSA: the indexer's projections (fp32), its prepared queries, the score
-  // scratch of qsaScoreRows rows, the step's bitmaps of qsaMaskWords words per
+  // scratch of qsaScoreRows rows (a decode lane's slice has one more, holding
+  // its page list), the step's bitmaps of qsaMaskWords words per
   // row, the RoPE inverse frequencies, the block records the family hook
   // wrote (Qwen4QsaBlock: a prefill sequence's from record rowBegin on, a
   // decode lane's from byte lane * qsaBlockLaneBytes) and where each
