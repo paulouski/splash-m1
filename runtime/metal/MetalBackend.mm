@@ -1134,11 +1134,16 @@ struct MetalBackend::Impl {
                 if (item.source->pipelineName == "verify_attention_q8_split_sgf_kv2_g12") {
                     // QSA coverage of the layer just run: 32-token pages holding a block some row of the tile admits.
                     const MetalBuffer *mask = nullptr;
-                    uint32_t words = 0;
+                    uint32_t words = 0, committed = 0, splitCount = 0;
                     for (const BufferBinding &b : item.source->buffers)
                         if (b.index == 8) mask = &b.buffer;
-                    for (const BytesBinding &b : item.source->bytes)
-                        if (b.index == 9 && b.sizeBytes >= 8) words = static_cast<const uint32_t *>(b.data)[0];
+                    for (const BytesBinding &b : item.source->bytes) {
+                        if (b.index == 10 && b.sizeBytes >= 8) words = static_cast<const uint32_t *>(b.data)[0];
+                        if (b.index == 7 && b.sizeBytes >= 24) {
+                            committed = static_cast<const uint32_t *>(b.data)[0];
+                            splitCount = static_cast<const uint32_t *>(b.data)[4];
+                        }
+                    }
                     const auto *bits = mask ? static_cast<const uint32_t *>(mask->contents()) : nullptr;
                     if (bits && words) {
                         std::vector<uint8_t> seen(words * 4, 0);
@@ -1157,6 +1162,36 @@ struct MetalBackend::Impl {
                         for (uint32_t page = 0; page < words * 4; ++page)
                             for (uint32_t rows = 1; rows <= 8; ++rows)
                                 if (seen[page] & ((1u << rows) - 1u)) ++counts[rows];
+                        if (splitCount) {
+                            // Kept pages per split of the contiguous partition, per threadgroup (half, simdgroup max).
+                            const uint32_t total = (committed + 8 + 31) / 32, per = (total + splitCount - 1) / splitCount;
+                            const uint32_t written = (total + per - 1) / per;
+                            uint32_t tgMax = 0, tgSum = 0, sgSum = 0, unionMax = 0, unionSum = 0, nonzero = 0;
+                            for (uint32_t split = 0; split < written; ++split) {
+                                const uint32_t p0 = split * per, p1 = std::min(total, p0 + per);
+                                uint32_t unionKept = 0;
+                                for (uint32_t page = p0; page < p1; ++page) unionKept += seen[page] ? 1 : 0;
+                                unionMax = std::max(unionMax, unionKept);
+                                unionSum += unionKept;
+                                for (uint32_t half = 0; half < 2; ++half) {
+                                    uint32_t tgKept = 0;
+                                    for (uint32_t sg = 0; sg < 6; ++sg) {
+                                        uint32_t rowsMask = 0;
+                                        for (uint32_t f = 48 * half + 8 * sg; f < 48 * half + 8 * sg + 8; ++f)
+                                            rowsMask |= 1u << std::min(f / 12, 7u);
+                                        uint32_t kept = 0;
+                                        for (uint32_t page = p0; page < p1; ++page) kept += (seen[page] & rowsMask) ? 1 : 0;
+                                        tgKept = std::max(tgKept, kept);
+                                        sgSum += kept;
+                                    }
+                                    tgMax = std::max(tgMax, tgKept);
+                                    tgSum += tgKept;
+                                    nonzero += tgKept ? 1 : 0;
+                                }
+                            }
+                            std::fprintf(log, "S pages=%u splits=%u per=%u written=%u tgmax=%u tgsum=%u sgsum=%u nonzero=%u umax=%u usum=%u\n",
+                                         total, splitCount, per, written, tgMax, tgSum, sgSum, nonzero, unionMax, unionSum);
+                        }
                         std::fprintf(log, "Q words=%u pages=%u blocks_r0=%u r1=%u r2=%u r3=%u r4=%u r8=%u\n", words,
                                      (top + 7) / 8, blocksRow0, counts[1], counts[2], counts[3], counts[4], counts[8]);
                     } else {
@@ -1582,6 +1617,20 @@ CommandTicket MetalBackend::submitCommandAsync(
     if (const char *gate = std::getenv("SPLASH_PROFILE_WHEN_FILE")) {
         struct stat info;
         impl_->dispatchProfiling = stat(gate, &info) == 0 && profileLog() != nullptr;
+        if (impl_->dispatchProfiling) {
+            // The gate file's text labels the window in the log (W lines).
+            static std::string label;
+            std::string text;
+            if (FILE *in = std::fopen(gate, "r")) {
+                char buffer[64] = {0};
+                if (std::fgets(buffer, sizeof buffer, in)) text = buffer;
+                std::fclose(in);
+            }
+            if (text != label) {
+                label = text;
+                std::fprintf(profileLog(), "W %s\n", text.c_str());
+            }
+        }
     }
     if (impl_->dispatchProfiling)
         return impl_->submitProfiled(dispatches, std::move(completion));
