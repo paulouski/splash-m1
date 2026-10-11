@@ -427,9 +427,11 @@ void Qwen4ExpTarget::addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyp
 }
 
 // A full-attention block's mixer over the step's rows (the QSA indexer, the
-// attention and its output projection) into h.branch.
+// attention and its output projection) into h.branch. Without `attend` only the
+// KV-writing parts run: the projection, the QSA index project and pool, the store.
 void Qwen4ExpTarget::addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer,
-                                        const QwenAttentionWeights &mixer, uint32_t attentionLayer) const {
+                                        const QwenAttentionWeights &mixer, uint32_t attentionLayer,
+                                        bool attend) const {
   const QwenTargetVerifyBuffers &b = step.buffers;
   const Qwen4Buffers &h = b.qwen4;
   const ops::Linear &linear = operators_.linear();
@@ -456,7 +458,7 @@ void Qwen4ExpTarget::addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWei
                            qsaBlockCount(first, kLaneRows), indexer.keyNorm, h.inverseFrequencies, b.pageTables[lane],
                            h.qsaIndex[attentionLayer]);
   }
-  if (sparse)
+  if (attend && sparse)
     for (uint32_t lane = 0; lane < step.lanes; ++lane)
       ops::Qwen4::addQsaSelect(
           step.graph, rowsOf<float>(backend_, h.qsaQueries, lane * kLaneRows, kLaneRows, kIndexWidth),
@@ -471,7 +473,8 @@ void Qwen4ExpTarget::addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWei
       step.graph, step.kvLayers[attentionLayer],
       {b.chunkKeys[attentionLayer], b.chunkValues[attentionLayer], b.fullQueries, b.attentionPartials,
        b.attentionStatistics, b.fullAttention, b.pageTables},
-      step.chunks, step.attention, ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, 0});
+      step.chunks, step.attention, ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, 0}, attend);
+  if (!attend) return;
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(
       step.graph, b.fullPacked, b.fullAttention, b.attentionHidden, geometry_.attentionQueryHeads, geometry_.kvLayout,
       step.lanes, b.linearScratch, linear.decodePlan(mixer.outputProjection, step.lanes).input());
@@ -509,7 +512,7 @@ void Qwen4ExpTarget::addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding
   ops::Qwen4::addMtpWiden(step.graph, h.gate, h.mtpStreams, hs, rows);
   const uint32_t attentionLayer = geometry_.kvLayout.attentionLayers - geometry_.qwen4.mtpLayers;
   addVerifyMix(step, mtp.block.mixerHyper, h.mtpStreams, b.normalized);
-  addVerifyAttention(step, mtp.block, std::get<QwenAttentionWeights>(mtp.block.mixer), attentionLayer);
+  addVerifyAttention(step, mtp.block, std::get<QwenAttentionWeights>(mtp.block.mixer), attentionLayer, full);
   if (!full) return;
   ops::Qwen4::addCombine(step.graph, h.mtpStreams, h.branch, h.weights, hs, rows);
   addVerifyMix(step, mtp.block.ffnHyper, h.mtpStreams, b.normalized);

@@ -51,7 +51,7 @@ private:
   void addVerifyMix(VerifyStep &step, const Qwen4HyperWeights &hyper, metal::MetalBuffer streams,
                     metal::MetalBuffer output) const;
   void addVerifyAttention(VerifyStep &step, const Qwen4ExpLayerWeights &layer, const QwenAttentionWeights &mixer,
-                          uint32_t attentionLayer) const;
+                          uint32_t attentionLayer, bool attend = true) const;
   void addMtpVerify(VerifyStep &step, metal::MetalBuffer embedding, metal::MetalBuffer history, uint32_t limit,
                     bool full) const;
   [[nodiscard]] metal::MetalBuffer mtpCarried(const metal::MetalBuffer &auxiliary) const;

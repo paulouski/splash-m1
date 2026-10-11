@@ -270,11 +270,11 @@ public:
                          const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan, QsaMask mask = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
-  // its verify rows with the plan's split counts.
+  // its verify rows with the plan's split counts (only the store when !attend).
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
-                        const VerifyAttentionPlan &plan, QsaMask mask = {});
+                        const VerifyAttentionPlan &plan, QsaMask mask = {}, bool attend = true);
 };
 
 } // namespace splash::ops

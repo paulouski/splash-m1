@@ -380,7 +380,7 @@ void PagedAttention::addPrefill(
 void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                                PagedVerifyBuffers buffers,
                                std::span<const kv::ChunkedPrefillParams> chunks,
-                               const VerifyAttentionPlan &plan, QsaMask mask) {
+                               const VerifyAttentionPlan &plan, QsaMask mask, bool attend) {
   constexpr uint32_t maximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
   if (chunks.size() != plan.lanes || buffers.pageTables.size() != maximumLanes) {
     throw std::invalid_argument("invalid paged verify batch");
@@ -407,6 +407,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
             {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
              tables[3]},
             stores, plan.storeGroups_, plan.storeThreads_);
+  if (!attend) return;
   if (masked(plan.splitPipeline))
     graph.add(std::string(plan.splitPipeline),
               {buffers.queries, buffers.partials, buffers.statistics, tables[0],
