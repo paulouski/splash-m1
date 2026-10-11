@@ -74,4 +74,5 @@ kernel void gguf_rows(device bfloat *input [[buffer(0)]], device uchar *w0 [[buf
       device bfloat *, device uchar *, device uchar *, device uchar *, device float *, constant GgufRowsParams &,  \
       uint2, uint, uint);
 GGUF_ROWS(FmtQ4K, q4k, 1) GGUF_ROWS(FmtQ4K, q4k, 2) GGUF_ROWS(FmtQ4K, q4k, 3) GGUF_ROWS(FmtQ4K, q4k, 4)
+GGUF_ROWS(FmtQ5K, q5k, 1) GGUF_ROWS(FmtQ5K, q5k, 2) GGUF_ROWS(FmtQ5K, q5k, 3) GGUF_ROWS(FmtQ5K, q5k, 4)
 #undef GGUF_ROWS

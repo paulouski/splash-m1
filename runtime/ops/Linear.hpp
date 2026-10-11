@@ -310,7 +310,7 @@ public:
                     const Projection &projection, const LinearPlan &plan,
                     const Projection *gate = nullptr) const;
 
-  // Whether addRows runs `rows` rows of the projection on this device: a single Q4_K segment into fp32 (the
+  // Whether addRows runs `rows` rows of the projection on this device: a single Q4_K or Q5_K segment into fp32 (the
   // vocabulary head) on an Apple7/8 GPU, one to four rows (LinearGguf.cpp).
   [[nodiscard]] bool rowsEligible(const Projection &projection, uint32_t rows) const noexcept;
   // Rows firstRow .. firstRow + rows - 1 of each of `lanes` lanes' SPLASH_TARGET_VERIFY_ROWS rows by dot products,

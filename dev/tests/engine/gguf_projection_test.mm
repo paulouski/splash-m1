@@ -649,17 +649,17 @@ void flashNextShapes(MetalBackend &backend, const Linear &linear) {
 }
 
 // ---------------------------------------------------------------- rows
-// The dot-product kernel of the vocabulary head (Linear::addRows, Q4_K into fp32) on [512, 2560] with padding columns:
+// The dot-product kernel of the vocabulary head (Linear::addRows, Q4_K or Q5_K into fp32) on [512, 2560] with padding columns:
 // every lane count, first row and one to three rows, on dense and sparse inputs. The rows asked for lie within fp64
 // and the rows and padding columns not asked for, the guards and the counters stay as they were; outside its domain
 // the projection is not eligible.
-void rowsKernel(MetalBackend &backend, const Linear &linear) {
+void rowsKernel(MetalBackend &backend, const Linear &linear, Fmt format, const char *name) {
   constexpr uint32_t N = 512, K = 2560, columns = N + kPadding;
-  const Tensor w = tensor(backend, Q4K, N, K);
+  const Tensor w = tensor(backend, format, N, K);
   Projection p = projection({&w}, columns);
   p.destination = FloatOutput::Float32;
   if (!linear.rowsEligible(p, 1) || !linear.rowsEligible(p, 4) || linear.rowsEligible(p, 0) || linear.rowsEligible(p, 5)) {
-    fail("rows eligibility of a Q4_K fp32 projection");
+    fail(std::string("rows eligibility of a ") + name + " fp32 projection");
     return;
   }
   Projection narrow = p;
@@ -698,7 +698,7 @@ void rowsKernel(MetalBackend &backend, const Linear &linear) {
           ++checks;
         }
   }
-  section("rows kernel: Q4_K fp32 dot products of one to three rows, 1-4 lanes, any first row, dense and sparse inputs, " +
+  section(std::string("rows kernel: ") + name + " fp32 dot products of one to three rows, 1-4 lanes, any first row, dense and sparse inputs, " +
           std::to_string(checks) + " runs within fp64, other rows and padding untouched");
 }
 
@@ -985,7 +985,8 @@ int main(int argc, char **argv) {
       }
       prefill(backend, linear);
       flashNextShapes(backend, linear);
-      rowsKernel(backend, linear);
+      rowsKernel(backend, linear, Q4K, "Q4_K");
+      rowsKernel(backend, linear, Q5K, "Q5_K");
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);

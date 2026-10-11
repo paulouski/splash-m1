@@ -607,7 +607,7 @@ bool Linear::rowsEligible(const Projection &p, uint32_t rows) const noexcept {
       p.destination != FloatOutput::Float32)
     return false;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  return segments.size() == 1 && segments.front().formatId == GGUF_FMT_Q4K &&
+  return segments.size() == 1 && (segments.front().formatId == GGUF_FMT_Q4K || segments.front().formatId == GGUF_FMT_Q5K) &&
          segments.front().outputSize % GGUF_TILE_COLUMNS == 0 && segments.front().inputSize % 256 == 0;
 }
 
@@ -621,7 +621,7 @@ void Linear::addRows(metal::CommandGraph &graph, metal::MetalBuffer input, const
   if (input.sizeBytes() < uint64_t{lanes} * laneRows * k * 2 ||
       output.sizeBytes() < uint64_t{lanes} * laneRows * p.outputSize * sizeof(float))
     throw std::invalid_argument("rows projection buffers are smaller than its lanes");
-  graph.add("gguf_rows_q4k_r" + std::to_string(rows), {std::move(input), s.plane0, s.plane1Slot(), s.meta, std::move(output)},
+  graph.add(std::string(s.formatId == GGUF_FMT_Q5K ? "gguf_rows_q5k_r" : "gguf_rows_q4k_r") + std::to_string(rows), {std::move(input), s.plane0, s.plane1Slot(), s.meta, std::move(output)},
             GgufRowsParams{k, p.outputSize, firstRow}, {n / GGUF_TILE_COLUMNS, lanes, 1}, {GGUF_STAGED_THREADS, 1, 1});
 }
 
