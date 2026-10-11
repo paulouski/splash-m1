@@ -233,10 +233,13 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
     const std::string kernel = table16 ? "moe_expert_gguf_sg"
                                        : (mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") +
                                              std::to_string(plan.tileRows());
-    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : ""), std::move(bindings),
+    // Unaligned experts on the 8-row MMA tile split K over a second pair of simdgroups.
+    const bool split = unaligned && mma && plan.tileRows() == 8;
+    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : "") + (split ? "_k2" : ""), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
-              {n / GGUF_TILE_COLUMNS, tiles, 1}, {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1});
+              {n / GGUF_TILE_COLUMNS, tiles, 1},
+              {table16 ? GGUF_REGISTER_THREADS : split ? GGUF_MOE_SPLIT_THREADS : GGUF_STAGED_THREADS, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;

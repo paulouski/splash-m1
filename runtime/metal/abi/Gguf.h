@@ -17,6 +17,9 @@
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)
+// MoE decode tile of the unaligned experts (moe_expert_gguf_mma_k2): the staged tile's two simdgroups twice, one pair
+// per half of K.
+#define GGUF_MOE_SPLIT_THREADS (2 * GGUF_STAGED_THREADS)
 // Prefill tile of the staged kernels: GGUF_PREFILL_SIMDGROUPS simdgroups of
 // GGUF_PREFILL_SIMDGROUP_ROWS rows share one stage of GGUF_PREFILL_STEP
 // inputs of the tile's columns, which all threads dequantize.
