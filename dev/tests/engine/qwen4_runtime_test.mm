@@ -666,6 +666,7 @@ void run(const std::string &metallib) {
   constexpr uint32_t steps = 3;
   const std::vector<uint8_t> wholeTable = tableBytes(table);
 
+  setenv("SPLASH_LOOKUP_MIN", "0", 1);
   const Run mtp = drafting.generate(prompt, 40, 8);
   std::printf("MTP decode: %zu tokens in %zu cycles, drafted %u accepted %u:", mtp.tokens.size(), mtp.cycles.size(),
               mtp.drafted, mtp.accepted);
@@ -673,19 +674,22 @@ void run(const std::string &metallib) {
   std::printf("\n");
   checkAcceptance(mtp, spy.calls, steps);
   checkStaging(spy.calls, {mtp}, table, wholeTable, 8);
-  for (size_t i = 0; i < mtp.tokens.size(); ++i) {
-    if (mtp.tokens[i] == decoded.tokens[i]) continue;
-    // The verify rows round differently from the draft-less cycle's: only a near tie may flip.
-    std::vector<uint32_t> before = prompt;
-    before.insert(before.end(), decoded.tokens.begin(), decoded.tokens.begin() + static_cast<std::ptrdiff_t>(i));
-    const std::vector<float> logits = session.score(before, 128);
-    const float best = logits[argmax(logits)];
-    std::printf("MTP decode differs at token %zu: %u against %u, logits %.3f and %.3f of best %.3f\n", i,
-                mtp.tokens[i], decoded.tokens[i], logits[mtp.tokens[i]], logits[decoded.tokens[i]], best);
-    require(logits[mtp.tokens[i]] > best - 0.3F && logits[decoded.tokens[i]] > best - 0.3F,
-            "the MTP decode left the draft-less decode before a near tie");
-    break;
-  }
+  const auto sameAsDraftless = [&](const Run &other, const char *what) {
+    for (size_t i = 0; i < other.tokens.size(); ++i) {
+      if (other.tokens[i] == decoded.tokens[i]) continue;
+      // The verify rows round differently from the draft-less cycle's: only a near tie may flip.
+      std::vector<uint32_t> before = prompt;
+      before.insert(before.end(), decoded.tokens.begin(), decoded.tokens.begin() + static_cast<std::ptrdiff_t>(i));
+      const std::vector<float> logits = session.score(before, 128);
+      const float best = logits[argmax(logits)];
+      std::printf("%s differs at token %zu: %u against %u, logits %.3f and %.3f of best %.3f\n", what, i,
+                  other.tokens[i], decoded.tokens[i], logits[other.tokens[i]], logits[decoded.tokens[i]], best);
+      require(logits[other.tokens[i]] > best - 0.3F && logits[decoded.tokens[i]] > best - 0.3F,
+              std::string(what) + " left the draft-less decode before a near tie");
+      break;
+    }
+  };
+  sameAsDraftless(mtp, "MTP decode");
   std::printf("MTP decode == draft-less decode (or a near tie)\n");
 
   // A budget that ends mid-cycle leaves the last cycle's later rows inactive in the MoE (they select no expert):
@@ -702,7 +706,9 @@ void run(const std::string &metallib) {
                 std::string(what) + " with a budget of " + std::to_string(budget) + " reports other logprobs");
     }
   };
+  setenv("SPLASH_LOOKUP_MIN", "2", 1);
   samePrefix(session, decoded, "draft-less decode");
+  setenv("SPLASH_LOOKUP_MIN", "0", 1);
   samePrefix(drafting, mtp, "MTP decode");
   std::printf("budgets ending mid-cycle == the long run's prefix\n");
 
@@ -740,6 +746,20 @@ void run(const std::string &metallib) {
       require(a[cycle] == b[cycle], "a batch of two changed the MTP head's proposals");
   }
   std::printf("MTP: chunked prefill and a batch of two propose what the one request does\n");
+
+  // A long enough match proposes in place of the head: those cycles skip the draft command and verify the lookup's
+  // rows, the others keep the head's; the tokens are the draft-less decode's.
+  setenv("SPLASH_LOOKUP_MIN", "2", 1);
+  const size_t hybridBefore = spy.calls.size();
+  const Run hybrid = drafting.generate(prompt, 40, 8);
+  const size_t lookups = std::count_if(hybrid.cycles.begin(), hybrid.cycles.end(),
+                                       [](const Cycle &c) { return c.drafted != steps; });
+  std::printf("MTP + lookup: %zu cycles, %zu lookup cycles\n", hybrid.cycles.size(), lookups);
+  require(lookups > 0 && lookups < hybrid.cycles.size(), "the hybrid decode did not mix lookup and MTP cycles");
+  require(spy.calls.size() - hybridBefore == hybrid.cycles.size(), "a hybrid cycle staged no verify rows");
+  sameAsDraftless(hybrid, "MTP + lookup decode");
+  checkStaging(spy.calls, {hybrid}, table, wholeTable, 8);
+  setenv("SPLASH_LOOKUP_MIN", "0", 1);
 
   // The engine polls the ticket instead of waiting for it: the verify is staged and submitted from the poll.
   drafting.pollTickets(true);

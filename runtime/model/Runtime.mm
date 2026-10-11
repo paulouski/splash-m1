@@ -790,10 +790,8 @@ struct Runtime::Impl {
   // L tokens long and followed by a full proposal, supplies the draft. The
   // target still verifies every token, so a wrong guess costs only the cycle.
   static bool promptLookup(Request &entry, uint32_t anchor, uint32_t *proposed) {
-    static const uint32_t minLen =
-        std::getenv("SPLASH_LOOKUP_MIN")
-            ? static_cast<uint32_t>(std::atoi(std::getenv("SPLASH_LOOKUP_MIN")))
-            : 16;
+    const char *raw = std::getenv("SPLASH_LOOKUP_MIN");
+    const uint32_t minLen = raw ? static_cast<uint32_t>(std::atoi(raw)) : 16;
     constexpr size_t kMaxLen = 64;
     if (minLen == 0 || entry.history.size() <= kDraftProposalTokens)
       return false;
@@ -2750,7 +2748,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
                         entry.decodePolicy.mode() == engine::DecodeMode::Ar;
     // The MTP head drafts every unconstrained cycle that decodes more than
     // the anchor.
-    const bool mtpLane = impl_->targetModel.hasMtp() && !constrained && !arLane;
+    bool mtpLane = impl_->targetModel.hasMtp() && !constrained && !arLane;
+    // A long n-gram match proposes in place of the MTP head: no draft command,
+    // and the verify's PLE rows are host-known.
+    bool lookupHit = false;
+    if (mtpLane && width == 1) {
+      lookupHit = Impl::promptLookup(entry, *entry.pendingToken, impl_->proposedTokens(lane));
+      mtpLane = !lookupHit;
+    }
     const bool noDraft = !impl_->draftModel && !mtpLane;
     laneResult.maximumRetained =
         arLane ? 1u : std::min(remaining, mtpLane ? impl_->mtpDraftSteps + 1 : kDecodeRows);
@@ -2762,7 +2767,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     } else if (!constrained && width == 1) {
       uint32_t *lookupTokens = impl_->proposedTokens(lane);
       laneResult.lookup =
-          !arLane && Impl::promptLookup(entry, *entry.pendingToken, lookupTokens);
+          lookupHit || (!arLane && Impl::promptLookup(entry, *entry.pendingToken, lookupTokens));
       if (laneResult.lookup && Impl::samplingEnabled(entry))
         impl_->stageLookupSamplingProposal(lane, lookupTokens);
       // A prompt-lookup miss decodes row 0 alone: no draft, one token retained.
