@@ -93,6 +93,17 @@ struct MoeGgufExpertParams {
 static_assert(sizeof(MoeGgufExpertParams) == 20,
               "MoE GGUF expert parameters are 20 bytes on both sides");
 
+// The fused gate + up pass over the unaligned 8-row tile (moe_expert_gguf_mma_gu_k2): both projections' parameters
+// and the route divisor that maps a grouped row's route to its input row.
+struct MoeGgufGateUpParams {
+  MoeGgufExpertParams gate;
+  MoeGgufExpertParams up;
+  uint32_t routes_per_row;
+};
+
+static_assert(sizeof(MoeGgufGateUpParams) == 44,
+              "MoE GGUF gate/up parameters are 44 bytes on both sides");
+
 struct MoeCombineParams {
   uint32_t rows;
   uint32_t hidden_size;

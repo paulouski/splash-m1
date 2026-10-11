@@ -64,6 +64,19 @@ inline void load_inputs(device const T *x, uint input_size, uint k0, sgmatrix::L
       v[r][e] = *reinterpret_cast<device const uint2 *>(x + ulong(8 * r + l.fn + e) * input_size + k);
 }
 
+// The two input rows a lane reads of an 8-row tile, taken from the layer's input rows through the tile's routes
+// (null: a padding row, read as zeros) instead of from a gathered copy.
+struct RoutedRows {
+  device const bfloat *row[2];
+};
+template <uint FM>
+inline void load_inputs(RoutedRows x, uint, uint k0, sgmatrix::Lane l, thread uint2 (&v)[FM][2]) {
+  static_assert(FM == 1, "routed rows hold one 8-row fragment");
+  const uint k = k0 + 4 * (l.fm >> 1) + 16 * (l.fm & 1);
+#pragma unroll
+  for (uint e = 0; e < 2; ++e) v[0][e] = x.row[e] ? *reinterpret_cast<device const uint2 *>(x.row[e] + k) : uint2(0);
+}
+
 // acc += one group of FN column fragments, a(i, j) giving the lane's A elements of fragment i at step j, times the
 // lane's activations v.
 template <uint FM, class A>
@@ -109,8 +122,8 @@ template <uint FM, class Fn> inline void elements(thread float2 (&acc)[FN][FM], 
 // weights before the multiply. Decoding each column's coefficients once per group this way beat decoding every
 // lane's own chunks in registers on an M1 Max (Q4_K 5120 x 17408, ms at one and four lanes: 0.38 and 1.0 against
 // 0.46 and 2.2).
-template <class F, uint FM>
-inline void accumulate(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
+template <class F, uint FM, class X = device const bfloat *>
+inline void accumulate(X x, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                        uint origin, threadgroup half *stage, threadgroup half2 *tl, uint lane, uint step_begin,
                        uint step_end, thread float2 (&acc)[FN][FM]) {
   if (step_begin >= step_end) return;

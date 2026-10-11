@@ -203,12 +203,19 @@ void addAffineExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
   }
 }
 
+// Unaligned experts on the 8-row MMA tile run gate and up as one pass that reads the layer's input rows through
+// the grouped routes, so no gather precedes it.
+bool fusedGateUp(const MoePlan &plan) {
+  return plan.configuration().ggufTile == MoeGgufTile::Mma && plan.tileRows() == 8 &&
+         plan.shape().expertIntermediateSize % QUANT_TILE_ROWS != 0;
+}
+
 // The three GGUF expert passes over grouped tiles: gate into expertOutput
 // (the down pass overwrites it after the up pass consumed it), up with
 // silu(gate) into expertIntermediate, down into expertOutput. Register plans
 // read Table16 tiles from groupedInput: the gather writes the gate/up input's
 // and a prepare dispatch the down input's.
-void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
+void addGgufExperts(metal::CommandGraph &graph, const metal::MetalBuffer &layerInput, const MoeScratch &scratch,
                     const BlockMoeWeights &weights, const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
@@ -233,20 +240,34 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeScratch &scratch,
     const std::string kernel = table16 ? "moe_expert_gguf_sg"
                                        : (mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") +
                                              std::to_string(plan.tileRows());
-    // Unaligned experts on the 8-row MMA tile split K over a second pair of simdgroups.
-    const bool split = unaligned && mma && plan.tileRows() == 8;
-    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : "") + (split ? "_k2" : ""), std::move(bindings),
+    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : ""), std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
               {n / GGUF_TILE_COLUMNS, tiles, 1},
-              {table16 ? GGUF_REGISTER_THREADS : split ? GGUF_MOE_SPLIT_THREADS : GGUF_STAGED_THREADS, 1, 1});
+              {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
-  pass(weights.gate, false, scratch.groupedInput, scratch.expertOutput,
-       intermediate, hidden);
-  pass(weights.up, true, scratch.groupedInput, scratch.expertIntermediate,
-       intermediate, hidden);
+  if (fusedGateUp(plan)) {
+    std::vector<metal::MetalBuffer> bindings{layerInput, scratch.groupedRoutes, scratch.tileDescriptors, scratch.tileCount};
+    for (const BlockExpertProjection *projection : {&weights.gate, &weights.up})
+      bindings.insert(bindings.end(),
+                      {projection->routed.plane0, projection->routed.plane1Slot(), projection->routed.meta,
+                       projection->shared.plane0, projection->shared.plane1Slot(), projection->shared.meta});
+    bindings.push_back(scratch.expertIntermediate);
+    const auto params = [&](const BlockExpertProjection &projection) {
+      return MoeGgufExpertParams{hidden, intermediate, shape.experts, projection.routed.formatId,
+                                 projection.shared.formatId};
+    };
+    graph.add("moe_expert_gguf_mma_gu_k2", std::move(bindings),
+              MoeGgufGateUpParams{params(weights.gate), params(weights.up), shape.routesPerToken()},
+              {intermediate / GGUF_TILE_COLUMNS, tiles, 1}, {2 * GGUF_MOE_SPLIT_THREADS, 1, 1});
+  } else {
+    pass(weights.gate, false, scratch.groupedInput, scratch.expertOutput,
+         intermediate, hidden);
+    pass(weights.up, true, scratch.groupedInput, scratch.expertIntermediate,
+         intermediate, hidden);
+  }
   if (table16)
     graph.add("moe_prepare_table16",
               {scratch.expertIntermediate, scratch.tileCount,
@@ -351,18 +372,21 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                            shape.experts},
             {1, 1, 1}, {shape.routerWidth(), 1, 1});
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.configuration().ggufTile == MoeGgufTile::Register)
-    graph.add("moe_gather_table16",
-              {buffers.input, scratch.groupedRoutes, scratch.tileCount,
-               scratch.groupedInput, scratch.groupedSums},
-              gather, {tiles, shape.hiddenSize / 256, 1});
-  else
-    graph.add("moe_gather_rows",
-              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
-               scratch.tileCount, scratch.groupedInput},
-              gather, {tiles, shape.hiddenSize / 256, 1});
+  // The fused gate/up pass reads the input rows through the routes: no gathered copy.
+  if (!(block && fusedGateUp(plan))) {
+    if (plan.configuration().ggufTile == MoeGgufTile::Register)
+      graph.add("moe_gather_table16",
+                {buffers.input, scratch.groupedRoutes, scratch.tileCount,
+                 scratch.groupedInput, scratch.groupedSums},
+                gather, {tiles, shape.hiddenSize / 256, 1});
+    else
+      graph.add("moe_gather_rows",
+                {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
+                 scratch.tileCount, scratch.groupedInput},
+                gather, {tiles, shape.hiddenSize / 256, 1});
+  }
   if (block)
-    addGgufExperts(graph, scratch, weights.blocks(), plan);
+    addGgufExperts(graph, buffers.input, scratch, weights.blocks(), plan);
   else
     addAffineExperts(graph, scratch, weights.affine(), plan);
   graph.add("moe_combine",
