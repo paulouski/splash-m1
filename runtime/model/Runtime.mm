@@ -310,10 +310,10 @@ struct Runtime::Impl {
   std::unique_ptr<DFlashDraft> draftModel;
   uint32_t prefillRows = kPrefillRows;
   uint32_t decodeLanes = kLaneCount;
-  // Proposals the MTP head drafts per cycle (SPLASH_MTP_DRAFTS, 1 to 7).
+  // Proposals the MTP head drafts per cycle (SPLASH_MTP_DRAFTS, 1 to 7, default 4).
   const uint32_t mtpDraftSteps = [] {
     const char *value = std::getenv("SPLASH_MTP_DRAFTS");
-    if (!value || !*value) return 3L;
+    if (!value || !*value) return 4L;
     return std::clamp<long>(std::strtol(value, nullptr, 10), 1, kDraftProposalTokens);
   }();
   // Read once at startup (SPLASH_DECODE_LADDER and friends); --decode-ladder

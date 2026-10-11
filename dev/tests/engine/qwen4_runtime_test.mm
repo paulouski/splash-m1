@@ -663,7 +663,7 @@ void run(const std::string &metallib) {
   auto spyOwner = std::make_unique<SpyFamily>(model::makeFamilyRuntime(mtpPackage), heads);
   SpyFamily &spy = *spyOwner;
   Session drafting(backend, mtpPackage, std::move(spyOwner));
-  constexpr uint32_t steps = 3;
+  constexpr uint32_t steps = 4;
   const std::vector<uint8_t> wholeTable = tableBytes(table);
 
   setenv("SPLASH_LOOKUP_MIN", "0", 1);
