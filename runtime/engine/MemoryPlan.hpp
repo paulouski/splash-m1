@@ -48,7 +48,7 @@ struct ModelMemoryFootprint final {
   uint64_t stateStagingBytes = 0;
   // Rows of the packed prefill chunk runtime.sharedPrefillPlannedAllocatedBytes
   // was sized for, and the concurrent decode lanes of its decode arena.
-  uint32_t prefillRows = model::ExecutionLimits::defaultPrefillRows;
+  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
   uint32_t decodeLanes = model::ExecutionLimits::maximumBatchWidth;
   // One cached composite state (prefix-cache snapshot), zero when unknown.
   uint64_t cachedStateBytes = 0;
@@ -128,7 +128,7 @@ struct EngineMemoryBreakdown {
   uint64_t visionWeightsBytes = 0;
   uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
   // Rows of the packed prefill chunk sharedPrefillBytes was sized for.
-  uint32_t prefillRows = model::ExecutionLimits::defaultPrefillRows;
+  uint32_t prefillRows = model::ExecutionLimits::prefillTokenBudget;
   uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;

@@ -382,8 +382,6 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
-  // Rows of the packed prefill arena the memory plan starts from.
-  static constexpr uint32_t defaultPrefillRows = 1024;
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
   // pool allocates when it is built.
   static constexpr uint32_t warmupKvPages =

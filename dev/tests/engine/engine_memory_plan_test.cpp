@@ -319,7 +319,6 @@ ModelMemoryProfile bonsai() {
   result.name = "Ternary-Bonsai-2-27B";
   result.footprint.runtime = {350'224'384ULL, 785'580'032ULL, 262'662'272ULL};
   result.footprint.cachedStateBytes = 196'083'712ULL;
-  result.footprint.prefillRows = model::ExecutionLimits::prefillTokenBudget;
   return result;
 }
 
@@ -366,7 +365,7 @@ void testAdaptivePrefillKeepsFittingPlansUnchanged() {
       const auto adaptive =
           evaluateAdaptiveMemoryPlan(max, profile, cap, neverCalled, neverCalled);
       require(adaptive.plan && adaptive.plan->breakdown().prefillRows ==
-                                   model::ExecutionLimits::defaultPrefillRows &&
+                                   model::ExecutionLimits::prefillTokenBudget &&
                   adaptive.plan->breakdown().maximumBatchWidth ==
                       model::ExecutionLimits::maximumBatchWidth,
               "a fitting plan changed its prefill rows or lanes");
