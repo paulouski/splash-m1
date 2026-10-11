@@ -369,7 +369,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
       [&](uint32_t lanes) {
         return model::plannedRuntimeMemory(
                    device, package, operators, config.kvFormat,
-                   model::ExecutionLimits::prefillTokenBudget, lanes)
+                   model::ExecutionLimits::defaultPrefillRows, lanes)
             .sharedDecodePlannedAllocatedBytes;
       });
   if (!planResult.plan) {
@@ -380,7 +380,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config) {
   EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
   {
     const EngineMemoryBreakdown &chosen = memoryPlan.breakdown();
-    if (chosen.prefillRows != model::ExecutionLimits::prefillTokenBudget ||
+    if (chosen.prefillRows != model::ExecutionLimits::defaultPrefillRows ||
         chosen.maximumBatchWidth != model::ExecutionLimits::maximumBatchWidth) {
       logStartup("Memory budget too small for the default configuration; "
                  "packed prefill chunks reduced to ",

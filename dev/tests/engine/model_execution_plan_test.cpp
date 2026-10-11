@@ -212,17 +212,18 @@ void checkPrefillRowCap(const model::ModelPackage &package) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     ops::ExecutionPlans plans(device);
-    const auto full = model::plannedRuntimeMemory(device, package, plans);
+    const auto full = model::plannedRuntimeMemory(
+        device, package, plans, kv::Format::Int8, model::ExecutionLimits::prefillTokenBudget);
     const auto explicitFull = model::plannedRuntimeMemory(
-        device, package, plans, kv::Format::Int8,
-        model::ExecutionLimits::prefillTokenBudget,
+        device, package, plans, kv::Format::Int8, model::ExecutionLimits::defaultPrefillRows,
         model::ExecutionLimits::maximumBatchWidth);
+    const auto defaulted = model::plannedRuntimeMemory(device, package, plans);
     const auto half = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 1024);
     const auto quarter = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 512);
     const auto eighth = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 256);
     const auto sixteenth = model::plannedRuntimeMemory(device, package, plans, kv::Format::Int8, 128);
     const uint64_t decode = full.sharedDecodePlannedAllocatedBytes;
-    require(full.sharedPrefillPlannedAllocatedBytes ==
+    require(defaulted.sharedPrefillPlannedAllocatedBytes ==
                     explicitFull.sharedPrefillPlannedAllocatedBytes &&
                 decode == explicitFull.sharedDecodePlannedAllocatedBytes &&
                 full.laneStatePlannedAllocatedBytes ==
@@ -254,7 +255,7 @@ void checkDecodeLanes(const model::ModelPackage &package) {
     const auto full = model::plannedRuntimeMemory(device, package, plans);
     const auto single = model::plannedRuntimeMemory(
         device, package, plans, kv::Format::Int8,
-        model::ExecutionLimits::prefillTokenBudget, 1);
+        model::ExecutionLimits::defaultPrefillRows, 1);
     require(single.sharedDecodePlannedAllocatedBytes <
                     full.sharedDecodePlannedAllocatedBytes &&
                 single.sharedPrefillPlannedAllocatedBytes ==

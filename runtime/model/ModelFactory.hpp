@@ -71,7 +71,7 @@ struct RuntimeContext final {
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
   // Packed-prefill row cap the shared prefill arena is sized for.
-  uint32_t prefillRows = ExecutionLimits::prefillTokenBudget;
+  uint32_t prefillRows = ExecutionLimits::defaultPrefillRows;
   // Concurrent lanes the shared decode arena is sized for.
   uint32_t decodeLanes = ExecutionLimits::maximumBatchWidth;
 };
@@ -133,7 +133,7 @@ plannedRuntimeMemory(const DeviceCapabilities &device,
                      const ModelPackage &package,
                      const ops::ExecutionPlans &operators,
                      kv::Format format = kv::Format::Int8,
-                     uint32_t prefillRows = ExecutionLimits::prefillTokenBudget,
+                     uint32_t prefillRows = ExecutionLimits::defaultPrefillRows,
                      uint32_t decodeLanes = ExecutionLimits::maximumBatchWidth);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
