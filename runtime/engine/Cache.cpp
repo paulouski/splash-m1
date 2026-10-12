@@ -510,6 +510,18 @@ CacheReclaimResult Cache::reclaimStatesTo(uint64_t capBytes) {
   return total;
 }
 
+CacheReclaimResult Cache::reclaimDeadKv() {
+  CacheReclaimResult total;
+  for (auto leaf = oldestDeadKvLeaf(0); leaf; leaf = oldestDeadKvLeaf(0)) {
+    if (reclaimKvLeaf(leaf->id, ReclaimTiming::Immediate) != LeafReclaim::Started)
+      break;
+    total.madeProgress = true;
+  }
+  if (total.madeProgress)
+    total.reclaimedBytes = pool_.reclaimEmptyExtents(true, std::numeric_limits<uint32_t>::max());
+  return total;
+}
+
 std::optional<CacheEvictionCandidate> Cache::oldestDeadKvLeaf(uint64_t after) const {
   while (auto candidate = kv_.evictionCandidate(after)) {
     after = candidate->id;

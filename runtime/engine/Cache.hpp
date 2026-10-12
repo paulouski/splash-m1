@@ -373,6 +373,10 @@ public:
   // ones, until the states in RAM take at most capBytes or only the resume
   // point and states in use are left. Reports an eviction as evictedState.
   [[nodiscard]] CacheReclaimResult reclaimStatesTo(uint64_t capBytes);
+  // Erases every KV leaf no state restores through (oldestDeadKvLeaf), a
+  // chain at a time from its tail, and returns the extents that empties,
+  // keeping one warm.
+  CacheReclaimResult reclaimDeadKv();
   [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
     return states_.evictableStates(upTo == ReclaimClass::InUse);
   }

@@ -1107,6 +1107,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
         ++publications;
         if (config_.maxStateCacheBytes &&
             cache_.reclaimStatesTo(config_.maxStateCacheBytes).evictedState) {
+          // A dead KV chain no state restores through goes with its states.
+          cache_.reclaimDeadKv();
           // Evicted buffers park in the model's pool; hand them to the host.
           while (model_.reclaimIdleState(true, model::IdleMemory::Buffers)) {
           }

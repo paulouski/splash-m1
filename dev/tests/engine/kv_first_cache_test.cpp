@@ -3474,6 +3474,27 @@ void testLaneTakesStatesInUseLast() {
           "a lane could not take the last state in use");
 }
 
+// KV past the last state of a branch restores nothing: with the older
+// state recycled, the chain it sat on goes, its extents back but one kept warm, and the block
+// under the newest state stays.
+void testDeadKvGoesWithItsStates() {
+  CacheFixture fixture;
+  fixture.publish(3);
+  fixture.publish(0);
+  require(!fixture.cache.reclaimDeadKv().madeProgress,
+          "KV a state restores through was erased");
+  require(fixture.cache.reclaimStatesTo(100).evictedState,
+          "the cap did not take the older state");
+  const bool progressed = fixture.cache.reclaimDeadKv().madeProgress;
+  const auto pages = fixture.pool.snapshot();
+  const auto kept = fixture.lookup(129);
+  require(progressed && pages.pagesAllocated == 2 && pages.extentReleases == 2 &&
+              kept.kvBoundary == 32 && kept.resumeBoundary() == 32,
+          "dead KV stayed after its states went");
+  require(!fixture.cache.reclaimDeadKv().madeProgress,
+          "the newest state's KV was erased");
+}
+
 // The RAM cap on states recycles checkpoints and the oldest ordinary states
 // and keeps the newest publication and states in use.
 void testStateCapKeepsNewestAndInUse() {
@@ -4140,6 +4161,7 @@ int main() {
   try {
     testStateInUseGoesLast();
     testStateCapKeepsNewestAndInUse();
+    testDeadKvGoesWithItsStates();
     testKvAStateInUseNeedsGoesLast();
     testStateUsesAreCountedPerBlock();
     testKvInUseFollowsItsState();
