@@ -29,9 +29,10 @@
 //     MXFP4 indices (4 bits, so byte p of word c is pair p), Q8_0 values (8),
 //     Q6_K high, Q3_K low, Q2_K, Q2_0 and PQ2_0 bits (2), Q5_K fifth and Q3_K hmask
 //     bits (1).
-//   IQ3_S word c: bits 0..7 and 8..15 the low grid index bits of elements
-//     4c..4c+3 and 16+4c..16+4c+3, 16..23 the sign bits of slots 8c..8c+7,
-//     24 and 25 the two ninth index bits, 26..29 the group's scale.
+//   IQ3_S plane0's 14 bytes: four little-endian halfwords at offsets 0..7
+//     hold the low grid indices qs[c], qs[4+c]; bytes 8..11 hold the sign
+//     bits of slots 8c..8c+7; the halfword at 12 holds qh in bits 0..7 and
+//     the group's scale in bits 8..11.
 //   IQ3_XXS, IQ2 and IQ1 keep the group's native bytes, whose grid entries
 //     span four or eight elements and so several chunks: its block_*'s fields
 //     for the group's 32 elements, split between the planes as its row below
@@ -87,7 +88,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {14, 256, 210, 16, 8, 20, 8, "q6k"},  // plane1: high 2 bits; meta: 16 int8 scales, d, 0, 0
     {11, 256, 110, 8, 4, 16, 8, "q3k"},   // plane1: hmask bits; meta: d, 0, 0, 12 scale bytes
     {8, 32, 34, 32, 0, 2, 1, "q80"},      // meta: d
-    {21, 256, 110, 16, 0, 2, 8, "iq3s"},  // plane0 also holds signs, qh and the scale; meta: d
+    {21, 256, 110, 14, 0, 2, 8, "iq3s"},  // plane0: index pairs, signs, qh, scale; meta: d
     {10, 256, 84, 8, 0, 20, 8, "q2k"},    // meta: d, dmin, the 16 scale bytes
     {18, 256, 98, 8, 4, 2, 8, "iq3xxs"},  // plane0: qs; plane1: the sign and scale word; meta: d
     {16, 256, 66, 8, 0, 2, 8, "iq2xxs"},  // plane0: the grid index and the sign and scale words; meta: d

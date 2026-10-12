@@ -237,15 +237,16 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
           vals[8 * l + 4 + k] = db * g2[k] * ((signs[l] & (1 << (4 + k))) ? -1.f : 1.f);
         }
       }
-      // word c: grid indices of elements 4c.. and 16+4c.. (qs[c], qs[4 + c]), chunk c's signs, their ninth bits,
-      // the scale
+      // Four index-pair halfwords, four sign bytes, then qh in control bits 0..7 and scale in bits 8..11.
       for (int k = 0; k < 32; ++k) hi[quant_slot(k)] = (signs[k / 8] >> (k % 8)) & 1;
       uint8_t sign[4]; packBits(hi, 1, sign);
       for (int c = 0; c < 4; ++c) {
-        const uint32_t v = qs[c] | uint32_t(qs[4 + c]) << 8 | uint32_t(sign[c]) << 16 | ((qh[j] >> c) & 1u) << 24 |
-                           ((qh[j] >> (4 + c)) & 1u) << 25 | sc << 26;
-        memcpy(p0 + 4 * c, &v, 4);
+        const uint16_t pair = uint16_t(qs[c]) | uint16_t(qs[4 + c]) << 8;
+        memcpy(p0 + 2 * c, &pair, 2);
+        p0[8 + c] = sign[c];
       }
+      const uint16_t control = uint16_t(qh[j]) | uint16_t(sc) << 8;
+      memcpy(p0 + 12, &control, 2);
       return;
     }
     case Q2K: {

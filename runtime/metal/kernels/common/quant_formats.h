@@ -205,15 +205,28 @@ struct FmtQ80 {
   static uint2 values(Chunk q) { return q; }
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
 };
-// IQ3_S: plane0 word c = the 8-bit grid indices of pairs 0, 1 and 2, 3, chunk c's sign bits, the two ninth index
-// bits and the group's 4-bit scale; meta half d per super-block. value = d * (1 + 2 * scale) * signed grid value.
+// IQ3_S: plane0 has four 16-bit index pairs, four sign bytes, and one 16-bit qh/scale field; meta half d per
+// super-block. value = d * (1 + 2 * scale) * signed grid value.
 struct FmtIQ3S {
   QUANT_FORMAT(GGUF_FMT_IQ3S, QuantGrid, 0, 32, true);
   struct Payload { uint4 a; }; typedef uint Chunk; typedef ushort Meta;
-  static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
+  static Chunk decode(device uchar *p0, ushort c, ushort control) {
+    const uint indices = *((device ushort *)(p0 + 2 * c));
+    const uint sign = p0[8 + c];
+    return indices | sign << 16 | uint((control >> c) & 1) << 24 | uint((control >> (4 + c)) & 1) << 25 |
+           uint(control >> 8) << 26;
+  }
+  static Payload load(device uchar *p0, device uchar *) {
+    const ushort control = *((device ushort *)(p0 + 12));
+    Payload w;
+    w.a = uint4(decode(p0, 0, control), decode(p0, 1, control), decode(p0, 2, control), decode(p0, 3, control));
+    return w;
+  }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
   static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
-  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) {
+    return decode(p0, c, *((device ushort *)(p0 + 12)));
+  }
   static uint2 grid(Chunk q) { return uint2(kIQ3SGrid[(q & 0xFF) | ((q >> 16) & 0x100)], kIQ3SGrid[((q >> 8) & 0xFF) | ((q >> 17) & 0x100)]); }
   static uint signs(Chunk q) { return (q >> 16) & 0xFF; }
   static QuantCoef coef(Meta mt, Chunk q) { return {float2(float(as_type<half>(mt)) * float(1 + 2 * ((q >> 26) & 0xF)))}; }

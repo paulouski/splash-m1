@@ -23,7 +23,7 @@
   },
   "gguf_images": {
     "dense": {
-      "target/layer-0.bin": "3cb6434604cdcae0d93b72844939421eff05f98cff74196392c2153a5c0b4ab3",
+      "target/layer-0.bin": "b23dd8620dfb328fd8d5e13e2192d7cb9a8c1c94ea870543069f5df50d6525d9",
       "target/layer-1.bin": "f7e1f9a7dec53a1a2396898a302d39e7877ee13bcb493f7240b7c9479df91bfe",
       "target/head.bin": "568caf2ce1c20591bbb6da095f1e94b47f868addf0ca3865fede7bafe7486e36",
       "target/embedding.bin": "6d17df18962f4941a0ce6538aa0092dba1073c78848a62f577a666b81a89e159"
