@@ -1105,6 +1105,13 @@ void Engine::publishReachedStateBoundaries(Request &active,
       if (state) {
         cache_.publishCompositeState(block, std::move(state), checkpoint);
         ++publications;
+        if (config_.maxStateCacheBytes &&
+            cache_.reclaimStatesTo(config_.maxStateCacheBytes).evictedState) {
+          // Evicted buffers park in the model's pool; hand them to the host.
+          while (model_.reclaimIdleState(true, model::IdleMemory::Buffers)) {
+          }
+          signalResourceProgress();
+        }
       } else if (cache_.reuseStoredState(block, checkpoint)) {
         // No cache slot takes a RAM copy of a state already on disk.
         ++counters_.deduplicatedStatePublications;

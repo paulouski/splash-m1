@@ -369,6 +369,10 @@ public:
   // reported pending, as in reclaimOne. evictableStates(upTo) are those it
   // can take.
   [[nodiscard]] CacheReclaimResult reclaimStateForLane(ReclaimClass upTo);
+  // Recycles unpinned states, checkpoints first then the oldest ordinary
+  // ones, until the states in RAM take at most capBytes or only the resume
+  // point and states in use are left. Reports an eviction as evictedState.
+  [[nodiscard]] CacheReclaimResult reclaimStatesTo(uint64_t capBytes);
   [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
     return states_.evictableStates(upTo == ReclaimClass::InUse);
   }

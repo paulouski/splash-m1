@@ -541,6 +541,7 @@ def main_args(**overrides):
             "max_context": None,
             "max_memory": None,
             "max_cache_disk": 0,
+            "max_state_cache": 0,
             "idle_unload": 0,
             "decode_share": None,
             "max_image_pixels": images.MAX_PIXELS,
@@ -3759,6 +3760,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             api._native_command(share_args)[-3:],
             [str(5 * 1024**3), "--decode-share", "0.0"],
+        )
+        self.assertNotIn("--max-state-cache", api._native_command(args))
+        cap_args = api.parse_args([*required, "--max-state-cache", "384M"])
+        self.assertEqual(
+            api._native_command(cap_args)[-2:],
+            ["--max-state-cache", str(384 * 1024**2)],
         )
         # The engine's per-image patch limit follows the pixel cap: the most
         # patches a resized image can have, a whole number of merge units.

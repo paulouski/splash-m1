@@ -308,6 +308,15 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--max-state-cache",
+        dict(
+            type=parse_max_cache_disk,
+            default=0,
+            help="RAM cap for cached recurrent states, e.g. 384M (default: 0, "
+            "no cap)",
+        ),
+    ),
+    ServeOption(
         "--max-context",
         dict(
             type=parse_max_context,

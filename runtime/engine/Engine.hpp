@@ -49,6 +49,8 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
+  // Most bytes of recurrent states cached in RAM; zero is no cap.
+  uint64_t maxStateCacheBytes = 0;
   // Host growth admission, supplied by the runtime governor. Queried only
   // while resident lanes drain after a suspension; allocation reads the
   // cause of a refusal instead.

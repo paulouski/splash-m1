@@ -493,6 +493,23 @@ CacheReclaimResult Cache::reclaimStateForLane(ReclaimClass upTo) {
           .evictedState = eviction.evicted};
 }
 
+CacheReclaimResult Cache::reclaimStatesTo(uint64_t capBytes) {
+  CacheReclaimResult total;
+  while (states_.snapshot().bytes > capBytes) {
+    std::optional<CacheEvictionCandidate> state = states_.checkpointCandidate(true);
+    if (!state)
+      state = states_.ordinaryCandidate(true);
+    if (!state)
+      break;
+    const StateEviction eviction = states_.reclaim(state->id, StateCache::Unwritten::Wait);
+    total.pending = eviction.pending;
+    if (!eviction.evicted)
+      break;
+    total.madeProgress = total.evictedState = true;
+  }
+  return total;
+}
+
 std::optional<CacheEvictionCandidate> Cache::oldestDeadKvLeaf(uint64_t after) const {
   while (auto candidate = kv_.evictionCandidate(after)) {
     after = candidate->id;

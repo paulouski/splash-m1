@@ -77,6 +77,11 @@ OPTIONS = {
         {"0": 0, "5G": 5 * 1024**3},
         ("auto", "-1", "0G", "5X", "nan"),
     ),
+    "--max-state-cache": values(
+        "--max-state-cache",
+        {"0": 0, "384M": 384 * 1024**2},
+        ("auto", "-1", "0G", "5X", "nan"),
+    ),
     "--max-context": values(
         "--max-context",
         {"auto": None, "100K": 102400, "256k": 262144, "262144": 262144, "1": 1},

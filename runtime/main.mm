@@ -59,6 +59,7 @@ struct NativeArguments final {
   uint32_t maxContext = 0;
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
+  uint64_t maxStateCacheBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
   double decodeShare = engine::EngineConfig{}.decodeShare;
   uint32_t maxImagePatches = ops::kMaximumImagePatches;
@@ -333,6 +334,9 @@ NativeArguments parseArguments(int argc, char **argv) {
         throw UsageError("--kv-format bf16 is unsupported on the macOS-15 build; use int8");
 #endif
       result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+    } else if (option == "--max-state-cache") {
+      if (!parsePositive(value, result.maxStateCacheBytes))
+        throw UsageError("--max-state-cache requires a positive byte count");
     } else if (option == "--decode-share") {
       result.decodeShare = parseDecodeShare(value);
     } else if (option == "--max-image-patches") {
@@ -418,6 +422,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.prefillCommandMilliseconds = arguments.prefillCommandMilliseconds;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  config.nativeLoop.engine.maxStateCacheBytes = arguments.maxStateCacheBytes;
   return config;
 }
 

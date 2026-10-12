@@ -3474,6 +3474,30 @@ void testLaneTakesStatesInUseLast() {
           "a lane could not take the last state in use");
 }
 
+// The RAM cap on states recycles checkpoints and the oldest ordinary states
+// and keeps the newest publication and states in use.
+void testStateCapKeepsNewestAndInUse() {
+  CacheFixture fixture;
+  fixture.publish(0);
+  fixture.publish(1);
+  StateUse use = fixture.cache.useState(fixture.blocks[2]);
+  fixture.publish(2);
+  fixture.publish(3);
+  require(!fixture.cache.reclaimStatesTo(400).madeProgress &&
+              fixture.cache.snapshot().stateCache.entries == 4,
+          "a state was evicted under the cap");
+  require(fixture.cache.reclaimStatesTo(250).evictedState &&
+              fixture.cache.snapshot().stateCache.bytes == 200 &&
+              !fixture.cache.stateResident(fixture.blocks[0]) &&
+              !fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.stateResident(fixture.blocks[2]) &&
+              fixture.cache.stateResident(fixture.blocks[3]),
+          "the cap did not evict the oldest states");
+  require(!fixture.cache.reclaimStatesTo(0).madeProgress &&
+              fixture.cache.snapshot().stateCache.bytes == 200,
+          "the cap took the newest state or one in use");
+}
+
 // Work that a resident lane holds back reclaims up to the ordinary class:
 // the ordinary state and the stateless KV go, and then it stops short of the
 // state in use and the KV that state restores through, with nothing pending.
@@ -4115,6 +4139,7 @@ void testPublicationReleasesTheExtentItEmpties() {
 int main() {
   try {
     testStateInUseGoesLast();
+    testStateCapKeepsNewestAndInUse();
     testKvAStateInUseNeedsGoesLast();
     testStateUsesAreCountedPerBlock();
     testKvInUseFollowsItsState();

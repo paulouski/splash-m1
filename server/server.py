@@ -2065,6 +2065,8 @@ def _native_command(args, prefill_bound_ms=None):
     ]
     if args.max_cache_disk:
         command.append(str(args.max_cache_disk))
+    if args.max_state_cache:
+        command.extend(("--max-state-cache", str(args.max_state_cache)))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
     if args.decode_share is not None:
