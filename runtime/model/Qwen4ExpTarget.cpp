@@ -22,9 +22,10 @@ namespace {
 
 constexpr uint32_t kLaneRows = ExecutionLimits::targetVerifyRows;
 // The Neural Engine takes prefill chunks of 512 to this many rows, and this share of the columns of the
-// projections it is given (SPLASH_ANE_FRACTION).
+// input projections it is given (SPLASH_ANE_FRACTION), and of the output ones (SPLASH_ANE_OUTPUT_FRACTION).
 constexpr uint32_t kAneMaximumRows = 1024;
 constexpr double kAneFraction = 0.55;
+constexpr double kAneOutputFraction = 0.42;
 constexpr uint32_t kIndexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
 
 template <class T>
@@ -108,12 +109,24 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
   if (!geometry_.qwen4 || weights.layers.size() != geometry_.layers)
     throw std::invalid_argument("Qwen3.8-Flash-Next weights do not match execution geometry");
   if (!ane::requested()) return;
-  const char *override = std::getenv("SPLASH_ANE_FRACTION");
-  const double fraction = override && override[0] ? std::atof(override) : kAneFraction;
+  const auto fractionOf = [](const char *name, double fallback) {
+    const char *override = std::getenv(name);
+    return override && override[0] ? std::atof(override) : fallback;
+  };
+  const double inputs = fractionOf("SPLASH_ANE_FRACTION", kAneFraction),
+               outputs = fractionOf("SPLASH_ANE_OUTPUT_FRACTION", kAneOutputFraction);
+  const auto offload = [&](const ops::Projection &projection, double fraction) {
+    if (fraction > 0)
+      if (const auto columns = ops::AneOffload::plan(projection, fraction))
+        aneProjections_.push_back({&projection, *columns});
+  };
   for (const Qwen4ExpLayerWeights &layer : weights.layers) {
     if (const auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer)) {
-      if (const auto columns = ops::AneOffload::plan(gdn->inputProjection, fraction))
-        aneProjections_.push_back({&gdn->inputProjection, *columns});
+      offload(gdn->inputProjection, inputs);
+      offload(gdn->outputProjection, outputs);
+    } else if (const auto *attention = std::get_if<QwenAttentionWeights>(&layer.mixer)) {
+      offload(attention->inputProjection, inputs);
+      offload(attention->outputProjection, outputs);
     }
   }
 }
