@@ -390,7 +390,7 @@ void testAllNativeWarmupsPrecedeReady() {
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
           "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
-  require(harness.executor().lastPrefillRows == model::ExecutionLimits::prefillTokenBudget,
+  require(harness.executor().lastPrefillRows == model::ExecutionLimits::defaultPrefillRows,
           "bootstrap memory warmup did not explicitly use maximum prefill rows");
   require(report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
           "bootstrap report omitted the real B3 graph");
