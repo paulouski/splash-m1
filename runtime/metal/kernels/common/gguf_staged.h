@@ -21,7 +21,8 @@ inline QuantCoef group_coef(typename F::Meta meta, typename F::Chunk q, ushort j
   if constexpr (F::ScaleInChunk) return F::coef(meta, q); else return F::coef(meta, j);
 }
 // Chunk q's elements 4c..4c+3 (lo) and 16+4c..16+4c+3 (hi) of its group, whose coefficients are k.
-template <class F>
+// SignXor: grid signs by half sign-bit XOR (faster in prefill tiles), else by select (faster in decode).
+template <class F, bool SignXor = true>
 inline void dequant_chunk(typename F::Chunk q, QuantCoef k, threadgroup half2 *tl, thread half4 &lo, thread half4 &hi) {
   if constexpr (F::Kind == QuantLinear) {
     const uint4 p = F::codes(q);
@@ -41,19 +42,24 @@ inline void dequant_chunk(typename F::Chunk q, QuantCoef k, threadgroup half2 *t
     const uint2 g = F::grid(q); const uint s = F::signs(q);
     lo = half4(float4(as_type<uchar4>(g.x)) * k.s.x);
     hi = half4(float4(as_type<uchar4>(g.y)) * k.s.y);
-    const ushort4 sh = ushort4(15, 14, 13, 12);   // sign bits straight into the half sign bit
-    lo = as_type<half4>(as_type<ushort4>(lo) ^ ((ushort4(s) << sh) & ushort(0x8000)));
-    hi = as_type<half4>(as_type<ushort4>(hi) ^ ((ushort4(s >> 4) << sh) & ushort(0x8000)));
+    if constexpr (SignXor) {
+      const ushort4 sh = ushort4(15, 14, 13, 12);   // sign bits straight into the half sign bit
+      lo = as_type<half4>(as_type<ushort4>(lo) ^ ((ushort4(s) << sh) & ushort(0x8000)));
+      hi = as_type<half4>(as_type<ushort4>(hi) ^ ((ushort4(s >> 4) << sh) & ushort(0x8000)));
+    } else {
+      lo = select(lo, -lo, bool4(s & 1, s & 2, s & 4, s & 8));
+      hi = select(hi, -hi, bool4(s & 16, s & 32, s & 64, s & 128));
+    }
   }
 }
 // The group's values chunk by chunk: put(c, lo, hi) takes chunk c's elements.
-template <class F, class Put>
+template <class F, bool SignXor = true, class Put>
 inline void dequant32_chunks(typename F::Payload w, typename F::Meta meta, ushort j, threadgroup half2 *tl, Put put) {
   const QuantCoef k = group_coef<F>(meta, F::chunk(w, 0), j);
 #pragma unroll
   for (ushort c = 0; c < 4; ++c) {
     half4 lo, hi;
-    dequant_chunk<F>(F::chunk(w, c), k, tl, lo, hi);
+    dequant_chunk<F, SignXor>(F::chunk(w, c), k, tl, lo, hi);
     put(c, lo, hi);
   }
 }

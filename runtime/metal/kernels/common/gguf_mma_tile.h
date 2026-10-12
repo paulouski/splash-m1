@@ -38,10 +38,10 @@ static_assert(GGUF_STAGED_STEP == kStep, "decode tiles split K like the staged t
 static_assert(GGUF_PREFILL_ROWS % kPrefillRows == 0, "prefill storage holds whole tiles");
 
 // One group of one column in MMA order: chunk c's element t of lo goes to 8 t + 2c, of hi to 8 t + 2c + 1.
-template <class F>
+template <class F, bool SignXor = true>
 inline void stage_group(typename F::Payload w, typename F::Meta meta, ushort j, threadgroup half2 *tl,
                         threadgroup half *dst) {
-  dequant32_chunks<F>(w, meta, j, tl, [&](ushort c, half4 lo, half4 hi) {
+  dequant32_chunks<F, SignXor>(w, meta, j, tl, [&](ushort c, half4 lo, half4 hi) {
 #pragma unroll
     for (ushort t = 0; t < 4; ++t) *reinterpret_cast<threadgroup half2 *>(dst + 8 * t + 2 * c) = half2(lo[t], hi[t]);
   });
@@ -122,7 +122,7 @@ template <uint FM, class Fn> inline void elements(thread float2 (&acc)[FN][FM], 
 // weights before the multiply. Decoding each column's coefficients once per group this way beat decoding every
 // lane's own chunks in registers on an M1 Max (Q4_K 5120 x 17408, ms at one and four lanes: 0.38 and 1.0 against
 // 0.46 and 2.2).
-template <class F, uint FM, class X = device const bfloat *>
+template <class F, uint FM, class X = device const bfloat *, bool SignXor = true>
 inline void accumulate(X x, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                        uint origin, threadgroup half *stage, threadgroup half2 *tl, uint lane, uint step_begin,
                        uint step_end, thread float2 (&acc)[FN][FM]) {
@@ -151,7 +151,7 @@ inline void accumulate(X x, device uchar *w0, device uchar *w1, device uchar *me
       if (next_unit != unit) next_hdr = F::loadMeta(cm + ulong(next_unit) * QUANT_TILE_ROWS * F::MetaBytes);
       load_inputs<FM>(x, input_size, (step + 1) * kStep, l, next_v);
     }
-    stage_group<F>(packed, hdr, ushort(step % F::MetaGroups), tl, stage + lane * kStride);
+    stage_group<F, SignXor>(packed, hdr, ushort(step % F::MetaGroups), tl, stage + lane * kStride);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     mma_group<FM>(v, [&](uint i, uint j) {
       return *reinterpret_cast<threadgroup const half2 *>(stage + (8 * i + l.fm) * kStride + 8 * j + l.fn);

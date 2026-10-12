@@ -107,7 +107,7 @@ kernel void moe_expert_gguf_mma_gu_k2(
   float2 acc[FN][1];
   zero(acc);
   quant_format_switch(s.format, [&](auto format) {
-    accumulate<decltype(format), 1>(x, s.w0, s.w1, s.meta, p.gate.input_size,
+    accumulate<decltype(format), 1, RoutedRows, false>(x, s.w0, s.w1, s.meta, p.gate.input_size,
                                     origin + moe_gguf_first_row(tile.expert, up ? p.up : p.gate),
                                     stage + simd_group * kSimdgroupStage, tl + up * kQuantPairTableEntries, simd_lane,
                                     half_index * (steps / 2), half_index ? steps : steps / 2, acc);
