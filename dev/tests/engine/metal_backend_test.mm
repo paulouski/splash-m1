@@ -1082,6 +1082,34 @@ void bindingRunsKeepOffsets(MetalBackend &backend) {
     }
 }
 
+// A dispatch's signal reaches the host when the command buffer ending with it completes, and a wait holds back
+// only the dispatches after it, whatever the child size (none here: sync values alone split the command).
+void eventsSplitTheCommand(MetalBackend &backend) {
+    constexpr uint32_t count = 1, one = 1, ten = 10, hundred = 100;
+    MetalBuffer values = sharedBuffer(backend, sizeof(uint32_t));
+    auto *word = static_cast<uint32_t *>(values.contents());
+    *word = 0;
+    const auto add = [&](const uint32_t &increment) {
+        return ComputeDispatch{"test_add_u32", {{0, values}},
+            {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}}, {1, 1, 1}, {1, 1, 1}};
+    };
+    std::vector<ComputeDispatch> dispatches{add(one), add(ten), add(hundred)};
+    id<MTLSharedEvent> event = (__bridge id<MTLSharedEvent>)backend.syncEvent();
+    const uint64_t base = event.signaledValue;
+    dispatches[0].signalValue = base + 1;
+    dispatches[2].waitValue = base + 2;
+    auto ticket = backend.submitCommandAsync(dispatches);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (event.signaledValue < base + 1 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(event.signaledValue == base + 1, "a dispatch's signal never reached the host");
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    require(*word == 11 && !ticket.ready(), "a wait did not hold back exactly the dispatches after it");
+    event.signaledValue = base + 2;
+    (void)ticket.wait();
+    require(*word == 111, "the dispatch after a wait did not run once its value was signalled");
+}
+
 void sharedMemoryCompletionLifetime(MetalBackend &backend) {
     struct Gate {
         std::mutex mutex;
@@ -1383,6 +1411,7 @@ void run(const std::string &metallibPath) {
             "private allocation release was not tracked");
 
     bindingRunsKeepOffsets(backend);
+    eventsSplitTheCommand(backend);
     sharedMemoryCompletionLifetime(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");

@@ -378,6 +378,8 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
                         : b.halfInput                                          ? GgufRoute::StagedHalfInput
                                                                                : GgufRoute::Staged;
   const bool gemv = route == GgufRoute::Gemv;
+  if (b.columns && route != GgufRoute::Prefill)
+    throw std::invalid_argument("a column limit takes the prefill tile");
   if (p.rotation) {
     // Weights stored for rotated inputs (InputRotation): the quantized
     // segments, and a gate/up pair's gate too, read H (D x) from the scratch,
@@ -506,12 +508,15 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const char epilogue = epilogueSuffix(w.epilogue);
   const bool mma = mmaTiles(appleGpuFamily_);
   const uint32_t tileRows = mma ? kMmaPrefillRows : GGUF_PREFILL_ROWS;
+  if (b.columns % GGUF_TILE_COLUMNS) throw std::invalid_argument("a column limit fills whole column tiles");
   for (const QuantizedSegment &s : p.blocks().segments) {
+    if (b.columns && s.columnOffset >= b.columns) break;
+    const uint32_t columns = b.columns ? std::min(s.outputSize, b.columns - s.columnOffset) : s.outputSize;
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     graph.add(tensorKernel(GgufRoute::Prefill, s, 0, epilogue, mma, plan.destination()), std::move(bindings),
               GgufPrefillParams{k, w.rows, n, s.columnOffset},
-              {plan.storageRows() / tileRows, s.outputSize / GGUF_TILE_COLUMNS, 1},
+              {plan.storageRows() / tileRows, columns / GGUF_TILE_COLUMNS, 1},
               {mma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS, 1, 1});
   }
 }

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -64,6 +65,18 @@ public:
     dispatch.bytes.push_back({index, payloads_.back().data(), sizeof(Tail)});
   }
 
+  // The command signals `value` of MetalBackend::syncEvent after the last
+  // dispatch added, and waits for `value` before the next one.
+  void signalAfterLast(uint64_t value) { dispatches_.back().signalValue = value; }
+  void waitBeforeNext(uint64_t value) { pendingWait_ = value; }
+  // Host work the submitter runs just before committing the graph, in order:
+  // it starts what the graph's events wait on.
+  void beforeSubmit(std::function<void()> work) { hostWork_.push_back(std::move(work)); }
+  [[nodiscard]] bool hasHostWork() const noexcept { return !hostWork_.empty(); }
+  void runHostWork() const {
+    for (const std::function<void()> &work : hostWork_) work();
+  }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
     return dispatches_;
@@ -76,6 +89,7 @@ private:
     dispatch.pipelineName = std::move(pipeline);
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
+    dispatch.waitValue = std::exchange(pendingWait_, 0);
     dispatch.buffers.reserve(buffers.size());
     for (uint32_t index = 0; index < buffers.size(); ++index) {
       dispatch.buffers.push_back({index, std::move(buffers[index])});
@@ -86,6 +100,8 @@ private:
 
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
+  uint64_t pendingWait_ = 0;
+  std::vector<std::function<void()>> hostWork_;
 };
 
 } // namespace splash::metal

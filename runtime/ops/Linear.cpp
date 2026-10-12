@@ -821,8 +821,8 @@ void Linear::addPrefillSums(metal::CommandGraph &graph, metal::MetalBuffer input
 }
 void Linear::addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,
                         metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                        LinearScratch scratch) const {
-  add(graph, {.input = input, .output = output, .sums = sums, .scratch = scratch}, p,
+                        LinearScratch scratch, uint32_t columns) const {
+  add(graph, {.input = input, .output = output, .sums = sums, .scratch = scratch, .columns = columns}, p,
       prefillPlan(p, rows, LinearEpilogue::None));
 }
 void Linear::addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &p,

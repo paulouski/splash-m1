@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -20,6 +21,10 @@ namespace splash::model {
 namespace {
 
 constexpr uint32_t kLaneRows = ExecutionLimits::targetVerifyRows;
+// The Neural Engine takes prefill chunks of 512 to this many rows, and this share of the columns of the
+// projections it is given (SPLASH_ANE_FRACTION).
+constexpr uint32_t kAneMaximumRows = 1024;
+constexpr double kAneFraction = 0.55;
 constexpr uint32_t kIndexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
 
 template <class T>
@@ -102,6 +107,15 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
     : weights_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.qwen4 || weights.layers.size() != geometry_.layers)
     throw std::invalid_argument("Qwen3.8-Flash-Next weights do not match execution geometry");
+  if (!ane::requested()) return;
+  const char *override = std::getenv("SPLASH_ANE_FRACTION");
+  const double fraction = override && override[0] ? std::atof(override) : kAneFraction;
+  for (const Qwen4ExpLayerWeights &layer : weights.layers) {
+    if (const auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer)) {
+      if (const auto columns = ops::AneOffload::plan(gdn->inputProjection, fraction))
+        aneProjections_.push_back({&gdn->inputProjection, *columns});
+    }
+  }
 }
 
 ops::HyperShape Qwen4ExpTarget::hyperShape() const noexcept {
@@ -135,7 +149,18 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
   const Qwen4Buffers &h = b.qwen4;
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape();
+  ane::Runtime *engine = !aneProjections_.empty() && rows >= ane::Program::kMinimumRows && rows <= kAneMaximumRows
+                             ? ane::Runtime::get(backend_)
+                             : nullptr;
   const auto project = [&](metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer output) {
+    if (engine)
+      for (const AneProjection &offload : aneProjections_)
+        if (offload.projection == &projection)
+          if (const auto program = engine->program(projection.inputSize, offload.columns.columns, kAneMaximumRows)) {
+            ops::AneOffload::addPrefill(graph, linear, *engine, program, std::move(input), projection, offload.columns,
+                                        std::move(output), b.projectionSums, rows, b.linearScratch);
+            return;
+          }
     linear.addPrefill(graph, std::move(input), projection, std::move(output), b.projectionSums, rows,
                       b.linearScratch);
   };

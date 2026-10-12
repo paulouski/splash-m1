@@ -114,6 +114,11 @@ struct ComputeDispatch {
   std::vector<BytesBinding> bytes;
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  // Values of MetalBackend::syncEvent: the command waits for waitValue before
+  // this dispatch and signals signalValue after it, each at a command buffer
+  // boundary (0: none).
+  uint64_t waitValue = 0;
+  uint64_t signalValue = 0;
 };
 
 struct CommandTiming {
@@ -235,6 +240,9 @@ public:
   // Whether the loaded metallib defines this Metal function, e.g. to skip a
   // variant absent from a build (MACOS15=1 drops MPP-only kernels).
   [[nodiscard]] bool hasFunction(std::string_view name) const;
+  // The id<MTLSharedEvent> that ComputeDispatch wait and signal values refer
+  // to, for an engine that signals it from outside the GPU (runtime/ane).
+  [[nodiscard]] void *syncEvent() const noexcept;
 
   // Every buffer the backend allocates or wraps belongs to one residency set,
   // attached to the command queue, until its last view is gone. Metal by

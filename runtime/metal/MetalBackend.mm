@@ -715,6 +715,8 @@ struct CommandTicket::State {
     }
 };
 
+constexpr NSUInteger kMaximumCommandBuffers = 512;
+
 struct MetalBackend::Impl {
     // One dispatch of a command, validated and resolved to its pipeline.
     struct PreparedDispatch {
@@ -743,6 +745,8 @@ struct MetalBackend::Impl {
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
+    // The event of ComputeDispatch::waitValue and signalValue.
+    __strong id<MTLSharedEvent> syncEvent = nil;
     // Allocations hold it weakly: they may outlive the backend.
     std::shared_ptr<Residency> residency;
     __strong id<MTLLibrary> library = nil;
@@ -986,7 +990,32 @@ struct MetalBackend::Impl {
                 groupSize = 1 + (dispatches.size() - 1) /
                                     kMaximumChildCommandBuffers;
             }
-            groupCount = 1 + (dispatches.size() - 1) / groupSize;
+        }
+        // First dispatch of each child. Event waits begin a child and
+        // signals end one, so a signal reaches the host as its dispatch
+        // completes and a wait holds only the work after it.
+        std::vector<size_t> starts;
+        const bool synchronized = std::ranges::any_of(
+            dispatches, [](const PreparedDispatch &item) {
+                return item.source->waitValue || item.source->signalValue;
+            });
+        if (groupSize || synchronized) {
+            for (size_t first = 0; first < dispatches.size();
+                 first += groupSize ? groupSize : dispatches.size())
+                starts.push_back(first);
+            if (synchronized) {
+                for (size_t index = 0; index < dispatches.size(); ++index) {
+                    if (dispatches[index].source->waitValue)
+                        starts.push_back(index);
+                    if (dispatches[index].source->signalValue &&
+                        index + 1 < dispatches.size())
+                        starts.push_back(index + 1);
+                }
+                std::ranges::sort(starts);
+                starts.erase(std::unique(starts.begin(), starts.end()),
+                             starts.end());
+            }
+            groupCount = starts.size();
             ticketState->groupedCommands.resize(groupCount);
         }
 
@@ -998,12 +1027,17 @@ struct MetalBackend::Impl {
                     id<MTLCommandBuffer> child = [queue commandBuffer];
                     if (!child) failBeforeCommit("unable to create Metal command buffer");
                     ticketState->groupedCommands[childIndex].command = child;
+                    const size_t first = starts[childIndex];
+                    const size_t last = childIndex + 1 < groupCount
+                        ? starts[childIndex + 1] : dispatches.size();
+                    if (const uint64_t value = dispatches[first].source->waitValue)
+                        [child encodeWaitForEvent:syncEvent value:value];
                     id<MTLComputeCommandEncoder> encoder = [child computeCommandEncoder];
                     if (!encoder)
                         failBeforeCommit("unable to create Metal compute encoder");
-                    const size_t first = childIndex * groupSize;
-                    encodeRange(encoder, first,
-                                std::min(dispatches.size(), first + groupSize));
+                    encodeRange(encoder, first, last);
+                    if (const uint64_t value = dispatches[last - 1].source->signalValue)
+                        [child encodeSignalEvent:syncEvent value:value];
                     const std::weak_ptr<CommandTicket::State> weakTicket = ticketState;
                     [child addCompletedHandler:^(id<MTLCommandBuffer> completedChild) {
                         if (auto ticket = weakTicket.lock())
@@ -1012,7 +1046,7 @@ struct MetalBackend::Impl {
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
                     if (FILE *log = timelineLog()) {
                         const double committed = CACurrentMediaTime();
-                        const size_t count = std::min(dispatches.size(), first + groupSize) - first;
+                        const size_t count = last - first;
                         const std::string firstName = dispatches[first].source->pipelineName;
                         const uint64_t sequence = ticketState->sequence;
                         const std::string tag = currentTimelineTag();
@@ -1356,9 +1390,15 @@ MetalBackend::MetalBackend(std::string metallibPath)
             throw MetalBackendError("Metal device unavailable");
         }
         impl_->asyncState->device = impl_->device;
-        impl_->queue = [impl_->device newCommandQueue];
+        // A graph with event waits and signals commits as many children as it has of them (ComputeDispatch), all
+        // created before the first commits.
+        impl_->queue = [impl_->device newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
         if (!impl_->queue) {
             throw MetalBackendError("unable to create Metal command queue");
+        }
+        impl_->syncEvent = [impl_->device newSharedEvent];
+        if (!impl_->syncEvent) {
+            throw MetalBackendError("unable to create Metal shared event");
         }
 
         NSString *path = checkedNSString(metallibPath, "metallib path");
@@ -1405,6 +1445,10 @@ void MetalBackend::stop() noexcept {
 
 const DeviceCapabilities &MetalBackend::capabilities() const noexcept {
     return impl_->capabilities;
+}
+
+void *MetalBackend::syncEvent() const noexcept {
+    return (__bridge void *)impl_->syncEvent;
 }
 
 bool MetalBackend::hasFunction(std::string_view name) const {

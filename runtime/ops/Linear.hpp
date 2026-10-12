@@ -251,6 +251,9 @@ struct LinearBuffers final {
   PreparedInput prepared{};
   // The input holds half rows and their group sums (gguf_rotate_half), which the PQ20 register-A tiles read.
   bool halfInput = false;
+  // The leading output columns a block projection's prefill tile writes, a multiple of GGUF_TILE_COLUMNS; the
+  // rest belong to another engine (0: all).
+  uint32_t columns = 0;
 };
 
 // How Linear::addGguf runs the quantized segments of one projection (LinearGguf.cpp): the one-row GEMV, the Apple9
@@ -326,7 +329,7 @@ public:
   // reused serially within one command stream, as in decode.
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                   metal::MetalBuffer output, metal::MetalBuffer sums, uint32_t rows,
-                  LinearScratch scratch = {}) const;
+                  LinearScratch scratch = {}, uint32_t columns = 0) const;
   void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
                             metal::MetalBuffer gateScratch, metal::MetalBuffer output, metal::MetalBuffer sums,
                             metal::MetalBuffer downSums, uint32_t rows, LinearScratch scratch) const;

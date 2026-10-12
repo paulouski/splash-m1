@@ -8,9 +8,11 @@
 
 #include "model/Qwen4Exp.hpp"
 #include "model/QwenTarget.hpp"
+#include "ops/AneOffload.hpp"
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace splash::model {
 
@@ -61,6 +63,12 @@ private:
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   const ops::ExecutionPlans &operators_;
+  // Projections whose trailing columns a prefill chunk gives the Neural Engine (SPLASH_ANE).
+  struct AneProjection {
+    const ops::Projection *projection;
+    ops::AneColumns columns;
+  };
+  std::vector<AneProjection> aneProjections_;
 };
 
 } // namespace splash::model

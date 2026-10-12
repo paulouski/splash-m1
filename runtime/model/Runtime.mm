@@ -1,5 +1,6 @@
 #include "model/Runtime.hpp"
 #include "AwakeClock.hpp"
+#include "ane/Ane.hpp"
 #include "engine/DecodePolicy.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
@@ -2550,6 +2551,17 @@ Runtime::prefillAsync(const BatchPlan &plan,
       impl_->backend.capabilities().appleGpuFamily == 7 && packedRows >= 256
           ? 64
           : 0;
+  // A graph that uses the Neural Engine can fail after it ran; the chunk is then rerun on the GPU alone, from the
+  // items' own copy of what they point to.
+  ane::Runtime *engine = graph.hasHostWork() ? ane::Runtime::existing() : nullptr;
+  std::vector<std::vector<uint32_t>> ownedTokens, ownedPages;
+  if (engine)
+    for (const ModelBatchItem &item : items) {
+      ownedTokens.emplace_back(item.inputTokens.begin(), item.inputTokens.end());
+      ownedPages.emplace_back(item.pageTable.begin(), item.pageTable.end());
+    }
+  if (engine) impl_->backend.preparePipelines(graph.dispatches());
+  graph.runHostWork();
   CommandTicket command = impl_->backend.submitCommandAsync(
       graph.dispatches(), std::move(completion), maxDispatchesPerCommandBuffer);
   Impl *impl = impl_.get();
@@ -2557,8 +2569,21 @@ Runtime::prefillAsync(const BatchPlan &plan,
   if (gMoeStats)
     for (const ModelBatchItem &item : items)
       statsTokens.emplace_back(item.inputTokens.begin(), item.inputTokens.end());
-  auto finish = [impl, entries, captures, statsTokens = std::move(statsTokens),
+  auto finish = [impl, entries, captures, engine, maxDispatchesPerCommandBuffer, ownedTokens = std::move(ownedTokens),
+                 ownedPages = std::move(ownedPages), statsTokens = std::move(statsTokens),
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
+    if (engine && !engine->settle()) {
+      // The engine is off for the process now: the graph below has no part of it. Nothing of the failed run
+      // has been applied (the states swap parity below).
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        items[lane].inputTokens = ownedTokens[lane];
+        items[lane].pageTable = ownedPages[lane];
+      }
+      CommandGraph rerun;
+      std::array<Impl::Request *, kLaneCount> rerunEntries{};
+      impl->encodePackedPrefillGraph(rerun, items, rerunEntries);
+      timing = impl->backend.submitCommandAsync(rerun.dispatches(), {}, maxDispatchesPerCommandBuffer).wait();
+    }
     if (gMoeStats && impl->moeStatsPrefill) {
       uint32_t rowBegin = 0;
       for (uint32_t lane = 0; lane < items.size(); ++lane) {
