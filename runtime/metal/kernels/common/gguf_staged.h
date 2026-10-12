@@ -41,8 +41,9 @@ inline void dequant_chunk(typename F::Chunk q, QuantCoef k, threadgroup half2 *t
     const uint2 g = F::grid(q); const uint s = F::signs(q);
     lo = half4(float4(as_type<uchar4>(g.x)) * k.s.x);
     hi = half4(float4(as_type<uchar4>(g.y)) * k.s.y);
-    lo = select(lo, -lo, bool4(s & 1, s & 2, s & 4, s & 8));
-    hi = select(hi, -hi, bool4(s & 16, s & 32, s & 64, s & 128));
+    const ushort4 sh = ushort4(15, 14, 13, 12);   // sign bits straight into the half sign bit
+    lo = as_type<half4>(as_type<ushort4>(lo) ^ ((ushort4(s) << sh) & ushort(0x8000)));
+    hi = as_type<half4>(as_type<ushort4>(hi) ^ ((ushort4(s >> 4) << sh) & ushort(0x8000)));
   }
 }
 // The group's values chunk by chunk: put(c, lo, hi) takes chunk c's elements.
