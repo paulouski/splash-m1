@@ -396,6 +396,13 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             {rows, shape.hiddenSize / 256, 1});
 }
 
+void MoE::addStats(metal::CommandGraph &graph, const MoeScratch &scratch, const metal::MetalBuffer &stats,
+                   const MoeShape &shape, uint32_t layer, uint32_t rows, uint32_t statsRows) {
+  const MoeStatsParams params{layer, rows, shape.expertsPerToken, shape.routesPerToken(), statsRows};
+  graph.add("moe_stats_record", {scratch.selectedExperts, scratch.routingWeights, stats}, params,
+            {(rows * shape.expertsPerToken + 63) / 64, 1, 1}, {64, 1, 1});
+}
+
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
     throw std::invalid_argument("invalid MoE prefill rows");

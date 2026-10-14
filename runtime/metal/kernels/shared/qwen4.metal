@@ -476,4 +476,3 @@ kernel void qwen4_ple_hash(device const uint *tokens [[buffer(0)]],
     }
   }
 }
-

@@ -43,14 +43,6 @@ metal::MetalBuffer rowsFrom(metal::MetalBackend &backend, const metal::MetalBuff
   return backend.view(buffer, offset, buffer.sizeBytes() - offset);
 }
 
-// SPLASH_MOE_STATS: the layer's routed experts of the step's rows, kept for the host.
-void addMoeStats(metal::CommandGraph &graph, const Qwen4Buffers &h, const ops::MoeScratch &moe,
-                 const ops::MoeShape &shape, uint32_t layer, uint32_t rows) {
-  const MoeStatsParams params{layer, rows, shape.expertsPerToken, shape.routesPerToken(), h.moeStatsRows};
-  graph.add("moe_stats_record", {moe.selectedExperts, moe.routingWeights, h.moeStats}, params,
-            {(rows * shape.expertsPerToken + 63) / 64, 1, 1}, {64, 1, 1});
-}
-
 // The QSA indexer's fp32 projections of `rows` rows: one float segment each
 // (Qwen4Exp.cpp readIndexer), at any row count.
 void addIndexerProjection(metal::CommandGraph &graph, const ops::Linear &linear, metal::MetalBuffer input,
@@ -306,7 +298,7 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
     mix(layer.ffnHyper, b.normalized, h.streams);
     ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe);
-    if (h.moeStats) addMoeStats(graph, h, b.moe, geometry_.moeShape(), index, rows);
+    if (h.moeStats) ops::MoE::addStats(graph, b.moe, h.moeStats, geometry_.moeShape(), index, rows, h.moeStatsRows);
     ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
   }
   if (step.gdnLayer != geometry_.stateLayout.layers ||
@@ -401,7 +393,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
         layer.mixer);
     addVerifyMix(step, layer.ffnHyper, h.streams, b.normalized, true);
     ops::MoE::add(graph, {b.normalized, h.zeros, h.branch, b.moe}, layer.ffn, *step.moe, b.activeRows);
-    if (h.moeStats) addMoeStats(graph, h, b.moe, geometry_.moeShape(), index, rows);
+    if (h.moeStats) ops::MoE::addStats(graph, b.moe, h.moeStats, geometry_.moeShape(), index, rows, h.moeStatsRows);
     combinePending = true;
   }
   if (step.gdnLayer != geometry_.stateLayout.layers ||

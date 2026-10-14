@@ -329,6 +329,9 @@ struct MoE final {
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan,
                   std::span<const uint32_t> laneActiveRows = {});
+  // Keeps the layer's routed experts of `rows` rows in `stats` (`statsRows` rows) for the host.
+  static void addStats(metal::CommandGraph &graph, const MoeScratch &scratch, const metal::MetalBuffer &stats,
+                       const MoeShape &shape, uint32_t layer, uint32_t rows, uint32_t statsRows);
 };
 
 } // namespace splash::ops
