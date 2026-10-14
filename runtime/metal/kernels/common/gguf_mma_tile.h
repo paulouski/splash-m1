@@ -137,8 +137,19 @@ inline void accumulate(X x, device uchar *w0, device uchar *w1, device uchar *me
                                        c1 + ulong(step_begin) * QUANT_TILE_ROWS * F::P1);
   uint unit = step_begin / F::MetaGroups;
   typename F::Meta hdr = F::loadMeta(cm + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
+  constexpr bool Plain = __is_same(X, device const bfloat *);
+  device const bfloat *xl = nullptr;
+  if constexpr (Plain) xl = x + ulong(l.fn) * input_size + 4 * (l.fm >> 1) + 16 * (l.fm & 1);
+  const auto inputs = [&](uint step, thread uint2 (&u)[FM][2]) {
+    if constexpr (Plain) {
+#pragma unroll
+      for (uint r = 0; r < FM; ++r)
+#pragma unroll
+        for (uint e = 0; e < 2; ++e) u[r][e] = *reinterpret_cast<device const uint2 *>(xl + ((8 * r + e) * input_size + step * kStep));
+    } else load_inputs<FM>(x, input_size, step * kStep, l, u);
+  };
   uint2 v[FM][2];
-  load_inputs<FM>(x, input_size, step_begin * kStep, l, v);
+  inputs(step_begin, v);
   for (uint step = step_begin; step < step_end; ++step) {
     // The next step's weights, header and inputs are in flight while this step dequantizes and multiplies.
     typename F::Payload next_packed = packed;
@@ -149,7 +160,7 @@ inline void accumulate(X x, device uchar *w0, device uchar *w1, device uchar *me
       next_packed = F::load(c0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0, c1 + ulong(step + 1) * QUANT_TILE_ROWS * F::P1);
       next_unit = (step + 1) / F::MetaGroups;
       if (next_unit != unit) next_hdr = F::loadMeta(cm + ulong(next_unit) * QUANT_TILE_ROWS * F::MetaBytes);
-      load_inputs<FM>(x, input_size, (step + 1) * kStep, l, next_v);
+      inputs(step + 1, next_v);
     }
     stage_group<F, SignXor>(packed, hdr, ushort(step % F::MetaGroups), tl, stage + lane * kStride);
     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -310,6 +321,7 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
   device uchar *c1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
   device uchar *cm = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
   x += ulong(half_m) * kPrefillSimdgroupRows * input_size;
+  device const bfloat *xl = x + ulong(l.fn) * input_size + 4 * (l.fm >> 1) + 16 * (l.fm & 1);
   typename F::Payload packed;
   typename F::Meta hdr;
   uint unit = 0;
@@ -335,7 +347,10 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (owns) {
       uint2 v[FM][2];
-      load_inputs<FM>(x, input_size, step * kStep, l, v);
+#pragma unroll
+      for (uint r = 0; r < FM; ++r)
+#pragma unroll
+        for (uint e = 0; e < 2; ++e) v[r][e] = *reinterpret_cast<device const uint2 *>(xl + ((8 * r + e) * input_size + step * kStep));
       threadgroup const half *mine = buffer + half_n * kSimdgroupStage;
       mma_group<FM>(v, [&](uint i, uint j) {
         return *reinterpret_cast<threadgroup const half2 *>(mine + (8 * i + l.fm) * kStride + 8 * j + l.fn);
