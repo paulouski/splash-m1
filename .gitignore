@@ -11,3 +11,4 @@ __pycache__/
 dist/
 install/download-token
 build-*/
+/_local/

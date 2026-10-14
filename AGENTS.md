@@ -7,7 +7,8 @@ This is an unofficial Splash fork based on Inco's source and the community Apple
 - README.md describes supported hardware, models, and current download availability.
 - DEVELOPMENT.md covers source builds and package review.
 - RUN.md has portable source and local-checkpoint examples.
-- Checkout-local files under _local/, when present, are optional research notes and artifacts. Contributor setup and reviews must not depend on them.
+- When `_local/` exists and a task concerns local research, read `_local/AGENTS.md`, then `_local/INDEX.md`, then the relevant track README. These files are optional for public contributor setup and reviews.
+- After relevant local research work, keep the active track README and index up to date.
 
 ## Scope and collaboration
 
@@ -36,7 +37,7 @@ This is an unofficial Splash fork based on Inco's source and the community Apple
 
 ## Existing M1 observations
 
-These are setup-specific historical measurements, not portable performance claims. Recheck them after changing the build, workload, or GPU.
+These are historical observations from the earlier Qwen3.8-27B work. They do not automatically describe Bonsai 2 or Flash Next. Recheck them after changing the model, build, workload, or GPU.
 
 - Eight-row Q4 decode was ALU-limited on the tested M1 Max. Making weights cache-resident did not improve it; profile ALU work and occupancy before assuming a memory bottleneck.
 - Prefill kernels were at parity with MLX fp16 on identical shapes. Use fp16 for comparisons with this model.

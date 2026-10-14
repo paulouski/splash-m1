@@ -1,6 +1,8 @@
 # Performance
 
-[Back to Splash](../README.md#performance)
+The results below are from original upstream Splash releases on newer Apple GPUs and builds. They are not measurements or performance guarantees for this macOS 15 Apple7/8 fork.
+
+[Back to Splash](../README.md#measured-performance)
 
 ## Splash 1.0 launch benchmarks
 
@@ -26,7 +28,7 @@ grew with load: 3.8× at four concurrent 32K requests on the 35B. The
 [launch post](https://inco.ai/blog/splash/) has the method and the full
 comparison against oMLX, Lily, uzu, and Ollama.
 
-For repeatable measurements on your Mac, see [local benchmarks](../DEVELOPMENT.md#local-benchmarks).
+For repeatable performance measurements on your Mac, see the [benchmark tools](../dev/benchmarks/). [Development checks](../DEVELOPMENT.md#development-checks) run model-free local validation, not performance benchmarks.
 
 ## GGUF against llama.cpp
 

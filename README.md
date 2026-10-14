@@ -48,7 +48,7 @@ The fork builds on Splash's APIs, DFlash, and tool integrations, with a focus on
 - Supports mixed Q4/Q5 group-64 weights. Apple7 kernels handle weight unpacking and addressing, plus GDN and prefill work tuned for that GPU generation.
 - Offers prompt lookup that reuses likely next source tokens and asks the target model to verify them; the benefit depends on the prompt.
 - Preserves exact generated tokens and model state across turns so follow-up requests can reuse earlier answer text.
-- Adds a packaged Mac app and CLI workflow, an English browser UI, and Pi client setup. The app and CLI packages are implemented but not yet published.
+- Provides release-candidate app and CLI packages; signed and notarized public desktop distribution is still pending. The fork also adds an English browser UI and Pi client setup.
 
 ## Platform and model support
 
