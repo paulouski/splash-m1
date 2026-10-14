@@ -14,7 +14,7 @@ This is an unofficial Splash fork based on Inco's source and the community Apple
 
 - Make the smallest change that fixes the requested issue. Do not refactor adjacent code or add speculative behavior.
 - Do not edit generated files or downloaded model artifacts unless the task explicitly requires it.
-- Root owns requirements, decisions, integration review, and final verification. Use Codex-native GPT-6 Luna explorers or workers for non-trivial tasks when delegation materially reduces context or enables independent work. Native workers use fork_turns="none" and never run Git state-changing commands such as stash, checkout, reset, restore, clean, commit, or push. Root independently checks decision-critical source and diffs, then owns final verification. Do not use Claude Code agents.
+- Root owns requirements, decisions, integration review, and final verification. Use Codex-native GPT-6 Luna explorers or workers for non-trivial tasks when delegation materially reduces context or enables independent work. Native workers use fork_turns="none" and never run Git state-changing commands such as stash, checkout, reset, restore, clean, commit, or push. Root independently checks decision-critical source and diffs, then owns final verification.
 - Keep user-specific paths, machine configuration, prompts, and private research data out of tracked files.
 
 ## Build and production safety
