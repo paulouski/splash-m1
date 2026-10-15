@@ -119,6 +119,8 @@ struct ComputeDispatch {
   // boundary (0: none).
   uint64_t waitValue = 0;
   uint64_t signalValue = 0;
+  // A wait for this value of MetalBackend::gateEvent, which only the host signals (signalGate).
+  uint64_t gateValue = 0;
 };
 
 struct CommandTiming {
@@ -243,6 +245,9 @@ public:
   // The id<MTLSharedEvent> that ComputeDispatch wait and signal values refer
   // to, for an engine that signals it from outside the GPU (runtime/ane).
   [[nodiscard]] void *syncEvent() const noexcept;
+  // The host-signalled event of ComputeDispatch::gateValue: a command waits there until the host has written
+  // what the dispatch reads. Values only grow; signalGate releases every wait up to `value`.
+  void signalGate(uint64_t value) const noexcept;
 
   // Every buffer the backend allocates or wraps belongs to one residency set,
   // attached to the command queue, until its last view is gone. Metal by

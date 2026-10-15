@@ -272,6 +272,9 @@ struct QwenTargetVerifyBuffers final {
   // Qwen3.8-Flash-Next: each lane's leading rows that can be retained (empty:
   // all); the MoE routes no expert for the later ones.
   std::span<const uint32_t> activeRows;
+  // Qwen3.8-Flash-Next: the gate value (MetalBackend::gateEvent) the host signals once the staged PLE rows are
+  // written; the first PLE layer waits for it (0: the rows are staged before the command is submitted).
+  uint64_t pleGate = 0;
   // Qwen3.8-Flash-Next: each lane's PLE history before the step (the
   // commit writes the one after it).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> pleHistories;

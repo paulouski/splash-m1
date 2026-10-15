@@ -69,6 +69,8 @@ public:
   // dispatch added, and waits for `value` before the next one.
   void signalAfterLast(uint64_t value) { dispatches_.back().signalValue = value; }
   void waitBeforeNext(uint64_t value) { pendingWait_ = value; }
+  // The next dispatch waits for `value` of MetalBackend::gateEvent (the host's signalGate).
+  void gateBeforeNext(uint64_t value) { pendingGate_ = value; }
   // Host work the submitter runs just before committing the graph, in order:
   // it starts what the graph's events wait on.
   void beforeSubmit(std::function<void()> work) { hostWork_.push_back(std::move(work)); }
@@ -90,6 +92,7 @@ private:
     dispatch.threadgroups = groups;
     dispatch.threadsPerThreadgroup = threads;
     dispatch.waitValue = std::exchange(pendingWait_, 0);
+    dispatch.gateValue = std::exchange(pendingGate_, 0);
     dispatch.buffers.reserve(buffers.size());
     for (uint32_t index = 0; index < buffers.size(); ++index) {
       dispatch.buffers.push_back({index, std::move(buffers[index])});
@@ -101,6 +104,7 @@ private:
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
   uint64_t pendingWait_ = 0;
+  uint64_t pendingGate_ = 0;
   std::vector<std::function<void()>> hostWork_;
 };
 

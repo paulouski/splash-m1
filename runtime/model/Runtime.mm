@@ -308,6 +308,13 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   // Null for a family with no per-request host work (FamilyRuntime).
   std::unique_ptr<FamilyRuntime> family;
+  // The last value of MetalBackend::gateEvent handed to an MTP verify (SPLASH_PLE_DECODE_OVERLAP=0: it gathers the
+  // family's rows before submitting).
+  uint64_t pleGate = 0;
+  const bool pleOverlap = [] {
+    const char *value = std::getenv("SPLASH_PLE_DECODE_OVERLAP");
+    return !value || std::strcmp(value, "0") != 0;
+  }();
   // Where each full-attention layer's QSA index tensors sit in the KV
   // extents; empty without index regions.
   std::vector<ops::QsaIndex> qsaIndex;
@@ -1768,7 +1775,8 @@ struct Runtime::Impl {
                                       std::span<const ModelBatchItem> items,
                                       bool singleRow = false,
                                       bool mtpDraft = false,
-                                      std::span<const uint32_t> activeRows = {}) {
+                                      std::span<const uint32_t> activeRows = {},
+                                      uint64_t pleGate = 0) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid target verify batch");
@@ -1824,6 +1832,7 @@ struct Runtime::Impl {
     buffers.qwen4.moeStats = moeStatsDecode;
     buffers.qwen4.moeStatsRows = kDecodeRows * decodeLanes;
     buffers.activeRows = activeRows;
+    buffers.pleGate = pleGate;
     bindQsa(buffers.qwen4, kDecodeRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
@@ -2211,8 +2220,9 @@ struct Runtime::Impl {
       const uint32_t width = static_cast<uint32_t>(lanes_.size());
       impl_.encodeBatchVerifyInput(verify_, width);
       impl_.encodeBatchEmbedding(verify_, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
+      gate_ = impl_.family && impl_.pleOverlap ? ++impl_.pleGate : 0;
       impl_.encodeTargetVerifyBatchForward(verify_, active, items_, false, false,
-                                           {maximumRetained.data(), lanes_.size()});
+                                           {maximumRetained.data(), lanes_.size()}, gate_);
       // The target's rows rank the ids the next draft may propose.
       if (lanes_[0].shortlist)
         ops::Qwen4::addTopK(verify_, impl_.decodeArena->packed(DecodeTensor::Logits, 1), impl_.shortlist->top,
@@ -2222,14 +2232,28 @@ struct Runtime::Impl {
       impl_.encodeBatchGdnCommit(verify_, active);
     }
 
-    // The draft is done: stage the verify rows of every lane from its
-    // proposals and submit the verify, policy, acceptance and commit.
+    // The draft is done: submit the verify, policy, acceptance and commit, and stage the verify rows of every
+    // lane from the proposals while it runs up to the family's first read (gate_); without a gate they are
+    // staged first.
     void stageVerify() {
       addTiming(command_.wait());
-      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
-        impl_.stageFamilyVerifyLane(*lanes_[lane].request, items_[lane], lane, lanes_[lane].maximumRetained);
+      if (!gate_) {
+        for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+          impl_.stageFamilyVerifyLane(*lanes_[lane].request, items_[lane], lane, lanes_[lane].maximumRetained);
+        submit(verify_);
+        stage_ = Stage::Verify;
+        return;
+      }
       submit(verify_);
       stage_ = Stage::Verify;
+      // The gate opens on a failed read too, or the command would wait for it forever.
+      struct Open {
+        MetalBackend &backend;
+        uint64_t value;
+        ~Open() { backend.signalGate(value); }
+      } open{impl_.backend, gate_};
+      for (uint32_t lane = 0; lane < lanes_.size(); ++lane)
+        impl_.stageFamilyVerifyLane(*lanes_[lane].request, items_[lane], lane, lanes_[lane].maximumRetained);
     }
 
     void submit(const CommandGraph &graph) {
@@ -2249,6 +2273,7 @@ struct Runtime::Impl {
     CommandTiming timing_;
     std::function<void()> wake_;
     CommandGraph verify_;
+    uint64_t gate_ = 0;
   };
 
   // A constrained DFlash cycle has one host dependency between three Metal

@@ -770,6 +770,8 @@ struct MetalBackend::Impl {
     __strong id<MTLCommandQueue> queue = nil;
     // The event of ComputeDispatch::waitValue and signalValue.
     __strong id<MTLSharedEvent> syncEvent = nil;
+    // The event of ComputeDispatch::gateValue, signalled by the host alone.
+    __strong id<MTLSharedEvent> gateEvent = nil;
     // Allocations hold it weakly: they may outlive the backend.
     std::shared_ptr<Residency> residency;
     __strong id<MTLLibrary> library = nil;
@@ -1029,7 +1031,8 @@ struct MetalBackend::Impl {
         std::vector<size_t> starts;
         const bool synchronized = std::ranges::any_of(
             dispatches, [](const PreparedDispatch &item) {
-                return item.source->waitValue || item.source->signalValue;
+                return item.source->waitValue || item.source->signalValue ||
+                       item.source->gateValue;
             });
         if (groupSize || synchronized) {
             for (size_t first = 0; first < dispatches.size();
@@ -1037,7 +1040,8 @@ struct MetalBackend::Impl {
                 starts.push_back(first);
             if (synchronized) {
                 for (size_t index = 0; index < dispatches.size(); ++index) {
-                    if (dispatches[index].source->waitValue)
+                    if (dispatches[index].source->waitValue ||
+                        dispatches[index].source->gateValue)
                         starts.push_back(index);
                     if (dispatches[index].source->signalValue &&
                         index + 1 < dispatches.size())
@@ -1064,6 +1068,8 @@ struct MetalBackend::Impl {
                         ? starts[childIndex + 1] : dispatches.size();
                     if (const uint64_t value = dispatches[first].source->waitValue)
                         [child encodeWaitForEvent:syncEvent value:value];
+                    if (const uint64_t value = dispatches[first].source->gateValue)
+                        [child encodeWaitForEvent:gateEvent value:value];
                     id<MTLComputeCommandEncoder> encoder = [child computeCommandEncoder];
                     if (!encoder)
                         failBeforeCommit("unable to create Metal compute encoder");
@@ -1432,6 +1438,10 @@ MetalBackend::MetalBackend(std::string metallibPath)
         if (!impl_->syncEvent) {
             throw MetalBackendError("unable to create Metal shared event");
         }
+        impl_->gateEvent = [impl_->device newSharedEvent];
+        if (!impl_->gateEvent) {
+            throw MetalBackendError("unable to create Metal shared event");
+        }
 
         NSString *path = checkedNSString(metallibPath, "metallib path");
         NSError *error = nil;
@@ -1481,6 +1491,10 @@ const DeviceCapabilities &MetalBackend::capabilities() const noexcept {
 
 void *MetalBackend::syncEvent() const noexcept {
     return (__bridge void *)impl_->syncEvent;
+}
+
+void MetalBackend::signalGate(uint64_t value) const noexcept {
+    impl_->gateEvent.signaledValue = value;
 }
 
 bool MetalBackend::hasFunction(std::string_view name) const {

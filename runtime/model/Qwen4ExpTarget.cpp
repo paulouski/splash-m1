@@ -356,12 +356,14 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, const QwenTargetVerif
   ops::Qwen4::addInit(graph, b.hidden[0], h.streams, hs, rows);
   // The previous layer's FFN combine, folded into the next norm unless the PLE reads the streams first.
   bool combinePending = false;
+  uint64_t gate = b.pleGate;
   for (uint32_t index = 0; index < geometry_.layers; ++index) {
     const Qwen4ExpLayerWeights &layer = weights_.layers[index];
     if (layer.ple) {
       if (std::exchange(combinePending, false)) ops::Qwen4::addCombine(graph, h.streams, h.branch, h.weights, hs, rows);
       const Qwen4PleWeights &ple = *layer.ple;
       const ops::PleShape ps = pleShape();
+      graph.gateBeforeNext(std::exchange(gate, 0));
       ops::Embedding::add(graph, h.pleSlots, stagedTable(h.pleStaging, geometry_.qwen4.pleHeadDimension, weights_.pleTable), h.pleRows,
                           rows * geometry_.qwen4.pleHeads());
       addVerifyProjection(step, h.pleRows, ple.key, h.gate);
