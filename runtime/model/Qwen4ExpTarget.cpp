@@ -21,9 +21,8 @@ namespace splash::model {
 namespace {
 
 constexpr uint32_t kLaneRows = ExecutionLimits::targetVerifyRows;
-// The Neural Engine takes prefill chunks of 512 to this many rows, and this share of the columns of the
+// The Neural Engine takes prefill chunks of 512 to the prefill chunk rows, and this share of the columns of the
 // input projections it is given (SPLASH_ANE_FRACTION), and of the output ones (SPLASH_ANE_OUTPUT_FRACTION).
-constexpr uint32_t kAneMaximumRows = 1024;
 constexpr double kAneFraction = 0.55;
 constexpr double kAneOutputFraction = 0.42;
 constexpr uint32_t kIndexWidth = QWEN4_QSA_HEADS * QWEN4_QSA_DIMENSION;
@@ -154,14 +153,14 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
   const Qwen4Buffers &h = b.qwen4;
   const ops::Linear &linear = operators_.linear();
   const ops::HyperShape hs = hyperShape();
-  ane::Runtime *engine = !aneProjections_.empty() && rows >= ane::Program::kMinimumRows && rows <= kAneMaximumRows
+  ane::Runtime *engine = !aneProjections_.empty() && rows >= ane::Program::kMinimumRows && rows <= ExecutionLimits::defaultPrefillRows
                              ? ane::Runtime::get(backend_)
                              : nullptr;
   const auto project = [&](metal::MetalBuffer input, const ops::Projection &projection, metal::MetalBuffer output) {
     if (engine)
       for (const AneProjection &offload : aneProjections_)
         if (offload.projection == &projection)
-          if (const auto program = engine->program(projection.inputSize, offload.columns.columns, kAneMaximumRows)) {
+          if (const auto program = engine->program(projection.inputSize, offload.columns.columns, ExecutionLimits::defaultPrefillRows)) {
             ops::AneOffload::addPrefill(graph, linear, *engine, program, std::move(input), projection, offload.columns,
                                         std::move(output), b.projectionSums, rows, b.linearScratch);
             return;

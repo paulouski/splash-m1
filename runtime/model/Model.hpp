@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -376,6 +377,14 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
   return static_cast<uint32_t>((uint64_t{vocabularySize} + 31) / 32);
 }
 
+// SPLASH_PREFILL_ROWS (a multiple of 128 up to the prefill token budget) overrides the packed prefill chunk
+// rows for experiments; anything else leaves 1024.
+inline uint32_t prefillRowsFromEnvironment() noexcept {
+  const char *value = std::getenv("SPLASH_PREFILL_ROWS");
+  const unsigned long rows = value ? std::strtoul(value, nullptr, 10) : 0;
+  return rows >= 128 && rows <= 2048 && rows % 128 == 0 ? static_cast<uint32_t>(rows) : 1024;
+}
+
 // Compile-time ceiling of the one native DFlash execution contract. Concrete
 // target/draft manifests are validated against these limits at startup;
 // cache-page and attention-kernel geometry live with their operators.
@@ -383,7 +392,7 @@ struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
   static constexpr uint32_t prefillTokenBudget = 2048;
   // Rows of the packed prefill arena the memory plan starts from.
-  static constexpr uint32_t defaultPrefillRows = 1024;
+  static inline const uint32_t defaultPrefillRows = prefillRowsFromEnvironment();
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
   // pool allocates when it is built.
   static constexpr uint32_t warmupKvPages =
