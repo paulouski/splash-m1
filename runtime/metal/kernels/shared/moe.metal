@@ -471,6 +471,9 @@ kernel void moe_stats_record(
       uint2(selected[source], as_type<uint>(routing_weights[source]));
 }
 
+// Command rows up to which a tile's rows follow the route order (decode plans); wider commands take atomic slots.
+constant constexpr uint kOrderedGroupRows = 32;
+
 // Sorts one command's routes by expert. Tile t covers grouped rows
 // [first_row, first_row + tile_rows) of a single expert. Padded layout: an
 // expert starts at its first tile * tile_rows and the rows past its last route
@@ -544,8 +547,14 @@ template <uint Experts>
       route_rows[route] = ~0u;
       continue;
     }
-    uint slot =
-        atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
+    uint slot;
+    if (params.rows <= kOrderedGroupRows) {
+      slot = 0;
+      for (uint earlier = 0; earlier < route; ++earlier)
+        slot += earlier % routes_per_row != params.top_k && selected[earlier] == expert;
+    } else {
+      slot = atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
+    }
     uint row = row_offsets[expert] + slot;
     grouped_routes[row] = route;
     route_rows[route] = row;

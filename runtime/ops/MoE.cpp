@@ -210,6 +210,31 @@ bool fusedGateUp(const MoePlan &plan) {
          plan.shape().expertIntermediateSize % QUANT_TILE_ROWS != 0;
 }
 
+// The formats whose tiles of one or two live rows run on registers (kernels/common/gguf_dot_tile.h): gate/up and down
+// pass the kernel name suffix, null where the MMA tile runs every tile. The shared expert must be Q8_0.
+const char *gateUpDotFormat(const BlockExpertProjection &gate, const BlockExpertProjection &up, uint32_t hidden) noexcept {
+  if (gate.routed.formatId != up.routed.formatId || gate.shared.formatId != GGUF_FMT_Q80 ||
+      up.shared.formatId != GGUF_FMT_Q80 || hidden > 5120)
+    return nullptr;
+  switch (gate.routed.formatId) {
+  case GGUF_FMT_IQ2XXS: return "iq2xxs";
+  case GGUF_FMT_IQ2XS: return "iq2xs";
+  case GGUF_FMT_IQ2S: return "iq2s";
+  case GGUF_FMT_IQ3XXS: return "iq3xxs";
+  case GGUF_FMT_IQ3S: return "iq3s";
+  default: return nullptr;
+  }
+}
+const char *downDotFormat(const BlockExpertProjection &down, uint32_t intermediate) noexcept {
+  if (down.shared.formatId != GGUF_FMT_Q80 || intermediate > 1280)
+    return nullptr;
+  switch (down.routed.formatId) {
+  case GGUF_FMT_IQ4NL: return "iq4nl";
+  case GGUF_FMT_Q20: return "q20";
+  default: return nullptr;
+  }
+}
+
 // The three GGUF expert passes over grouped tiles: gate into expertOutput
 // (the down pass overwrites it after the up pass consumed it), up with
 // silu(gate) into expertIntermediate, down into expertOutput. Register plans
@@ -222,7 +247,7 @@ void addGgufExperts(metal::CommandGraph &graph, const metal::MetalBuffer &layerI
   const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
                         const metal::MetalBuffer &input,
-                        const metal::MetalBuffer &output, uint32_t n, uint32_t k) {
+                        const metal::MetalBuffer &output, uint32_t n, uint32_t k, const char *dot = nullptr) {
     std::vector<metal::MetalBuffer> bindings{input};
     if (table16) bindings.push_back(scratch.groupedSums);
     bindings.insert(bindings.end(),
@@ -240,7 +265,8 @@ void addGgufExperts(metal::CommandGraph &graph, const metal::MetalBuffer &layerI
     const std::string kernel = table16 ? "moe_expert_gguf_sg"
                                        : (mma ? "moe_expert_gguf_mma_m" : "moe_expert_gguf_m") +
                                              std::to_string(plan.tileRows());
-    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : ""), std::move(bindings),
+    graph.add(kernel + (up ? "_g" : "_a") + (unaligned ? "_u" : "") + (dot ? std::string("_dot_") + dot : ""),
+              std::move(bindings),
               MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
                                   projection.shared.formatId},
               {n / GGUF_TILE_COLUMNS, tiles, 1},
@@ -259,7 +285,8 @@ void addGgufExperts(metal::CommandGraph &graph, const metal::MetalBuffer &layerI
       return MoeGgufExpertParams{hidden, intermediate, shape.experts, projection.routed.formatId,
                                  projection.shared.formatId};
     };
-    graph.add("moe_expert_gguf_mma_gu_k2", std::move(bindings),
+    const char *dot = plan.configuration().ggufFewRowDot ? gateUpDotFormat(weights.gate, weights.up, hidden) : nullptr;
+    graph.add(dot ? std::string("moe_expert_gguf_mma_gu_k2_dot_") + dot : "moe_expert_gguf_mma_gu_k2", std::move(bindings),
               MoeGgufGateUpParams{params(weights.gate), params(weights.up), shape.routesPerToken()},
               {intermediate / GGUF_TILE_COLUMNS, tiles, 1}, {2 * GGUF_MOE_SPLIT_THREADS, 1, 1});
   } else {
@@ -275,7 +302,11 @@ void addGgufExperts(metal::CommandGraph &graph, const metal::MetalBuffer &layerI
               intermediate, {tiles, (intermediate + 255) / 256, 1});
   pass(weights.down, false,
        table16 ? scratch.groupedInput : scratch.expertIntermediate,
-       scratch.expertOutput, hidden, intermediate);
+       scratch.expertOutput, hidden, intermediate,
+       plan.configuration().ggufFewRowDot && plan.tileRows() == 8 &&
+               hidden % GGUF_TILE_COLUMNS == 0 && hidden % QUANT_TILE_ROWS == 0
+           ? downDotFormat(weights.down, intermediate)
+           : nullptr);
 }
 
 } // namespace

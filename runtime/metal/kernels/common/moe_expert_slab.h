@@ -7,6 +7,7 @@
 // `rows` live rows first, then padding. Every expert pass runs the matmul of
 // the smallest of 8, 16 and tile_rows rows that holds the live rows, and the
 // grouping and the gather fill exactly those rows: no kernel reads past them.
+// The few-row dot passes (gguf_dot_tile.h) compute and store only the live rows.
 inline uint moe_matmul_rows(uint rows, uint tile_rows) {
   return min(tile_rows, rows <= 8 ? 8u : rows <= 16 ? 16u : tile_rows);
 }

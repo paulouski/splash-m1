@@ -4,12 +4,12 @@
 // Unaligned: experts of an output_size that is not a multiple of QUANT_TILE_ROWS (Qwen3.8-Flash-Next's 640), whose
 // planes do not start on a plane tile: the routed segment keeps its base and the expert's first row joins the origin.
 #pragma clang fp reassociate(off)
-#include "metal/kernels/common/gguf_mma_tile.h"
+#include "metal/kernels/common/gguf_dot_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
 
 using namespace gguf_mma;
 
-template <ushort Rows, GgufEpilogue Ep, bool Unaligned = false>
+template <ushort Rows, GgufEpilogue Ep, bool Unaligned = false, class DotF = void>
 kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                                 device const uint *tile_count [[buffer(2)]], device uchar *w0 [[buffer(3)]],
                                 device uchar *w1 [[buffer(4)]], device uchar *meta [[buffer(5)]], device uchar *sw0 [[buffer(6)]],
@@ -21,6 +21,14 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
   threadgroup half2 tl[kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  if constexpr (!__is_same(DotF, void)) {
+    static_assert(Rows == 8 && Ep == EpNone && !Unaligned, "the few-row down tile");
+    if (tile.rows <= kDotRows) {
+      moe_down_dot<DotF, 1, 2, 1>(input, tile, w0, w1, meta, sw0, sw1, smeta, output, p, group, simd_lane, simd_group,
+                                  (threadgroup uint *)stage, tl);
+      return;
+    }
+  }
   const MoeGgufSegment s = moe_gguf_segment_for<Unaligned>(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
   device bfloat *x = input + ulong(tile.first_row) * p.input_size;
   const ulong out = ulong(tile.first_row) * p.output_size;
@@ -55,6 +63,8 @@ template [[host_name("moe_expert_gguf_mma_m8_a")]] kernel MoeExpertGgufMmaKernel
 template [[host_name("moe_expert_gguf_mma_m8_g")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpUpWithGate>;
 template [[host_name("moe_expert_gguf_mma_m32_a")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<32, EpNone>;
 template [[host_name("moe_expert_gguf_mma_m32_g")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<32, EpUpWithGate>;
+template [[host_name("moe_expert_gguf_mma_m8_a_dot_iq4nl")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpNone, false, FmtIQ4NL>;
+template [[host_name("moe_expert_gguf_mma_m8_a_dot_q20")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpNone, false, FmtQ20>;
 template [[host_name("moe_expert_gguf_mma_m8_a_u")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpNone, true>;
 template [[host_name("moe_expert_gguf_mma_m8_g_u")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpUpWithGate, true>;
 template [[host_name("moe_expert_gguf_mma_m32_a_u")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<32, EpNone, true>;
@@ -66,6 +76,7 @@ template [[host_name("moe_expert_gguf_mma_m32_g_u")]] kernel MoeExpertGgufMmaKer
 // input rows, which are read from `input` through the tile's routes instead of a gathered copy (rows beyond the
 // routed ones read as zeros, as moe_gather_rows writes them). The gate's sums, rounded to bf16, reach the up's
 // simdgroups through threadgroup memory for the up's SwiGLU epilogue, so only the activated rows are stored.
+template <class FG>
 kernel void moe_expert_gguf_mma_gu_k2(
     device const bfloat *input [[buffer(0)]], device const uint *routes [[buffer(1)]],
     device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]],
@@ -82,6 +93,14 @@ kernel void moe_expert_gguf_mma_gu_k2(
   threadgroup float gate_sums[2 * 32 * FN * 2];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  if constexpr (!__is_same(FG, void)) {
+    static_assert(2 * GGUF_MOE_SPLIT_THREADS == 256, "the few-row gate/up tile runs 2 x 2 x 2 simdgroups");
+    if (tile.rows <= kDotRows) {
+      moe_gate_up_dot<FG, 2, 2, 1>(input, routes, tile, gw0, gw1, gmeta, gsw0, gsw1, gsmeta, uw0, uw1, umeta, usw0, usw1, usmeta,
+                                   output, p, group, simd_lane, simd_group, (threadgroup uint *)stage);
+      return;
+    }
+  }
   const MoeGgufSegment sg_gate = moe_gguf_segment_for<true>(tile.expert, p.gate, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
   const MoeGgufSegment sg_up = moe_gguf_segment_for<true>(tile.expert, p.up, uw0, uw1, umeta, usw0, usw1, usmeta);
   const uint thread_index = simd_group * 32 + simd_lane;
@@ -131,3 +150,13 @@ kernel void moe_expert_gguf_mma_gu_k2(
     output[out + ulong(row) * p.gate.output_size + origin + column] = bfloat(float(bfloat(v)) * splash_silu(gate));
   });
 }
+using MoeExpertGgufMmaGuK2Kernel = void(device const bfloat *, device const uint *, device const MoeTileDescriptor *, device const uint *,
+                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
+                                        device bfloat *, constant MoeGgufGateUpParams &, uint2, uint, uint);
+template [[host_name("moe_expert_gguf_mma_gu_k2")]] kernel MoeExpertGgufMmaGuK2Kernel moe_expert_gguf_mma_gu_k2<void>;
+template [[host_name("moe_expert_gguf_mma_gu_k2_dot_iq2xxs")]] kernel MoeExpertGgufMmaGuK2Kernel moe_expert_gguf_mma_gu_k2<FmtIQ2XXS>;
+template [[host_name("moe_expert_gguf_mma_gu_k2_dot_iq2xs")]] kernel MoeExpertGgufMmaGuK2Kernel moe_expert_gguf_mma_gu_k2<FmtIQ2XS>;
+template [[host_name("moe_expert_gguf_mma_gu_k2_dot_iq2s")]] kernel MoeExpertGgufMmaGuK2Kernel moe_expert_gguf_mma_gu_k2<FmtIQ2S>;
+template [[host_name("moe_expert_gguf_mma_gu_k2_dot_iq3xxs")]] kernel MoeExpertGgufMmaGuK2Kernel moe_expert_gguf_mma_gu_k2<FmtIQ3XXS>;
+template [[host_name("moe_expert_gguf_mma_gu_k2_dot_iq3s")]] kernel MoeExpertGgufMmaGuK2Kernel moe_expert_gguf_mma_gu_k2<FmtIQ3S>;

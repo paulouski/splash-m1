@@ -284,6 +284,8 @@ struct MoeConfig final {
   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
   // GGUF plans only; the execution plans derive it from the GPU family.
   MoeGgufTile ggufTile = MoeGgufTile::Staged;
+  // GGUF decode plans: tiles of one or two live rows run on registers (opt-in: SPLASH_MOE_DOT=1).
+  bool ggufFewRowDot = false;
   // The tile of a GGUF plan's F32 router; the execution plans derive it from
   // the device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
