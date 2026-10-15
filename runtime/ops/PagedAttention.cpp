@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -126,6 +127,40 @@ uint64_t splitThreads(AttentionTile tile, uint32_t queryHeads, kv::Layout layout
 // The group-of-twelve register-tile split kernels, which also bind the QSA bitmaps.
 bool masked(std::string_view pipeline) noexcept {
   return pipeline.ends_with("_split_sgf_kv2_g12");
+}
+
+// Entries of one segment's list: two rows' budgets of topBlocks + 1 blocks, in whole virtual pages of eight.
+uint32_t virtualPageEntries(uint32_t topBlocks) noexcept { return (2 * (topBlocks + 1) + 7) / 8 * 8; }
+
+// The virtual-page scratch: an (offset, pages) pair per segment, padded to 64 words, then the lists.
+uint64_t virtualPageListsOffset(uint64_t segments) noexcept { return (segments * 2 + 63) / 64 * 64; }
+uint64_t virtualPageWords(uint64_t segments, uint32_t topBlocks) noexcept {
+  return virtualPageListsOffset(segments) + segments * virtualPageEntries(topBlocks);
+}
+
+// N1 (virtual pages): whether a masked prefill chunk walks the admitted blocks. The lists need the int8 cache and
+// scratch for every segment; past those, SPLASH_N1 decides (a forced run that cannot use them says so once).
+// Auto: a virtual page costs about 2.3x a stock page (bench, l3 worst layer) and a row admits topBlocks + 1 blocks
+// of the (committed + rows / 2) / 4 the chunk's middle row sees; a segment's list is the union of two rows' blocks.
+// With admitted blocks scattered over the context, the stock/virtual step ratio is (1 - (1 - q)^8) / q / 2.5, q the
+// admitted share (measured: 2.84x worst layer at q = 0.036 gives the 2.5), which crosses 2.3 at q = 0.10, i.e. 10
+// budgets of context; 16 budgets (q = 0.0625, ratio 2.58) keeps a margin. Checked on 34-69K contexts at 2048 rows.
+bool useVirtualPages(const PrefillAttentionPlan &plan, const kv::ChunkedPrefillParams &chunk, const QsaMask &mask) {
+  if (mask.virtualPages == VirtualPages::Off || !mask.words || !mask.topBlocks || plan.format != kv::Format::Int8)
+    return false;
+  if (mask.vpScratch.sizeBytes() < virtualPageWords(uint64_t{plan.splitGroups.y} * 12, mask.topBlocks) * sizeof(uint32_t)) {
+    static const bool logged = [&] {
+      if (mask.virtualPages == VirtualPages::On)
+        std::fprintf(stderr, "SPLASH_N1=1: the QSA score scratch is too small for the block lists; using every page\n");
+      return true;
+    }();
+    (void)logged;
+    return false;
+  }
+  if (mask.virtualPages == VirtualPages::On)
+    return true;
+  const uint64_t blocks = (uint64_t{chunk.committed_tokens} + chunk.chunk_tokens / 2) / QWEN4_QSA_BLOCK;
+  return blocks >= 16 * (uint64_t{mask.topBlocks} + 1);
 }
 
 } // namespace
@@ -363,7 +398,16 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
-  if (masked(plan.splitPipeline))
+  if (masked(plan.splitPipeline) && useVirtualPages(plan, chunk, mask)) {
+    const uint64_t segments = uint64_t{plan.splitGroups.y} * 12;
+    // list_offset: where the lists start in the scratch, after the segments' (offset, pages) pairs.
+    const Qwen4QsaMaskParams lists{mask.words, mask.row0, virtualPageEntries(mask.topBlocks),
+                                         static_cast<uint32_t>(virtualPageListsOffset(segments)), 0};
+    graph.add("prefill_attention_vp_listbuild", {mask.bits}, params, {mask.vpScratch}, lists, {segments, 1, 1}, {256, 1, 1});
+    graph.add("prefill_attention_q8_split_sgf_vp_kv2_g12",
+              {std::move(queries), partials, statistics, std::move(pageTable)}, params,
+              {mask.bits, mask.vpScratch}, lists, plan.splitGroups, plan.splitThreads);
+  } else if (masked(plan.splitPipeline))
     graph.add(std::string(plan.splitPipeline),
               {std::move(queries), partials, statistics, std::move(pageTable)}, params,
               {mask.words ? mask.bits : partials}, Qwen4QsaMaskParams{mask.words, mask.row0, 0, 0, 0},

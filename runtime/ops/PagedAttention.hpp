@@ -170,6 +170,10 @@ private:
 // row. Only the group-of-twelve register-tile kernels read them. A verify step
 // also binds its lanes' compacted page lists (Qwen4QsaMaskParams), `pages` at
 // listOffset words into each lane's listStride, split into at least minPages.
+// A masked prefill may instead walk virtual pages of the admitted blocks (N1): `vpScratch` holds the lists,
+// `topBlocks` is the QSA selection budget, `virtualPages` the SPLASH_N1 choice.
+enum class VirtualPages : uint8_t { Off, Auto, On };
+
 struct QsaMask final {
   metal::MetalBuffer bits;
   uint32_t words = 0;
@@ -178,6 +182,9 @@ struct QsaMask final {
   uint32_t listStride = 0;
   uint32_t listOffset = 0;
   uint32_t minPages = 0;
+  metal::MetalBuffer vpScratch = {};
+  uint32_t topBlocks = 0;
+  VirtualPages virtualPages = VirtualPages::Off;
 };
 
 struct PagedVerifyBuffers final {

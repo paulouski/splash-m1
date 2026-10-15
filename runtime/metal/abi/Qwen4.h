@@ -81,7 +81,9 @@ struct Qwen4QsaBlock {
 // first query row. The verify kernels also read each lane's compacted page
 // list (count, then the pages in order) at lane * list_stride + list_offset
 // words of the list buffer (list_stride 0: none) and split it into splits of
-// at least min_pages pages.
+// at least min_pages pages. The N1 prefill kernels read list_offset as the
+// word where their virtual-page lists start and list_stride as the entries
+// of each list.
 struct Qwen4QsaMaskParams {
   uint32_t mask_words;
   uint32_t row0;

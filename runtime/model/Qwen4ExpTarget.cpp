@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -186,6 +187,13 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
   // A full-attention block's mixer over the prefill rows: the QSA indexer's
   // keys, the attention's KV into the pages and, when `attend`, the attention
   // and its output projection into h.branch.
+  // SPLASH_N1: 1 forces the virtual pages of the admitted blocks, auto picks per chunk
+  // (ops::PagedAttention::addPrefill), else (unset) every page of the masked prefill is walked.
+  // The score scratch holds the block lists: the select has consumed it before the attention.
+  const char *n1 = std::getenv("SPLASH_N1");
+  const ops::VirtualPages virtualPages = n1 && std::strcmp(n1, "1") == 0      ? ops::VirtualPages::On
+                                         : n1 && std::strcmp(n1, "auto") == 0 ? ops::VirtualPages::Auto
+                                                                              : ops::VirtualPages::Off;
   const auto addAttention = [&](const Qwen4ExpLayerWeights &layer, const QwenAttentionWeights &mixer,
                                 uint32_t attentionLayer, bool attend) {
     const Qwen4IndexerWeights &indexer = *layer.indexer;
@@ -235,7 +243,8 @@ metal::MetalBuffer Qwen4ExpTarget::addPrefill(metal::CommandGraph &graph, const 
       ops::PagedAttention::addPrefill(
           graph, kvLayers[attentionLayer], attentionQueries, attentionRows, b.attentionPartials,
           b.attentionStatistics, sequence.pageTable, sequence.chunk, step.attention[s],
-          ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, sequence.rowBegin, {}, 0, 0, 0});
+          ops::QsaMask{h.qsaMask, sparse ? h.qsaMaskWords : 0, sequence.rowBegin, {}, 0, 0, 0, h.qsaScores, topBlocks,
+                       virtualPages});
       ops::PagedAttention::addPrefillGate(
           graph, u16Rows(b.fullPacked, sequence.rowBegin, sequence.rows, geometry_.packedFullWidth),
           attentionRows, u16Rows(b.attentionHidden, sequence.rowBegin, sequence.rows, geometry_.attentionWidth),
