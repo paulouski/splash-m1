@@ -599,9 +599,14 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
       input.sizeBytes() < uint64_t{rows} * k * 2 ||
       output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
     throw std::invalid_argument("invalid float projection");
-  const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
-                             (type == FloatOutput::Float32 ? "f32" : "bf16");
+  // Staged simdgroup tile (16 B loads): fp32 output above 32 rows, 16-byte aligned views
+  const bool staged = !accelerator && type == FloatOutput::Float32 && rows > 32 && n % 16 == 0 &&
+                      input.gpuAddress() % 16 == 0 && weights.plane0.gpuAddress() % 16 == 0;
+  const std::string kernel = staged ? "gguf_float_s42_f32"
+                                    : std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
+                                          (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
+                                   : staged    ? metal::DispatchSize{n / 16, (rows + 31) / 32, 1}
                                                : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
   graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
             GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});

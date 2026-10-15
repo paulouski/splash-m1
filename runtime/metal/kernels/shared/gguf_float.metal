@@ -81,6 +81,87 @@ GGUF_FLOAT_KERNEL(gguf_float_bf16, bfloat)
 GGUF_FLOAT_KERNEL(gguf_float_f32, float)
 #undef GGUF_FLOAT_KERNEL
 
+// Staged variant for fp32 output above 32 rows: each simdgroup stages its K step's 32 rows and 16 columns into
+// threadgroup memory with 16 B loads (input and weight offsets and K % 8 aligned), then runs the same MMAs. The K
+// parts, step order and part reduction match gguf_float_f32, so results are bit-identical.
+namespace gguf_staged {
+
+constant constexpr uint kColumns = 16, kColGroups = kColumns / 8;
+constant constexpr uint kColStride = 12;   // floats per staged weight column: 8 + 4 pad (conflict-free lane reads)
+constant constexpr uint kABytes = gguf_float::kRows * 16, kBBytes = kColumns * kColStride * 4;
+constant constexpr uint kRegionBytes = kABytes + kBBytes;
+constant constexpr uint kAccs = gguf_float::kFragments * kColGroups;
+constant constexpr uint kStageBytes = kRegionBytes * gguf_float::kSplits, kPartsBytes = gguf_float::kSplits * kAccs * 32 * 8;
+constant constexpr uint kTgBytes = kStageBytes > kPartsBytes ? kStageBytes : kPartsBytes;
+static_assert(kTgBytes <= 32768, "Apple7 threadgroup memory limit");
+static_assert(gguf_float::kSplits >= kAccs, "simdgroup a reduces accumulator a");
+
+// Threadgroup: columns [16 tg.x, 16 tg.x + 16) of rows [32 tg.y, 32 tg.y + 32); 512 threads. The staging region of
+// a simdgroup aliases the parts array.
+inline void project(device const bfloat *input, device const float *weights, device float *output,
+                    constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float4 *mem) {
+  using gguf_float::kFragments, gguf_float::kRows, gguf_float::kSplits;
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint K = p.input_size, row0 = tg.y * kRows, col0 = tg.x * kColumns;
+  const uint live = min(kRows, p.rows - row0);
+  const uint steps = K / 8, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
+  threadgroup uchar *region = reinterpret_cast<threadgroup uchar *>(mem) + sg * kRegionBytes;
+  float2 acc[kAccs];
+#pragma unroll
+  for (uint a = 0; a < kAccs; ++a) acc[a] = float2(0);
+  for (uint step = first; step < last; ++step) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      const uint row = lane;
+      uint4 v = uint4(0);
+      if (row < live) v = *reinterpret_cast<device const uint4 *>(input + ulong(row0 + row) * K + step * 8);
+      *reinterpret_cast<threadgroup uint4 *>(region + row * 16) = v;
+    }
+#pragma unroll
+    for (uint j = lane; j < kColumns * 2; j += 32) {
+      const uint c = j >> 1, h = j & 1;
+      *reinterpret_cast<threadgroup float4 *>(region + kABytes + c * kColStride * 4 + h * 16) =
+          *reinterpret_cast<device const float4 *>(weights + ulong(col0 + c) * K + step * 8 + h * 4);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const float *bT = reinterpret_cast<threadgroup const float *>(region + kABytes);
+#pragma unroll
+    for (uint cg = 0; cg < kColGroups; ++cg) {
+      const float2 b(bT[(cg * 8 + l.fn) * kColStride + l.fm], bT[(cg * 8 + l.fn + 1) * kColStride + l.fm]);
+#pragma unroll
+      for (uint f = 0; f < kFragments; ++f) {
+        if (f * 8 >= live) break;
+        const bfloat2 av = reinterpret_cast<threadgroup const bfloat2 *>(region + (f * 8 + l.fm) * 16)[l.fn >> 1];
+        sgmatrix::mma_acc<float>(acc[cg * kFragments + f], float2(av), b);
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  threadgroup float2 *parts = reinterpret_cast<threadgroup float2 *>(mem);
+#pragma unroll
+  for (uint a = 0; a < kAccs; ++a) parts[(sg * kAccs + a) * 32 + lane] = acc[a];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg >= kAccs) return;
+  const uint f = sg % kFragments, cg = sg / kFragments, row = f * 8 + l.fm;
+  if (row >= live) return;
+  float2 total = float2(0);
+  for (uint s = 0; s < kSplits; ++s) total += parts[(s * kAccs + sg) * 32 + lane];
+  device float *out = output + ulong(row0 + row) * p.out_stride + p.out_offset + col0 + cg * 8 + l.fn;
+  out[0] = total.x;
+  out[1] = total.y;
+}
+
+} // namespace gguf_staged
+
+// Grid (output_size / 16, ceil(rows / 32)), 32 kSplits threads.
+kernel void gguf_float_s42_f32(device const bfloat *input [[buffer(0)]], device const float *weights [[buffer(1)]],
+                               device float *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],
+                               uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float4 mem[gguf_staged::kTgBytes / 16];
+  gguf_staged::project(input, weights, output, p, tg, sg, lane, mem);
+}
+
 #if __METAL_VERSION__ >= 400   // MPP-only; Apple7/8 (MACOS15 build) uses gguf_float_{bf16,f32}
 // The same projections on the neural accelerator (ops::FloatTile::NeuralAccelerator), whose matmul takes bf16
 // operands: each F32 weight is split into three bf16 parts, its leading 8 significant bits, the next 8 and the last 8,
