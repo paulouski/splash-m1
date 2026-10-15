@@ -66,7 +66,7 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
     if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
     config.ggufTile = tile;
     const char *dot = std::getenv("SPLASH_MOE_DOT");
-    config.ggufFewRowDot = !prefill && tile == MoeGgufTile::Mma && dot && !std::strcmp(dot, "1");
+    config.ggufFewRowDot = !prefill && tile == MoeGgufTile::Mma && !(dot && !std::strcmp(dot, "0"));
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
   }
   return config;
