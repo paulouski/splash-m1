@@ -184,6 +184,7 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
   constexpr uint kThreads = QWEN4_QSA_SELECT_THREADS;
   threadgroup atomic_uint histogram[256];
   threadgroup uint shared[4];
+  threadgroup uint scan_totals[8];
   threadgroup uint simd_counts[kThreads / 32];
   const uint row = p.row_offset + group;
   if (group >= p.rows) return;
@@ -212,16 +213,18 @@ kernel void qwen4_qsa_select(device const float *scores [[buffer(0)]],
         atomic_fetch_add_explicit(&histogram[(v >> shift) & 255u], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-      uint above = 0, bin = 255;
-      for (;; --bin) {
-        const uint count = atomic_load_explicit(&histogram[bin], memory_order_relaxed);
-        if (above + count >= wanted || bin == 0) {
-          shared[0] = bin;
-          shared[1] = wanted - above;
-          break;
-        }
-        above += count;
+    // Thread t < 256 owns bin 255 - t; the one bin where the running count
+    // from the top first reaches `wanted` publishes {bin, wanted - count above}.
+    const uint count = tid < 256 ? atomic_load_explicit(&histogram[255 - tid], memory_order_relaxed) : 0u;
+    const uint inclusive_count = simd_prefix_inclusive_sum(count);
+    if (lane == 31 && sg < 8) scan_totals[sg] = inclusive_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 256) {
+      uint above = inclusive_count - count;
+      for (uint g = 0; g < sg; ++g) above += scan_totals[g];
+      if (above < wanted && (above + count >= wanted || tid == 255)) {
+        shared[0] = 255 - tid;
+        shared[1] = wanted - above;
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
