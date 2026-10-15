@@ -6,6 +6,8 @@
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -319,6 +321,21 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
       : LinearScratchSize{};
 }
 
+// Decode projections of at most eight rows that are narrow and deep (hyper down, N320 K10240: 5 column tiles on 32
+// cores) split K 16 ways on Apple7/8's MMA tile; the grid of 40 threadgroups left cores idle. The reduction adds the
+// partials in split order, so the sum differs from the 8-way split only by its grouping. SPLASH_HYPER_SPLITK=0 turns
+// it off.
+static bool wideSplitShape(const LinearWorkload &w, uint32_t appleGpuFamily) {
+  static const bool on = [] {
+    const char *e = std::getenv("SPLASH_HYPER_SPLITK");
+    return !(e && !std::strcmp(e, "0"));
+  }();
+  const auto [n, k] = w.matrix;
+  return on && mmaTiles(appleGpuFamily) && w.phase == LinearPhase::Decode && w.rows <= 8 &&
+         w.epilogue == LinearEpilogue::None && n / GGUF_TILE_COLUMNS <= 8 && k >= 8192 &&
+         (k / 32) % LinearConfig::kWideSplits == 0;
+}
+
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   const auto [n, k] = w.matrix;
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
@@ -338,13 +355,21 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (appleGpuFamily_ == 9 && !apple9Stages(w, projections)) return registerDecode(n, k, gpuCores_);
-  return stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  LinearConfig config = stagedDecode(n, k, gpuCores_, appleGpuFamily_);
+  if (wideSplitShape(w, appleGpuFamily_) && projections.size() == 2 && projections[0] && !projections[1] &&
+      projections[0]->destination == FloatOutput::BFloat16) {
+    const std::vector<QuantizedSegment> &segments = projections[0]->blocks().segments;
+    if (segments.size() == 1 && segments.front().formatId == GGUF_FMT_Q80) config.splits = LinearConfig::kWideSplits;
+  }
+  return config;
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, baseline(w)).scratchSize();
   if (appleGpuFamily_ == 9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, appleGpuFamily_)).scratchSize());
+  if (wideSplitShape(w, appleGpuFamily_))
+    size.include(LinearPlan(w, {.tile = LinearTile::GgufStaged, .splits = LinearConfig::kWideSplits}).scratchSize());
   return size;
 }
 
@@ -432,7 +457,8 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const metal::MetalBuffer counters = splits > 1 ? b.scratch.counters : b.output;
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(tensorKernel(route, s, rows, epilogue, mma, plan.destination()),
+    const std::string kernel = tensorKernel(route, s, rows, epilogue, mma, plan.destination());
+    graph.add(splits > LinearConfig::kMaximumSplits ? kernel + "_k16" : kernel,
               {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, splits, n, s.columnOffset}, {s.outputSize / GGUF_TILE_COLUMNS, splits, 1},
               {GGUF_STAGED_THREADS, 1, 1});

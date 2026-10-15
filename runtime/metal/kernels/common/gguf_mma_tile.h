@@ -269,8 +269,9 @@ inline void accumulate_pq20_rb(device const half *x, device const float *sums, d
 
 // A simdgroup's sums over every K partition, handed to store(row, column, sum), as gguf_store_sums: one partition
 // stores its own; more publish fp32 partials [split][Rows][destination column] and the last arriving partition adds
-// them in split order.
-template <uint Rows, uint FM, class Store>
+// them in split order (s = 0, 1, ..., splits - 1, left to right, own sum in its place), so a split count fixes the
+// rounding; `MaxSplits` bounds the unrolled reduction.
+template <uint Rows, uint MaxSplits = kMaximumSplits, uint FM, class Store>
 inline void store_sums(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint splits, uint split,
                        device coherent(device) float *partials, device atomic_uint *counter, uint stride,
                        uint column0, uint thread_index, threadgroup uint *arrival, Store store) {
@@ -289,13 +290,13 @@ inline void store_sums(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint spli
 #pragma unroll
       for (uint e = 0; e < 2; ++e) {
         const uint row = 8 * r + l.fn + e, column = 8 * i + l.fm;
-        float parts[kMaximumSplits];
+        float parts[MaxSplits];
 #pragma unroll
-        for (uint s = 0; s < kMaximumSplits; ++s)
+        for (uint s = 0; s < MaxSplits; ++s)
           parts[s] = s < splits && s != split ? partials[at(s, row, column)] : 0.0f;
         float total = 0.0f;
 #pragma unroll
-        for (uint s = 0; s < kMaximumSplits; ++s)
+        for (uint s = 0; s < MaxSplits; ++s)
           if (s < splits) total += s == split ? acc[i][r][e] : parts[s];
         store(row, column, total);
       }

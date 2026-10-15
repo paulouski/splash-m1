@@ -104,8 +104,10 @@ struct LinearConfig final {
   // least two); all other tiles use one.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 8;
+  // The 8-row bf16 Q8_0 staged tile alone runs up to this many (Linear::hyperSplitK).
+  static constexpr uint32_t kWideSplits = 16;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
-    return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
+    return splits && splits <= kWideSplits && !(splits & (splits - 1));
   }
   bool operator==(const LinearConfig &) const = default;
 };

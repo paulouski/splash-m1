@@ -8,7 +8,7 @@
 using namespace gguf_mma;
 
 // The decode kernels: grid (column tiles, K partitions), two simdgroups, as gguf_decode.
-template <class F, ushort Rows, GgufEpilogue Ep, class Out>
+template <class F, ushort Rows, GgufEpilogue Ep, class Out, uint MaxSplits = kMaximumSplits>
 kernel void gguf_decode_mma(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],
                             device uchar *meta [[buffer(3)]], device Out *output [[buffer(4)]],
                             device coherent(device) float *partials [[buffer(5)]], device atomic_uint *counters [[buffer(6)]],
@@ -27,7 +27,7 @@ kernel void gguf_decode_mma(device bfloat *input [[buffer(0)]], device uchar *w0
   zero(acc);
   accumulate<F, FM>(input, w0, w1, meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, tl, simd_lane,
                     group.y * per, (group.y + 1) * per, acc);
-  store_sums<Rows>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,
+  store_sums<Rows, MaxSplits>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,
                    counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0, thread_index, &arrival,
                    [&](uint row, uint column, float v) {
                      const ulong o = ulong(row) * p.out_stride + column0 + column;
@@ -49,6 +49,9 @@ using GgufDecodeMmaKernel = void(device bfloat *, device uchar *, device uchar *
   GGUF_DECODE_MMA_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_MMA_ROWS(F, f, a_f32, EpNone, float)               \
   GGUF_DECODE_MMA_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_MMA_ROWS(F, f, g, EpUpWithGate, bfloat)
 QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
+// Up to 16 K partitions for the 8-row bf16 Q8_0 tile (Linear::ggufBaseline: hyper down, SPLASH_HYPER_SPLITK).
+template [[host_name("gguf_decode_mma_q80_m8_a_k16")]] kernel GgufDecodeMmaKernel<bfloat>
+    gguf_decode_mma<FmtQ80, 8, EpNone, bfloat, 16>;
 #undef GGUF_DECODE_MMA_FORMAT
 #undef GGUF_DECODE_MMA_ROWS
 #undef GGUF_DECODE_MMA
