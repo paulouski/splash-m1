@@ -5,6 +5,7 @@
 #include "TestConfig.hpp"
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
 #include "BackendInstrumentation.hpp"
+#include "VariantRemap.hpp"
 #endif
 
 #import <Foundation/Foundation.h>
@@ -81,10 +82,32 @@ AblationControl ablationControl() {
 // Set per submission: 1 = this command carries the ablation, 0 = it is the paired baseline.
 std::atomic<int> ablationApplied{-1};
 std::atomic<size_t> ablationBaseCount{0};
+// SPLASH_VARIANT_FILE=path: lines "base_pipeline variant_pipeline"; every dispatch of a base pipeline runs the
+// variant instead (same metallib, same bindings and grid). Re-read when mtime/size changes; empty file = no remap (arm A).
+using splash::metal::VariantRemap;
+std::shared_ptr<const VariantRemap> variantRemap() {
+    static std::mutex mutex; static std::shared_ptr<const VariantRemap> current = std::make_shared<const VariantRemap>();
+    static time_t seconds = 0; static long nanos = 0; static off_t size = -1;
+    static const char *path = std::getenv("SPLASH_VARIANT_FILE");
+    if (!path) return current;
+    std::lock_guard lock(mutex);
+    struct stat info;
+    if (stat(path, &info) == 0 &&
+        (info.st_mtimespec.tv_sec != seconds || info.st_mtimespec.tv_nsec != nanos || info.st_size != size)) {
+        seconds = info.st_mtimespec.tv_sec; nanos = info.st_mtimespec.tv_nsec; size = info.st_size;
+        std::ifstream in(path);
+        current = std::make_shared<const VariantRemap>(VariantRemap::parse(std::string(std::istreambuf_iterator<char>(in), {})));
+    }
+    return current;
+}
+// Dispatches of the command being submitted that the variant file renamed (at pipeline lookup) or skipped.
+std::atomic<size_t> variantHits{0};
 std::string currentTimelineTag() {
-    const std::string tag = ablationControl().tag;
+    std::string tag = ablationControl().tag;
     const int applied = ablationApplied.load();
-    return tag == "base" || applied < 0 ? tag : tag + (applied ? "/on" : "/off");
+    if (tag != "base" && applied >= 0) tag += applied ? "/on" : "/off";
+    if (const auto remap = variantRemap(); !remap->map.empty()) tag = tag == "base" ? remap->tag : tag + "|" + remap->tag;
+    return tag;
 }
 }  // namespace
 #endif
@@ -889,8 +912,17 @@ struct MetalBackend::Impl {
             command.dispatches.push_back(item);
         }
 
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        const auto remap = variantRemap();
+#endif
         for (PreparedDispatch &item : command.dispatches) {
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+            const std::string &lookup = remap->apply(item.source->pipelineName);
+            variantHits += &lookup != &item.source->pipelineName;
+            item.pipeline = pipeline(lookup);
+#else
             item.pipeline = pipeline(item.source->pipelineName);
+#endif
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
                 throw MetalBackendError(
@@ -1050,12 +1082,12 @@ struct MetalBackend::Impl {
                         const std::string firstName = dispatches[first].source->pipelineName;
                         const uint64_t sequence = ticketState->sequence;
                         const std::string tag = currentTimelineTag();
-                        const size_t baseCount = ablationBaseCount;
+                        const size_t baseCount = ablationBaseCount, hits = variantHits;
                         [child addCompletedHandler:^(id<MTLCommandBuffer> completedChild) {
                             std::lock_guard lock(timelineMutex());
-                            std::fprintf(log, "T seq=%llu child=%zu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s tag=%s n0=%zu\n",
+                            std::fprintf(log, "T seq=%llu child=%zu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s tag=%s n0=%zu rh=%zu\n",
                                          (unsigned long long)sequence, childIndex, count, committed,
-                                         completedChild.GPUStartTime, completedChild.GPUEndTime, firstName.c_str(), tag.c_str(), baseCount);
+                                         completedChild.GPUStartTime, completedChild.GPUEndTime, firstName.c_str(), tag.c_str(), baseCount, hits);
                             std::fflush(log);
                         }];
                     }
@@ -1126,12 +1158,12 @@ struct MetalBackend::Impl {
                 const std::string last = dispatches.back().source->pipelineName;
                 const uint64_t sequence = ticketState->sequence;
                 const std::string tag = currentTimelineTag();
-                const size_t baseCount = ablationBaseCount;
+                const size_t baseCount = ablationBaseCount, hits = variantHits;
                 [command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
                     std::lock_guard lock(timelineMutex());
-                    std::fprintf(log, "T seq=%llu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s last=%s tag=%s n0=%zu\n",
+                    std::fprintf(log, "T seq=%llu n=%zu commit=%.6f gpu_start=%.6f gpu_end=%.6f first=%s last=%s tag=%s n0=%zu rh=%zu\n",
                                  (unsigned long long)sequence, count, committed, completed.GPUStartTime,
-                                 completed.GPUEndTime, first.c_str(), last.c_str(), tag.c_str(), baseCount);
+                                 completed.GPUEndTime, first.c_str(), last.c_str(), tag.c_str(), baseCount, hits);
                     std::fflush(log);
                 }];
             }
@@ -1592,6 +1624,13 @@ CommandTicket MetalBackend::submitCommandAsync(
     std::vector<ComputeDispatch> kept;
     const char *skip = std::getenv("SPLASH_SKIP_PIPELINES");
     const char *dup = std::getenv("SPLASH_DUP_PIPELINES");
+    std::string variantSkip;
+    variantHits = 0;
+    if (const auto remap = variantRemap(); std::getenv("SPLASH_VARIANT_FILE")) {
+        variantSkip = remap->skipList();
+        if (!variantSkip.empty())
+            for (const ComputeDispatch &dispatch : dispatches) variantHits += remap->skipped(dispatch.pipelineName);
+    }
     AblationControl ablation;
     ablationBaseCount = dispatches.size();
     if (std::getenv("SPLASH_ABLATION_FILE")) {
@@ -1603,6 +1642,10 @@ CommandTicket MetalBackend::submitCommandAsync(
         ablationApplied = applied ? 1 : 0;
         skip = applied && !ablation.skip.empty() ? ablation.skip.c_str() : nullptr;
         dup = applied && !ablation.dup.empty() ? ablation.dup.c_str() : nullptr;
+    }
+    if (!variantSkip.empty()) {
+        if (skip) variantSkip = std::string(skip) + "," + variantSkip;
+        skip = variantSkip.c_str();
     }
     // SPLASH_MOE_ROWS=N: 8-row MoE routing covers only the first N rows (experiment; later rows are not routed).
     const char *moeRows = std::getenv("SPLASH_MOE_ROWS");
