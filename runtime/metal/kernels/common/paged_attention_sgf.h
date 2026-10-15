@@ -143,9 +143,11 @@ __attribute__((always_inline)) inline bool admitted(uint token, uint limit, uint
 // query row (block_mask: the tile's first row, mask_words words per row;
 // mask_words == 0: every row attends causally). With a page_list (count, then
 // the pages some row admits, in order) the splits share that list equally,
-// each at least min_pages long, rather than the contiguous pages.
+// each at least min_pages long, rather than the contiguous pages. PageParity
+// (masked prefill) specialises each page's body on which block-parity halves
+// the simdgroup admits.
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, uint Halves = 1,
-          bool Masked = false>
+          bool Masked = false, bool PageParity = false>
 __attribute__((always_inline)) inline void tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -242,6 +244,20 @@ __attribute__((always_inline)) inline void tile(
           continue;
       }
     }
+    // Block parity: score/PV steps 0,1 cover this page's even blocks, 2,3 the odd ones
+    // (page_token), so a half with no admitted block in the simdgroup's rows is skipped.
+    // Its scores are masked and its weights zero, so the result is bit-identical.
+    bool even_blocks = true, odd_blocks = true;
+    if constexpr (Masked && PageParity) {
+      if (mask_words) {
+        const uint any_bits = blocks.x | blocks.y;
+        even_blocks = simd_any(any_bits & 1u);
+        odd_blocks = simd_any(any_bits & 2u);
+      }
+    }
+    // Parity decided once per page; each body has compile-time loop bounds, no branches in the loops.
+    auto page_body = [&](auto even_tag, auto odd_tag) __attribute__((always_inline)) {
+      constexpr bool EV = decltype(even_tag)::value, OD = decltype(odd_tag)::value;
     const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
     device const CacheElement *keys = tensors.keys;
     device const CacheElement *values = tensors.values;
@@ -267,7 +283,7 @@ __attribute__((always_inline)) inline void tile(
 #pragma unroll
     for (uint b = 0; b < 4; ++b)
 #pragma unroll
-      for (uint s = 0; s < 4; ++s) {
+      for (uint s = EV ? 0 : 2; s < (OD ? 4 : 2); ++s) {
         KeyRun<CacheElement> run;
         run.load(keys + page_token(fm, s) * D + 64 * b + 8 * fn);
 #pragma unroll
@@ -351,10 +367,25 @@ __attribute__((always_inline)) inline void tile(
     for (uint d = 0; d < 32; ++d) {
       ValueRun<CacheElement> run;
       run.load(value_row + d * 8 * N);
-      mma(output[d], run.step(0), weights[0]);
-      mma(output[d], run.step(1), weights[1]);
-      mma(output[d], run.step(2), weights[2]);
-      mma(output[d], run.step(3), weights[3]);
+      if constexpr (EV) {
+        mma(output[d], run.step(0), weights[0]);
+        mma(output[d], run.step(1), weights[1]);
+      }
+      if constexpr (OD) {
+        mma(output[d], run.step(2), weights[2]);
+        mma(output[d], run.step(3), weights[3]);
+      }
+    }
+    };
+    if constexpr (Masked && PageParity) {
+      if (even_blocks && odd_blocks)
+        page_body(true_type{}, true_type{});
+      else if (even_blocks)
+        page_body(true_type{}, false_type{});
+      else
+        page_body(false_type{}, true_type{});
+    } else {
+      page_body(true_type{}, true_type{});
     }
   }
 

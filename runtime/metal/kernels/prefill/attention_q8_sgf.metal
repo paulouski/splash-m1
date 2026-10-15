@@ -72,7 +72,7 @@ SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat)
         (ulong(kv_head) * params.chunk_stride + tile_start) * 12 * D;          \
     const ulong slot =                                                         \
         (ulong(tile) * 2 + kv_head) * params.split_count + split;              \
-    q8sgf::tile<2, 12, CacheElement, 2, true>(                                 \
+    q8sgf::tile<2, 12, CacheElement, 2, true, true>(                           \
         queries + tile_offset, page_table, params.kv, kv_head,                 \
         params.committed_tokens + tile_start, active_rows, params.split_count, \
         split, partials, statistics, slot, sg, lane, query_words, group.x & 1, \
