@@ -439,6 +439,12 @@ void Qwen4ExpTarget::addVerifyProjection(VerifyStep &step, metal::MetalBuffer in
 // kernel writes just those and beats the 8-row tile up to three rows.
 void Qwen4ExpTarget::addVerifyLogits(VerifyStep &step, uint32_t firstRow, uint32_t rows) const {
   const ops::Linear &linear = operators_.linear();
+  // The draft's shortlist head: its logits rows are `head.outputSize` apart.
+  if (const QwenDraftShortlist *shortlist = step.buffers.shortlist; shortlist && shortlist->scored) {
+    linear.addRows(step.graph, step.buffers.finalHidden, shortlist->head, step.buffers.logits, step.lanes, firstRow,
+                   rows);
+    return;
+  }
   if (rows < 4 && linear.rowsEligible(weights_.logitsProjection, rows))
     linear.addRows(step.graph, step.buffers.finalHidden, weights_.logitsProjection, step.buffers.logits, step.lanes,
                    firstRow, rows);
@@ -584,6 +590,11 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, const QwenTargetVer
     throw std::invalid_argument("invalid MTP draft batch");
   VerifyStep step = verifyStep(graph, b, kvLayers, chunks, lanes);
   const Qwen4Buffers &h = b.qwen4;
+  const QwenDraftShortlist *shortlist = b.shortlist;
+  if (shortlist && shortlist->count)
+    ops::Qwen4::addShortlistGather(graph, weights_.logitsProjection.blocks().segments.front(),
+                                   shortlist->head.blocks().segments.front(), shortlist->ids, shortlist->first,
+                                   shortlist->count);
   // Step j reads rows 0..j-1 (the anchor and the proposals so far, each with
   // the streams of the row before) and drafts proposal j - 1 from row j - 1.
   // The rows before it recompute what the steps before wrote; the later rows
@@ -592,8 +603,10 @@ void Qwen4ExpTarget::addMtpDraft(metal::CommandGraph &graph, const QwenTargetVer
     ops::Qwen4::addMtpTokens(graph, b.anchors, b.proposals, h.mtpTokens, lanes, kLaneRows, b.proposalsPerLane, j);
     ops::Embedding::add(graph, h.mtpTokens, weights_.tokenEmbedding, b.hidden[1], step.rows);
     addMtpVerify(step, b.hidden[1], h.mtpStreams, j, true);
-    ops::Qwen4::addMtpArgmax(graph, b.logits, b.proposals, b.candidates, lanes, kLaneRows, geometry_.vocabularySize,
-                             b.proposalsPerLane, b.candidatesPerProposal, j - 1, j == steps);
+    const bool scored = shortlist && shortlist->scored;
+    ops::Qwen4::addMtpArgmax(graph, b.logits, b.proposals, b.candidates, lanes, kLaneRows,
+                             scored ? shortlist->head.outputSize : geometry_.vocabularySize, b.proposalsPerLane,
+                             b.candidatesPerProposal, j - 1, j == steps, scored ? shortlist->map : metal::MetalBuffer{});
   }
 }
 

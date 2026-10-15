@@ -6,7 +6,9 @@
 // ops::Linear; model/QwenTarget.cpp composes them.
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/Qwen4.h"
 #include "ops/Normalization.hpp"
+#include "ops/Weights.hpp"
 
 #include <cstdint>
 
@@ -46,6 +48,19 @@ struct QsaRows final {
 struct QsaIndex final {
   uint32_t keysOffset = 0;
   uint32_t pooledOffset = 0;
+};
+
+// SPLASH_DRAFT_SHORTLIST: scratch of the top-k of the target's rows (kernels/shared/draft_shortlist.metal). The
+// histogram starts zeroed and is left zeroed by every call.
+struct ShortlistTopK final {
+  static constexpr uint32_t kCandidates = QWEN4_TOPK_CANDIDATES;
+  metal::MetalBuffer histogram;
+  metal::MetalBuffer threshold;
+  metal::MetalBuffer count;
+  metal::MetalBuffer keys;
+  metal::MetalBuffer ids;
+  // [row][k] token ids, largest first.
+  metal::MetalBuffer topIds;
 };
 
 struct Qwen4 final {
@@ -119,7 +134,15 @@ struct Qwen4 final {
                           HyperShape shape, uint32_t rows);
   static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                            metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
-                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
+                           metal::MetalBuffer map = {});
+  // Rows first.. first + count of the Q4_K/Q5_K `destination` head from the `head` rows `ids` names.
+  static void addShortlistGather(metal::CommandGraph &graph, const QuantizedSegment &head,
+                                 const QuantizedSegment &destination, metal::MetalBuffer ids, uint32_t first,
+                                 uint32_t count);
+  // The `k` (<= 1024) largest logits' ids of rows 0..rows - 1 of fp32 `logits` rows of `vocabulary`.
+  static void addTopK(metal::CommandGraph &graph, metal::MetalBuffer logits, const ShortlistTopK &scratch,
+                      uint32_t vocabulary, uint32_t rows, uint32_t k);
   // Row retained - 1 of `streams` (retained a GPU count) or, without
   // `retained`, row `rows` - 1.
   static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,

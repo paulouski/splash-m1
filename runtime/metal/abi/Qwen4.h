@@ -130,3 +130,28 @@ struct Qwen4PleHashParams {
   uint32_t vocabularies[QWEN4_PLE_MAXIMUM_HEADS];
   uint32_t offsets[QWEN4_PLE_MAXIMUM_HEADS];
 };
+
+// SPLASH_DRAFT_SHORTLIST (kernels/shared/draft_shortlist.metal). Gather: `count` rows of the repacked logits head,
+// chosen by `ids`, into rows first.. of a head in the same tiled layout (groups of 32 inputs per row, meta units per
+// row, bytes per row and group or unit of each plane). Top-k: the k largest of each of `rows` rows of `vocabulary`
+// logits, through a 16-bit radix histogram and a bitonic sort of at most `capacity` (<= QWEN4_TOPK_CANDIDATES) candidates.
+// The most candidates a top-k row keeps for its bitonic sort.
+#define QWEN4_TOPK_CANDIDATES 2048u
+
+struct Qwen4GatherParams {
+  uint32_t groups;
+  uint32_t units;
+  uint32_t plane0;
+  uint32_t plane1;
+  uint32_t meta;
+  uint32_t count;
+  uint32_t first;
+  uint32_t pad;
+};
+
+struct Qwen4TopKParams {
+  uint32_t vocabulary;
+  uint32_t k;
+  uint32_t rows;
+  uint32_t capacity;
+};

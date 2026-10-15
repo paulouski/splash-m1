@@ -222,6 +222,19 @@ struct QwenTargetPrefillBuffers final {
   Qwen4Buffers qwen4;
 };
 
+// SPLASH_DRAFT_SHORTLIST: the logits head's rows the MTP draft scores (model/DraftShortlist.hpp), gathered into
+// `head`. Rows first.. first + count are gathered by this draft command from the head rows `ids` names.
+struct QwenDraftShortlist final {
+  ops::Projection head;
+  // Token id of each row of `head`.
+  metal::MetalBuffer map;
+  metal::MetalBuffer ids;
+  uint32_t first = 0;
+  uint32_t count = 0;
+  // Whether the draft head scores `head` rather than the whole vocabulary.
+  bool scored = false;
+};
+
 struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
@@ -270,6 +283,7 @@ struct QwenTargetVerifyBuffers final {
   metal::MetalBuffer candidates;
   uint32_t proposalsPerLane = 0;
   uint32_t candidatesPerProposal = 0;
+  const QwenDraftShortlist *shortlist = nullptr;
 };
 
 struct QwenTargetCommitBuffers final {

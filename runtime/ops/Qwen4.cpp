@@ -1,5 +1,6 @@
 #include "ops/Qwen4.hpp"
 
+#include "metal/abi/QuantFormat.h"
 #include "metal/abi/Qwen4.h"
 
 #include <algorithm>
@@ -144,12 +145,49 @@ void Qwen4::addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected
 
 void Qwen4::addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
                          metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
-                         uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last) {
+                         uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
+                         metal::MetalBuffer map) {
   if (!lanes || row >= laneRows || row >= proposalsPerLane) throw std::invalid_argument("invalid MTP argmax");
   const Qwen4MtpParams params{lanes * laneRows, 0, 0, laneRows, 0, vocabulary, proposalsPerLane,
                               candidatesPerProposal, row, last ? 1u : 0u, 0, 0};
-  graph.add("qwen4_mtp_argmax", {std::move(logits), std::move(proposals), std::move(candidates)}, params,
-            {lanes, 1, 1}, {1024, 1, 1});
+  if (map)
+    graph.add("qwen4_mtp_argmax_map",
+              {std::move(logits), std::move(proposals), std::move(candidates), std::move(map)}, params,
+              {lanes, 1, 1}, {1024, 1, 1});
+  else
+    graph.add("qwen4_mtp_argmax", {std::move(logits), std::move(proposals), std::move(candidates)}, params,
+              {lanes, 1, 1}, {1024, 1, 1});
+}
+
+void Qwen4::addShortlistGather(metal::CommandGraph &graph, const QuantizedSegment &head,
+                               const QuantizedSegment &destination, metal::MetalBuffer ids, uint32_t first,
+                               uint32_t count) {
+  if (head.formatId != destination.formatId || head.inputSize != destination.inputSize ||
+      head.formatId >= GGUF_FMT_COUNT || head.inputSize % 32)
+    throw std::invalid_argument("invalid shortlist gather");
+  if (!count) return;
+  const QuantFormat &f = kQuantFormats[head.formatId];
+  const uint32_t groups = head.inputSize / 32, units = groups / f.meta_groups;
+  if ((f.plane0_bytes | f.plane1_bytes | f.meta_bytes) & 3 || destination.outputSize < first + count ||
+      ids.sizeBytes() < uint64_t{count} * sizeof(uint32_t))
+    throw std::invalid_argument("invalid shortlist gather");
+  const Qwen4GatherParams params{groups, units, f.plane0_bytes, f.plane1_bytes, f.meta_bytes, count, first, 0};
+  graph.add("qwen4_shortlist_gather",
+            {head.plane0, head.plane1Slot(), head.meta, destination.plane0, destination.plane1Slot(), destination.meta,
+             std::move(ids)},
+            params, {(count + 63) / 64, groups + units, 1}, {64, 1, 1});
+}
+
+void Qwen4::addTopK(metal::CommandGraph &graph, metal::MetalBuffer logits, const ShortlistTopK &s,
+                    uint32_t vocabulary, uint32_t rows, uint32_t k) {
+  if (!rows || !k || k > 1024 || rows > SPLASH_TARGET_VERIFY_ROWS) throw std::invalid_argument("invalid top-k");
+  const Qwen4TopKParams params{vocabulary, k, rows, ShortlistTopK::kCandidates};
+  const uint32_t chunks = (vocabulary + 1023) / 1024;
+  graph.add("qwen4_topk_histogram", {logits, s.histogram}, params, {chunks, rows, 1}, {256, 1, 1});
+  graph.add("qwen4_topk_threshold", {s.histogram, s.threshold, s.count}, params, {rows, 1, 1}, {1024, 1, 1});
+  graph.add("qwen4_topk_collect", {std::move(logits), s.threshold, s.count, s.keys, s.ids}, params,
+            {chunks, rows, 1}, {256, 1, 1});
+  graph.add("qwen4_topk_sort", {s.keys, s.ids, s.count, s.topIds}, params, {rows, 1, 1}, {1024, 1, 1});
 }
 
 void Qwen4::addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,

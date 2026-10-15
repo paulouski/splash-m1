@@ -2,6 +2,8 @@
 #include "AwakeClock.hpp"
 #include "ane/Ane.hpp"
 #include "engine/DecodePolicy.hpp"
+#include "metal/abi/QuantFormat.h"
+#include "model/DraftShortlist.hpp"
 #include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -11,6 +13,7 @@
 #include "ops/Logprobs.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/Qwen4.hpp"
 #include "ops/RoPE.hpp"
 #include "ops/RowCopy.hpp"
 #include "ops/Sampling.hpp"
@@ -23,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -248,6 +252,8 @@ struct Runtime::Impl {
     // The MTP head drafts the proposals on the GPU in a command of its own,
     // before the verify's PLE rows can be staged.
     bool mtp = false;
+    // The cycle drafts through the shortlist and collects the target's top ids.
+    bool shortlist = false;
   };
 
   // What a lane's GPU table was last written from. Its entries stay valid
@@ -317,6 +323,29 @@ struct Runtime::Impl {
     if (!value || !*value) return 4L;
     return std::clamp<long>(std::strtol(value, nullptr, 10), 1, kDraftProposalTokens);
   }();
+  // SPLASH_DRAFT_SHORTLIST=<k> (1 to 1024; "all" is a control that gathers every id): the MTP draft head scores the
+  // request's history, the anchor and the top k ids of the target's earlier rows instead of the whole vocabulary.
+  // Width-1 MTP cycles only; the target's verify head is untouched. SPLASH_DRAFT_SHORTLIST_LOG=1 logs each cycle.
+  struct DraftShortlistState final {
+    static constexpr uint32_t kCapacity = 48000, kGate = 1000;
+    DraftShortlistState(uint32_t vocabulary, uint32_t capacity, uint32_t k, bool all)
+        : set(vocabulary, capacity, all ? 0 : kGate, all), k(k), all(all) {}
+    model::DraftShortlist set;
+    QwenDraftShortlist view;
+    ops::ShortlistTopK top;
+    MetalBuffer planes[3];
+    uint32_t k;
+    bool all;
+    bool log = false;
+  };
+  std::unique_ptr<DraftShortlistState> shortlist;
+  const QwenDraftShortlist *stagedShortlist = nullptr;
+  // SPLASH_DRAFT_SHORTLIST_WHEN_FILE=path: shortlist cycles only while that file exists (for in-server A/B).
+  [[nodiscard]] bool shortlistEnabled() const {
+    if (!shortlist) return false;
+    const char *gate = std::getenv("SPLASH_DRAFT_SHORTLIST_WHEN_FILE");
+    return !gate || std::filesystem::exists(gate);
+  }
   // Read once at startup (SPLASH_DECODE_LADDER and friends); --decode-ladder
   // sets the same environment variable before the runtime is constructed
   // (runtime/main.mm).
@@ -388,6 +417,71 @@ struct Runtime::Impl {
       }
     installFamily(makeFamilyRuntime(package));
     preparePolicyPipelines();
+    createDraftShortlist();
+  }
+
+  void createDraftShortlist() {
+    const char *value = std::getenv("SPLASH_DRAFT_SHORTLIST");
+    if (!value || !*value || std::string_view(value) == "0" || !targetModel.hasMtp()) return;
+    const ops::Projection &head = targetModel.vocabularyProjection();
+    if (!operators.linear().rowsEligible(head, 1))
+      throw std::invalid_argument("SPLASH_DRAFT_SHORTLIST needs a Q4_K or Q5_K logits head");
+    const bool all = std::string_view(value) == "all";
+    const uint32_t k = all ? 1 : static_cast<uint32_t>(std::clamp<long>(std::strtol(value, nullptr, 10), 1, 1024));
+    const uint32_t vocabulary = geometry.target.vocabularySize, tile = model::DraftShortlist::kTileRows;
+    const uint32_t capacity = all ? (vocabulary + tile - 1) / tile * tile : DraftShortlistState::kCapacity;
+    shortlist = std::make_unique<DraftShortlistState>(vocabulary, capacity, k, all);
+    DraftShortlistState &s = *shortlist;
+    s.log = std::getenv("SPLASH_DRAFT_SHORTLIST_LOG") != nullptr;
+    const ops::QuantizedSegment &source = head.blocks().segments.front();
+    const QuantFormat &f = kQuantFormats[source.formatId];
+    const uint32_t groups = source.inputSize / 32, tiles = (capacity + tile - 1) / tile;
+    const uint64_t bytes[3] = {uint64_t{tiles} * groups * tile * f.plane0_bytes,
+                               uint64_t{tiles} * groups * tile * f.plane1_bytes,
+                               uint64_t{tiles} * (groups / f.meta_groups) * tile * f.meta_bytes};
+    const auto allocate = [&](uint64_t size, const char *label) {
+      MetalBuffer buffer = backend.allocateBuffer(std::max<uint64_t>(size, 16), BufferStorage::Shared, label);
+      std::memset(buffer.contents(), 0, std::max<uint64_t>(size, 16));
+      return buffer;
+    };
+    s.planes[0] = allocate(bytes[0], "draft-shortlist-plane0");
+    s.planes[1] = bytes[1] ? allocate(bytes[1], "draft-shortlist-plane1") : MetalBuffer{};
+    s.planes[2] = allocate(bytes[2], "draft-shortlist-meta");
+    s.view.map = allocate(uint64_t{tiles} * tile * sizeof(uint32_t), "draft-shortlist-map");
+    s.view.ids = allocate(uint64_t{tiles} * tile * sizeof(uint32_t), "draft-shortlist-ids");
+    s.top = {allocate(uint64_t{kDecodeRows} * 65536 * sizeof(uint32_t), "topk-histogram"),
+             allocate(kDecodeRows * sizeof(uint32_t), "topk-threshold"),
+             allocate(2 * kDecodeRows * sizeof(uint32_t), "topk-count"),
+             allocate(uint64_t{kDecodeRows} * ops::ShortlistTopK::kCandidates * sizeof(uint32_t), "topk-keys"),
+             allocate(uint64_t{kDecodeRows} * ops::ShortlistTopK::kCandidates * sizeof(uint32_t), "topk-ids"),
+             allocate(uint64_t{kDecodeRows} * 1024 * sizeof(uint32_t), "topk-top")};
+  }
+
+  // Grows the shortlist by the history, the anchor and the target's top ids since the last cycle, and stages its
+  // new rows for this cycle's draft command. Null: the draft runs as without the shortlist.
+  const QwenDraftShortlist *stageDraftShortlist(const Request &entry, uint32_t anchor) {
+    DraftShortlistState &s = *shortlist;
+    const model::DraftShortlist::Update update = s.set.update(entry.id, entry.history, anchor);
+    const uint32_t rows = s.set.rows();
+    if (!rows) return nullptr;
+    const std::span<const uint32_t> map = s.set.map();
+    std::memcpy(contents<uint32_t>(s.view.map, "shortlist map") + update.first, map.data() + update.first,
+                uint64_t{update.count} * sizeof(uint32_t));
+    std::memcpy(contents<uint32_t>(s.view.ids, "shortlist ids"), map.data() + update.first,
+                uint64_t{update.count} * sizeof(uint32_t));
+    const ops::QuantizedSegment &source = targetModel.vocabularyProjection().blocks().segments.front();
+    ops::BlockWeights weights;
+    weights.segments.push_back(
+        ops::QuantizedSegment::planes(source.formatId, rows, source.inputSize, s.planes[0], s.planes[1], s.planes[2]));
+    s.view.head = ops::Projection(rows, source.inputSize, std::move(weights));
+    s.view.head.destination = ops::FloatOutput::Float32;
+    s.view.first = update.first;
+    s.view.count = update.count;
+    s.view.scored = s.set.active();
+    if (s.log)
+      std::fprintf(stderr, "[shortlist] request %llu size %u rows %u new %u scored %d\n",
+                   static_cast<unsigned long long>(entry.id), s.set.size(), rows, update.count, s.view.scored ? 1 : 0);
+    return &s.view;
   }
 
   // The family's hooks stage into the arenas' CPU-visible tensors.
@@ -1762,6 +1856,7 @@ struct Runtime::Impl {
       buffers.candidates = d(DecodeTensor::Candidates);
       buffers.proposalsPerLane = kDraftProposalTokens;
       buffers.candidatesPerProposal = SPLASH_DRAFT_CANDIDATES;
+      buffers.shortlist = std::exchange(stagedShortlist, nullptr);
       targetModel.addMtpDraft(graph, std::move(buffers), kvPages.layers(), std::span(chunks).first(lanes), lanes,
                               mtpDraftSteps);
       return;
@@ -1933,6 +2028,17 @@ struct Runtime::Impl {
       const uint32_t *targetTokens = contents<uint32_t>(
           d(DecodeTensor::OutputTokens), "target output tokens");
       laneResult.failure = invalidSelection({targetTokens, laneResult.retained});
+      if (laneResult.shortlist) {
+        const uint32_t *top = contents<uint32_t>(shortlist->top.topIds, "shortlist top ids");
+        shortlist->set.addPicks({top, uint64_t{laneResult.maximumRetained} * shortlist->k});
+        if (shortlist->log) {
+          const uint32_t *count = contents<uint32_t>(shortlist->top.count, "shortlist top counts");
+          for (uint32_t row = 0; row < laneResult.maximumRetained; ++row)
+            if (count[2 * row] + count[2 * row + 1] > ops::ShortlistTopK::kCandidates)
+              std::fprintf(stderr, "[shortlist] top-k row %u overflow: %u above, %u in the threshold bin\n", row,
+                           count[2 * row], count[2 * row + 1]);
+        }
+      }
     }
 
     std::vector<ModelStepResult> results;
@@ -2104,6 +2210,10 @@ struct Runtime::Impl {
       impl_.encodeBatchEmbedding(verify_, DecodeTensor::InputTokens, DecodeTensor::Hidden0, width);
       impl_.encodeTargetVerifyBatchForward(verify_, active, items_, false, false,
                                            {maximumRetained.data(), lanes_.size()});
+      // The target's rows rank the ids the next draft may propose.
+      if (lanes_[0].shortlist)
+        ops::Qwen4::addTopK(verify_, impl_.decodeArena->packed(DecodeTensor::Logits, 1), impl_.shortlist->top,
+                            impl_.geometry.target.vocabularySize, maximumRetained[0], impl_.shortlist->k);
       impl_.encodeTargetVerifyBatchPolicy(verify_, active);
       impl_.encodeBatchAcceptance(verify_, active, {maximumRetained.data(), lanes_.size()});
       impl_.encodeBatchGdnCommit(verify_, active);
@@ -2848,9 +2958,20 @@ Runtime::decodeAsync(const BatchPlan &plan,
   if (lanes[0].mtp) {
     // The proposals are the GPU's: the first command drafts them, the ticket
     // stages the verify rows' PLE from them and submits the verify.
-    impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false, true);
-    return std::make_unique<Impl::MtpDecodeTicket>(*impl_, std::move(lanes), items, commandGraph,
-                                                   std::move(completion));
+    if (width == 1 && impl_->shortlistEnabled()) {
+      lanes[0].shortlist = true;
+      impl_->stagedShortlist = impl_->stageDraftShortlist(*requests[0], lanes[0].currentAnchor);
+    }
+    try {
+      impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false, true);
+      return std::make_unique<Impl::MtpDecodeTicket>(*impl_, std::move(lanes), items, commandGraph,
+                                                     std::move(completion));
+    } catch (...) {
+      // The staged rows were never gathered.
+      impl_->stagedShortlist = nullptr;
+      if (impl_->shortlist) impl_->shortlist->set.reset();
+      throw;
+    }
   }
   if (!draftSkipped) {
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
