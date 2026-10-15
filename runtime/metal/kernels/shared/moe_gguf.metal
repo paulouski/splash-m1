@@ -25,8 +25,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  const ulong out = ulong(group.y) * Rows * p.output_size;
+  device bfloat *x = input + ulong(tile.first_row) * p.input_size;
+  const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   const auto run = [&](auto rows) {
@@ -36,6 +36,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
     staged_accumulate_any<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, my, tl,
                                             simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
+      if (row >= tile.rows) return;
       const ulong o = out + ulong(row) * p.output_size + origin + column;
       output[o] = gguf_epilogue<Ep>(v, aux, o);
     });

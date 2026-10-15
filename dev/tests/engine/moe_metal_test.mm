@@ -346,7 +346,7 @@ bool untouched(const void *data, uint64_t bytes) {
   return std::all_of(begin, begin + bytes, [](uint8_t byte) { return byte == kCanary; });
 }
 
-void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
+void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows, bool compact,
            const std::string &label) {
   const auto *selected =
       static_cast<const uint32_t *>(fixture.buffers.scratch.selectedExperts.contents());
@@ -366,13 +366,24 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
       static_cast<const uint32_t *>(fixture.buffers.scratch.groupedRoutes.contents());
   const auto *tiles =
       static_cast<const uint32_t *>(fixture.buffers.scratch.tileDescriptors.contents());
+  // Compact: routes, shared rows included, back to back; padded: whole tiles.
+  const uint32_t groupedRows =
+      compact ? rows * kRoutesPerRow : *tileCount * tileRows;
   for (uint32_t route = 0; route < rows * kRoutesPerRow; ++route) {
     require(selected[route] <= kExperts, label + ": invalid selected expert");
     ++expertCounts[selected[route]];
     const uint32_t grouped = routeRows[route];
-    require(grouped < *tileCount * tileRows && groupedRoutes[grouped] == route &&
-                tiles[(grouped / tileRows) * 2] == selected[route],
-            label + ": grouped route mapping does not round-trip");
+    bool mapped = grouped < groupedRows && groupedRoutes[grouped] == route;
+    if (mapped && !compact)
+      mapped = tiles[(grouped / tileRows) * 3] == selected[route];
+    else if (mapped) {
+      // Compact: the tile whose live rows hold the grouped row.
+      mapped = false;
+      for (uint32_t tile = 0; tile < *tileCount; ++tile)
+        if (grouped >= tiles[tile * 3 + 2] && grouped < tiles[tile * 3 + 2] + tiles[tile * 3 + 1])
+          mapped = tiles[tile * 3] == selected[route];
+    }
+    require(mapped, label + ": grouped route mapping does not round-trip");
   }
   uint32_t expectedTiles = 0;
   for (const uint32_t count : expertCounts)
@@ -384,9 +395,15 @@ void check(const Fixture &fixture, uint32_t rows, uint32_t tileRows,
   const uint64_t inputRowBytes = uint64_t{kHidden} * kBFloat16Bytes;
   const uint64_t scoresBytes = uint64_t{rows} * kStorageColumns * sizeof(float);
   for (uint32_t tile = 0; tile < *tileCount; ++tile) {
-    const uint32_t liveRows = tiles[tile * 2 + 1];
+    const uint32_t liveRows = tiles[tile * 3 + 1];
+    const uint32_t firstRow = tiles[tile * 3 + 2];
     require(liveRows > 0 && liveRows <= tileRows,
             label + ": invalid tile live row count");
+    if (compact) {
+      require(firstRow + liveRows <= groupedRows, label + ": compact tile past the grouped rows");
+      continue;
+    }
+    require(firstRow == tile * tileRows, label + ": padded tile does not start at its tile row");
     const uint32_t matmul = matmulRows(liveRows, tileRows);
     for (uint32_t row = liveRows; row < matmul; ++row)
       require(groupedRoutes[tile * tileRows + row] == UINT32_MAX,
@@ -528,7 +545,8 @@ void checkPlan(const MoePlan &plan) {
   const auto shape = plan.shape();
   const uint64_t rows = plan.rows();
   const uint64_t tiles = splash::ops::moeMaximumTiles(plan.rows(), shape, plan.tileRows());
-  const uint64_t grouped = tiles * plan.tileRows();
+  const uint64_t grouped = plan.compact() ? splash::ops::moeCompactGroupedRows(plan.rows(), shape)
+                                          : tiles * plan.tileRows();
   const uint64_t routes = rows * shape.routesPerToken();
   const uint64_t outputWidth =
       plan.splitExperts()
@@ -883,7 +901,7 @@ void run(const std::string &metallibPath) {
                                         &fixture.buffers.scratch.groupedInput})
         std::memset(buffer->contents(), kCanary, buffer->sizeBytes());
       wallSeconds += backend.submitCommand(graph.dispatches()).wallSeconds;
-      check(fixture, plan.rows(), plan.tileRows(), label + " " + routingLabel +
+      check(fixture, plan.rows(), plan.tileRows(), plan.compact(), label + " " + routingLabel +
             " M" + std::to_string(plan.tileRows()));
       ++cases;
       const auto *selected = static_cast<const uint32_t *>(

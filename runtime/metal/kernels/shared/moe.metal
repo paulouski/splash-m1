@@ -472,9 +472,11 @@ kernel void moe_stats_record(
 }
 
 // Sorts one command's routes by expert. Tile t covers grouped rows
-// [t * tile_rows, (t + 1) * tile_rows) of a single expert; the rows past
-// that expert's last route that its last tile's matmul reads
-// (moe_matmul_rows) carry the route ~0u. One threadgroup covers all routes
+// [first_row, first_row + tile_rows) of a single expert. Padded layout: an
+// expert starts at its first tile * tile_rows and the rows past its last route
+// that its last tile's matmul reads (moe_matmul_rows) carry the route ~0u.
+// Compact layout: experts follow each other at their routes' prefix sums and
+// the shared expert's rows follow the routed ones, with no padding rows. One threadgroup covers all routes
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
 // Experts is the expert count's thread width: 256, or 512 for Qwen3.8-Flash-Next.
@@ -483,8 +485,8 @@ template <uint Experts>
     device const uint *selected, device MoeTileDescriptor *tiles, device uint *tile_count,
     device uint *grouped_routes, device uint *route_rows, constant MoeGroupParams &params,
     uint thread_index, uint simd_lane, uint simd_group, threadgroup atomic_uint *counts,
-    threadgroup atomic_uint *cursors, threadgroup uint *tile_offsets, threadgroup uint *simd_totals,
-    threadgroup uint &routed_tiles) {
+    threadgroup atomic_uint *cursors, threadgroup uint *row_offsets, threadgroup uint *simd_totals,
+    threadgroup uint *simd_counts, threadgroup uint &routed_tiles, threadgroup uint &routed_rows) {
   const uint routes_per_row = params.top_k + 1;
   const uint routes = params.rows * routes_per_row;
   atomic_store_explicit(&counts[thread_index], 0u, memory_order_relaxed);
@@ -501,20 +503,31 @@ template <uint Experts>
   uint count = atomic_load_explicit(&counts[thread_index], memory_order_relaxed);
   uint expert_tiles = (count + params.tile_rows - 1) / params.tile_rows;
   uint prefix = simd_prefix_exclusive_sum(expert_tiles);
-  if (simd_lane == 31)
+  uint count_prefix = simd_prefix_exclusive_sum(count);
+  if (simd_lane == 31) {
     simd_totals[simd_group] = prefix + expert_tiles;
+    simd_counts[simd_group] = count_prefix + count;
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint tile_offset = prefix;
-  for (uint group = 0; group < simd_group; ++group)
+  uint count_offset = count_prefix;
+  for (uint group = 0; group < simd_group; ++group) {
     tile_offset += simd_totals[group];
-  tile_offsets[thread_index] = tile_offset;
-  if (thread_index == Experts - 1)
+    count_offset += simd_counts[group];
+  }
+  const bool compact = params.compact != 0;
+  const uint expert_row = compact ? count_offset : tile_offset * params.tile_rows;
+  row_offsets[thread_index] = expert_row;
+  if (thread_index == Experts - 1) {
     routed_tiles = tile_offset + expert_tiles;
+    routed_rows = count_offset + count;
+  }
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
+        thread_index, min(params.tile_rows, count - tile * params.tile_rows),
+        expert_row + tile * params.tile_rows};
   }
-  if (expert_tiles) {
+  if (expert_tiles && !compact) {
     const uint last = tile_offset + expert_tiles - 1;
     const uint live = count - (expert_tiles - 1) * params.tile_rows;
     for (uint row = tile_offset * params.tile_rows + count;
@@ -533,22 +546,24 @@ template <uint Experts>
     }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
-    uint row = tile_offsets[expert] * params.tile_rows + slot;
+    uint row = row_offsets[expert] + slot;
     grouped_routes[row] = route;
     route_rows[route] = row;
   }
 
   const uint shared_tiles =
       (params.rows + params.tile_rows - 1) / params.tile_rows;
-  const uint shared_base = routed_tiles * params.tile_rows;
+  const uint shared_base = compact ? routed_rows : routed_tiles * params.tile_rows;
   const uint shared_rows =
-      (shared_tiles - 1) * params.tile_rows +
-      moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
-                      params.tile_rows);
+      compact ? params.rows
+              : (shared_tiles - 1) * params.tile_rows +
+                    moe_matmul_rows(params.rows - (shared_tiles - 1) * params.tile_rows,
+                                    params.tile_rows);
   for (uint tile = thread_index; tile < shared_tiles; tile += Experts) {
     tiles[routed_tiles + tile] = MoeTileDescriptor{
         params.experts,
-        min(params.tile_rows, params.rows - tile * params.tile_rows)};
+        min(params.tile_rows, params.rows - tile * params.tile_rows),
+        shared_base + tile * params.tile_rows};
   }
   for (uint row = thread_index; row < shared_rows; row += Experts) {
     if (row < params.rows) {
@@ -575,11 +590,14 @@ kernel void moe_group_routes(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup atomic_uint counts[256];
   threadgroup atomic_uint cursors[256];
-  threadgroup uint tile_offsets[256];
+  threadgroup uint row_offsets[256];
   threadgroup uint simd_totals[8];
+  threadgroup uint simd_counts[8];
   threadgroup uint routed_tiles;
+  threadgroup uint routed_rows;
   moe_group_routes_phase<256>(selected, tiles, tile_count, grouped_routes, route_rows, params, thread_index,
-                              simd_lane, simd_group, counts, cursors, tile_offsets, simd_totals, routed_tiles);
+                              simd_lane, simd_group, counts, cursors, row_offsets, simd_totals, simd_counts,
+                              routed_tiles, routed_rows);
 }
 
 kernel void moe_group_routes_e512(
@@ -594,16 +612,20 @@ kernel void moe_group_routes_e512(
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup atomic_uint counts[512];
   threadgroup atomic_uint cursors[512];
-  threadgroup uint tile_offsets[512];
+  threadgroup uint row_offsets[512];
   threadgroup uint simd_totals[16];
+  threadgroup uint simd_counts[16];
   threadgroup uint routed_tiles;
+  threadgroup uint routed_rows;
   moe_group_routes_phase<512>(selected, tiles, tile_count, grouped_routes, route_rows, params, thread_index,
-                              simd_lane, simd_group, counts, cursors, tile_offsets, simd_totals, routed_tiles);
+                              simd_lane, simd_group, counts, cursors, row_offsets, simd_totals, simd_counts,
+                              routed_tiles, routed_rows);
 }
 
-// Copies each grouped row's input so every expert tile is a dense matrix,
-// over the rows its matmul reads (moe_matmul_rows): padding rows among them
-// are zero and their outputs are never read.
+// Copies each grouped row's input so every expert tile is a dense matrix from
+// its first_row. Padded layout: over the rows its matmul reads
+// (moe_matmul_rows), where padding rows are zero and their outputs are never
+// read. Compact layout: the live rows only, as the next tile's rows follow.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
@@ -615,9 +637,10 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
   if (group.x >= *tile_count)
     return;
   uint column = group.y * 256 + thread_index;
-  const uint rows = moe_matmul_rows(tiles[group.x].rows, params.tile_rows);
+  const MoeTileDescriptor tile = tiles[group.x];
+  const uint rows = params.compact ? tile.rows : moe_matmul_rows(tile.rows, params.tile_rows);
   for (uint local = 0; local < rows; ++local) {
-    uint row = group.x * params.tile_rows + local;
+    uint row = tile.first_row + local;
     uint route = grouped_routes[row];
     grouped_input[ulong(row) * params.input_size + column] =
         route == ~0u

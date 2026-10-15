@@ -115,6 +115,13 @@ moeRouteTile(uint32_t rows, uint32_t wideRows) noexcept {
          (rows + tileRows - 1) / tileRows;
 }
 
+// Compact layout (MoeGroupParams::compact): experts' routes packed back to back
+// and the shared expert's rows behind them. A tile's matmul may read up to 15
+// rows past its live rows (a 17-row tile runs 32), which the slack covers.
+[[nodiscard]] constexpr uint32_t moeCompactGroupedRows(uint32_t rows, MoeShape shape) noexcept {
+  return rows * shape.routesPerToken() + 16;
+}
+
 struct MoeWorkspace final {
   uint64_t selectedExpertsBytes = 0;
   uint64_t routingWeightsBytes = 0;
@@ -295,6 +302,12 @@ public:
     return static_cast<uint32_t>(config_.expertTile);
   }
   [[nodiscard]] bool splitExperts() const noexcept { return splitExperts_; }
+  // Whether the grouped rows are packed without per-tile padding: the 32-row
+  // tiles whose kernels never store past a tile's live rows (not the MPP affine tile).
+  [[nodiscard]] bool compact() const noexcept {
+    return tileRows() == 32 &&
+           (shape_.weightLayout == WeightLayout::Block32 || config_.kernel == MoeExpertKernel::Register);
+  }
   [[nodiscard]] uint32_t maximumTiles() const noexcept { return maximumTiles_; }
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;

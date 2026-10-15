@@ -1682,7 +1682,7 @@ CommandTicket MetalBackend::submitCommandAsync(
         };
         const std::vector<std::string> skips = split(skip), dups = split(dup);
         const uint32_t limit = moeRows ? static_cast<uint32_t>(std::atoi(moeRows)) : 0;
-        static std::deque<std::array<uint32_t, 4>> groupParams;
+        static std::deque<std::array<uint32_t, 5>> groupParams;
         for (const ComputeDispatch &dispatch : dispatches) {
             struct Count { std::unordered_map<std::string, uint32_t> &m; const std::string &n; ~Count() { ++m[n]; } } count{occurrences, dispatch.pipelineName};
             if (matches(skips, dispatch.pipelineName)) continue;
@@ -1691,8 +1691,8 @@ CommandTicket MetalBackend::submitCommandAsync(
                 kept.back().threadgroups.x = limit;
             if (limit && dispatch.pipelineName == "moe_group_routes_e512")
                 for (BytesBinding &bytes : kept.back().bytes)
-                    if (bytes.index == 5 && bytes.sizeBytes == 16 && static_cast<const uint32_t *>(bytes.data)[0] == 8) {
-                        groupParams.push_back(*static_cast<const std::array<uint32_t, 4> *>(bytes.data));
+                    if (bytes.index == 5 && bytes.sizeBytes == 20 && static_cast<const uint32_t *>(bytes.data)[0] == 8) {
+                        groupParams.push_back(*static_cast<const std::array<uint32_t, 5> *>(bytes.data));
                         groupParams.back()[0] = limit;
                         bytes.data = groupParams.back().data();
                         if (groupParams.size() > 4096) groupParams.pop_front();

@@ -88,7 +88,7 @@ inline void expert(device const bfloat *grouped_input,
   }
   const uint rowBase = firstRow + fn;
   device const bfloat *input =
-      grouped_input + (ulong(tg.y) * Rows + rowBase) * K + 8 * fm;
+      grouped_input + (ulong(descriptor.first_row) + rowBase) * K + 8 * fm;
   bool live[FM];
 #pragma unroll
   for (uint j = 0; j < FM; ++j) live[j] = firstRow + j * 8 < descriptor.rows;
@@ -185,7 +185,7 @@ inline void expert(device const bfloat *grouped_input,
       }
   }
 
-  device bfloat *tileOutput = output + ulong(tg.y) * Rows * N;
+  device bfloat *tileOutput = output + ulong(descriptor.first_row) * N;
 #pragma unroll
   for (uint j = 0; j < FM; ++j) {
     if (!live[j])
@@ -193,6 +193,8 @@ inline void expert(device const bfloat *grouped_input,
 #pragma unroll
     for (uint e = 0; e < 2; ++e) {
       const uint m = rowBase + j * 8 + e;
+      if (m >= descriptor.rows)
+        continue;
       if (gateUp) {
 #pragma unroll
         for (uint i = 0; i < FN / 2; ++i) {

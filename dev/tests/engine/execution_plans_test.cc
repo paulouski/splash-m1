@@ -325,11 +325,11 @@ void workspaceBounds() {
               verify.statisticsBytes ==
                   uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 2 * 4,
           "verify workspace does not cover the maximum split count");
-  // 65 tiles of 8 grouped rows per lane at every width.
+  // 65 tiles of 8 grouped rows per lane at every width; 12-byte descriptors.
   const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
   require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
-              moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 4,
+              moe.tileDescriptorsBytes == 780 && moe.tileCountBytes == 4,
           "MoE decode workspace per lane changed");
   require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
               plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,

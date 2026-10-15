@@ -21,36 +21,42 @@ static_assert(sizeof(MoeRouteParams) == 20,
 
 // Every row carries top_k routed experts followed by the shared expert, whose
 // id is `experts` and whose routing weight is the sigmoid of its scalar gate.
-// Routes are sorted by expert: tile t covers grouped rows [t * tile_rows,
-// (t + 1) * tile_rows) of one expert; padding rows carry the route ~0u.
+// Routes are sorted by expert. Tile t covers the `rows` live grouped rows
+// from first_row, which is t * tile_rows when the layout is padded (padding
+// rows carry the route ~0u) and the tile's offset into the experts' packed
+// routes when compact (MoeGroupParams::compact: no padding rows; a matmul
+// that reads past `rows` reads the next tile's rows and must not store them).
 //
 // Written by grouping kernels; the host uses this layout to size storage.
 struct MoeTileDescriptor {
   uint32_t expert;
   uint32_t rows;
+  uint32_t first_row;
 };
 
-static_assert(sizeof(MoeTileDescriptor) == 8,
-              "MoE tile descriptors are 8 bytes on both sides");
+static_assert(sizeof(MoeTileDescriptor) == 12,
+              "MoE tile descriptors are 12 bytes on both sides");
 
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
   uint32_t tile_rows;
   uint32_t experts;
+  uint32_t compact;
 };
 
-static_assert(sizeof(MoeGroupParams) == 16,
-              "MoE grouping parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 20,
+              "MoE grouping parameters are 20 bytes on both sides");
 
 struct MoeGatherParams {
   uint32_t tile_rows;
   uint32_t input_size;
   uint32_t routes_per_row;
+  uint32_t compact;
 };
 
-static_assert(sizeof(MoeGatherParams) == 12,
-              "MoE gather parameters are 12 bytes on both sides");
+static_assert(sizeof(MoeGatherParams) == 16,
+              "MoE gather parameters are 16 bytes on both sides");
 
 // SPLASH_MOE_STATS: copies a layer's routed expert ids and routing weights
 // (rows x top_k of the rows x routes_per_row select output) to slot

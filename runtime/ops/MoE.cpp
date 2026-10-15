@@ -92,12 +92,12 @@ void validate(const MoeWeights &weights, MoeShape shape) {
 }
 
 MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
-                          bool splitExperts, MoeGgufTile ggufTile) {
+                          bool splitExperts, bool compact, MoeGgufTile ggufTile) {
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);
-  const uint64_t groupedRows = uint64_t{tiles} * tileRows;
+  const uint64_t groupedRows = compact ? moeCompactGroupedRows(rows, shape) : uint64_t{tiles} * tileRows;
   const uint32_t widest = std::max(shape.hiddenSize, shape.expertIntermediateSize);
   const uint32_t outputWidth = splitExperts ? widest : shape.hiddenSize;
   // The router's fp32 scores, a row of routerWidth() expert slots per row,
@@ -300,7 +300,7 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   if (config.ggufTile == MoeGgufTile::Register &&
       (shape.weightLayout != WeightLayout::Block32 || config.expertTile != MoeExpertTile::M8))
     throw std::invalid_argument("the register expert tile takes block 8-row tiles");
-  workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_, config.ggufTile);
+  workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_, compact(), config.ggufTile);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
@@ -369,9 +369,9 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
             MoeGroupParams{rows, shape.expertsPerToken, tileRows,
-                           shape.experts},
+                           shape.experts, plan.compact()},
             {1, 1, 1}, {shape.routerWidth(), 1, 1});
-  const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
+  const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken(), plan.compact()};
   // The fused gate/up pass reads the input rows through the routes: no gathered copy.
   if (!(block && fusedGateUp(plan))) {
     if (plan.configuration().ggufTile == MoeGgufTile::Register)

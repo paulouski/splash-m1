@@ -22,8 +22,8 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const MoeGgufSegment s = moe_gguf_segment_for<Unaligned>(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  const ulong out = ulong(group.y) * Rows * p.output_size;
+  device bfloat *x = input + ulong(tile.first_row) * p.input_size;
+  const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns, thread_index = simd_group * 32 + simd_lane;
   const auto run = [&](auto fragments) {
     constexpr uint FM = decltype(fragments)::value;
@@ -37,6 +37,7 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
       accumulate_any<FM>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, tl,
                          thread_index, GGUF_STAGED_THREADS, simd_lane, 0, p.input_size / kStep, acc);
     elements(acc, sgmatrix::lane_map(simd_lane), [&](uint row, uint column, float v) {
+      if (row >= tile.rows) return;
       const ulong o = out + ulong(row) * p.output_size + origin + column;
       if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
       output[o] = bfloat(v);

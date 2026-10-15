@@ -25,7 +25,7 @@ inline void prefill_moe_expert_tile(device bfloat *grouped_input,
   const MoeQ4Slab slab = moe_q4_slab(
       packed, shared, tiles[group.y].expert, params.experts,
       params.expert_stride_bytes_0, params.output_size, params.input_size);
-  const ulong row = ulong(group.y) * PrefillMoeTileRows;
+  const ulong row = tiles[group.y].first_row;
   q4_mpp_tile<Rows, 256, false, false, MultiplySiluGate>(
       grouped_input + row * params.input_size, slab.weights, slab.scales,
       slab.biases, output + row * params.output_size, slab.weights,
