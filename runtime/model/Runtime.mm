@@ -421,11 +421,14 @@ struct Runtime::Impl {
   }
 
   void createDraftShortlist() {
-    const char *value = std::getenv("SPLASH_DRAFT_SHORTLIST");
-    if (!value || !*value || std::string_view(value) == "0" || !targetModel.hasMtp()) return;
+    const char *set = std::getenv("SPLASH_DRAFT_SHORTLIST");
+    const char *value = set && *set ? set : "1024";
+    if (std::string_view(value) == "0" || !targetModel.hasMtp()) return;
     const ops::Projection &head = targetModel.vocabularyProjection();
-    if (!operators.linear().rowsEligible(head, 1))
+    if (!operators.linear().rowsEligible(head, 1)) {
+      if (value != set) return;
       throw std::invalid_argument("SPLASH_DRAFT_SHORTLIST needs a Q4_K or Q5_K logits head");
+    }
     const bool all = std::string_view(value) == "all";
     const uint32_t k = all ? 1 : static_cast<uint32_t>(std::clamp<long>(std::strtol(value, nullptr, 10), 1, 1024));
     const uint32_t vocabulary = geometry.target.vocabularySize, tile = model::DraftShortlist::kTileRows;
