@@ -211,10 +211,12 @@ bool fusedGateUp(const MoePlan &plan) {
 }
 
 // The formats whose tiles of one or two live rows run on registers (kernels/common/gguf_dot_tile.h): gate/up and down
-// pass the kernel name suffix, null where the MMA tile runs every tile. The shared expert must be Q8_0.
-const char *gateUpDotFormat(const BlockExpertProjection &gate, const BlockExpertProjection &up, uint32_t hidden) noexcept {
-  if (gate.routed.formatId != up.routed.formatId || gate.shared.formatId != GGUF_FMT_Q80 ||
-      up.shared.formatId != GGUF_FMT_Q80 || hidden > 5120)
+// pass the kernel name suffix, null where the MMA tile runs every tile. The shared tile holds min(rows, 8) rows and
+// takes the dot body at two rows or fewer, which reads Q8_0 only.
+const char *gateUpDotFormat(const BlockExpertProjection &gate, const BlockExpertProjection &up, uint32_t hidden,
+                            uint32_t rows) noexcept {
+  if (gate.routed.formatId != up.routed.formatId || hidden > 5120 ||
+      (rows <= 2 && (gate.shared.formatId != GGUF_FMT_Q80 || up.shared.formatId != GGUF_FMT_Q80)))
     return nullptr;
   switch (gate.routed.formatId) {
   case GGUF_FMT_IQ2XXS: return "iq2xxs";
@@ -285,7 +287,7 @@ void addGgufExperts(metal::CommandGraph &graph, const metal::MetalBuffer &layerI
       return MoeGgufExpertParams{hidden, intermediate, shape.experts, projection.routed.formatId,
                                  projection.shared.formatId};
     };
-    const char *dot = plan.configuration().ggufFewRowDot ? gateUpDotFormat(weights.gate, weights.up, hidden) : nullptr;
+    const char *dot = plan.configuration().ggufFewRowDot ? gateUpDotFormat(weights.gate, weights.up, hidden, plan.rows()) : nullptr;
     graph.add(dot ? std::string("moe_expert_gguf_mma_gu_k2_dot_") + dot : "moe_expert_gguf_mma_gu_k2", std::move(bindings),
               MoeGgufGateUpParams{params(weights.gate), params(weights.up), shape.routesPerToken()},
               {intermediate / GGUF_TILE_COLUMNS, tiles, 1}, {2 * GGUF_MOE_SPLIT_THREADS, 1, 1});

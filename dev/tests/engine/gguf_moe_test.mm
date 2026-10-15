@@ -416,7 +416,8 @@ const std::vector<std::array<Fmt, 6>> kFormatSets = {
     {IQ1S, IQ1S, IQ4NL, Q5K, Q5K, Q80}, {IQ2XXS, IQ2XXS, IQ4NL, Q5K, Q5K, Q80},
     {IQ2XS, IQ2XS, IQ4NL, Q5K, Q5K, Q80}, {IQ3XXS, IQ3XXS, IQ4NL, Q5K, Q5K, Q80},
     {IQ1S, IQ1S, IQ4NL, Q6K, Q6K, Q80}, {IQ3XXS, IQ3XXS, Q20, Q5K, Q5K, Q80}, {IQ3S, IQ3S, Q20, Q5K, Q5K, Q80},
-    {IQ2S, IQ2S, Q20, Q5K, Q5K, Q80}, {IQ3XXS, IQ2S, Q20, Q5K, Q5K, Q80}};
+    {IQ2S, IQ2S, Q20, Q5K, Q5K, Q80}, {IQ3XXS, IQ2S, Q20, Q5K, Q5K, Q80},
+    {IQ2XS, IQ2XS, IQ4NL, IQ4XS, Q4K, Q80}};
 #else
 std::vector<std::array<Fmt, 6>> rotatingFormats() {
   std::vector<std::array<Fmt, 6>> sets;
@@ -639,6 +640,22 @@ int maskedRows(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   return failures;
 }
 
+// A few-row-dot decode plan keeps the fused gate/up dot for a shared expert that is not Q8_0: its 8-row shared tile
+// runs the MMA body. Builds the graph only.
+int gateUpDotSelected(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, const std::string &label) {
+  const Fmt routed = m.formats[0];
+  if (kIntermediate % 256 == 0 || m.formats[3] == Q80 || m.formats[0] != m.formats[1] ||
+      (routed != IQ2XXS && routed != IQ2XS && routed != IQ2S && routed != IQ3XXS && routed != IQ3S))
+    return 0;
+  allocate(backend, b, plan);
+  CommandGraph graph;
+  MoE::add(graph, b.moe, m.weights, plan);
+  for (const auto &dispatch : graph.dispatches())
+    if (dispatch.pipelineName.find("gu_k2_dot_") != std::string::npos) return 0;
+  printf("  %s: no gu_k2_dot_ dispatch for a non-Q8_0 shared gate/up FAIL\n", label.c_str());
+  return 1;
+}
+
 int moe(MetalBackend &backend) {
   int failures = 0;
   Buffers b;
@@ -683,6 +700,11 @@ int moe(MetalBackend &backend) {
           ++failures;
         }
         if (lanes == 4) failures += maskedRows(backend, m, b, plan, rows, label);
+        if (tile == MoeGgufTile::Mma && (lanes == 1 || lanes == 4)) {
+          MoeConfig dotConfig = plan.configuration();
+          dotConfig.ggufFewRowDot = true;
+          failures += gateUpDotSelected(backend, m, b, MoE::decodePlan(shape, lanes, dotConfig), label);
+        }
       }
       // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {

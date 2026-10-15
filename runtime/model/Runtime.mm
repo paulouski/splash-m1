@@ -313,7 +313,7 @@ struct Runtime::Impl {
   uint64_t pleGate = 0;
   const bool pleOverlap = [] {
     const char *value = std::getenv("SPLASH_PLE_DECODE_OVERLAP");
-    return !value || std::strcmp(value, "0") != 0;
+    return (!value || std::strcmp(value, "0") != 0) && !std::getenv("SPLASH_DISPATCH_PROFILE");
   }();
   // Where each full-attention layer's QSA index tensors sit in the KV
   // extents; empty without index regions.
