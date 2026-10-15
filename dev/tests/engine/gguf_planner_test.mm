@@ -322,9 +322,9 @@ void checkQwen4(const std::filesystem::path &directory) {
   check(inject && inject->conversion == model::gguf::Conversion::None && inject->source.rows == g.hyperConnections,
         "planner keeps the F32 injection weights as stored");
   const auto *indexer = copyOf(plan4.images[g.layers - 1], "blk.3.indexer.q_proj.weight");
-  check(indexer && indexer->conversion == model::gguf::Conversion::WidenToFloat32 &&
+  check(indexer && indexer->conversion == model::gguf::Conversion::None &&
             indexer->source.rows == uint64_t{g.indexerHeads} * g.indexerHeadDimension,
-        "planner widens the BF16 indexer projection to F32");
+        "planner keeps the BF16 indexer projection as stored");
   const auto &layer1 = plan4.images[1];
   check(repackOf(layer1, "blk.1.ple_key.weight") && copyOf(layer1, "blk.1.ple_conv1d.weight") &&
             !repackOf(plan4.images[0], "blk.0.ple_key.weight"),

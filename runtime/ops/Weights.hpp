@@ -100,8 +100,8 @@ struct ExpertProjection final {
 // A prepared GGUF tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
 // format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps
-// unquantized (F32, as llama.cpp keeps the MoE router), whose plane0 holds
-// [outputSize][inputSize] floats multiplied unrounded in fp32
+// unquantized (F32 or BF16, as llama.cpp keeps the MoE router), whose plane0 holds
+// [outputSize][inputSize] floats or bf16 values multiplied unrounded in fp32
 // (kernels/shared/gguf_float.metal). The source container is not part of it.
 struct QuantizedSegment final {
   // The formatId of a float segment.
@@ -111,8 +111,8 @@ struct QuantizedSegment final {
                                                metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                                metal::MetalBuffer meta);
   [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize,
-                                               metal::MetalBuffer values) {
-    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32};
+                                               metal::MetalBuffer values, bool bf16 = false) {
+    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32, bf16};
   }
 
   metal::MetalBuffer plane0;
@@ -122,6 +122,8 @@ struct QuantizedSegment final {
   uint32_t inputSize = 0;
   uint32_t columnOffset = 0;
   uint32_t formatId = kFloat32;
+  // A float segment's values are the stored bf16, widened exactly in the kernels.
+  bool bf16Values = false;
 
   [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32; }
   // The plane geometry of a quantized segment.

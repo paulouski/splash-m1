@@ -298,7 +298,7 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     // column unit.
     const uint32_t format = gguf_format_of(d.type);
     if (!d.outputSize || !d.inputSize ||
-        (d.type != ggml::kF32 && (d.outputSize % GGUF_TILE_COLUMNS ||
+        (d.type != ggml::kF32 && d.type != ggml::kBF16 && (d.outputSize % GGUF_TILE_COLUMNS ||
                                   (format != GGUF_FMT_COUNT && d.inputSize % ggufColumnUnit(kQuantFormats[format])))))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     return d;
@@ -307,12 +307,13 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
-    if (d.type == ggml::kF32) {
+    if (d.type == ggml::kF32 || d.type == ggml::kBF16) {
+        const bool bf16 = d.type == ggml::kBF16;
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
-            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
+            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * (bf16 ? sizeof(uint16_t) : sizeof(float)))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
         return ops::QuantizedSegment::floats(d.outputSize, d.inputSize,
-                                             file.section(d.plane0Bytes, std::string(label) + "-floats"));
+                                             file.section(d.plane0Bytes, std::string(label) + "-floats"), bf16);
     }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)

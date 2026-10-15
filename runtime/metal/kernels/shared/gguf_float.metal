@@ -27,21 +27,21 @@ constant constexpr uint kSplits = 16;
 // K part s of every fragment; simdgroup f then adds fragment f's parts in order, so a result depends neither on
 // the grid nor on the row count. Lane (fm, fn) holds x[row fm][k + fn, k + fn + 1] as A,
 // W[column fn, fn + 1][k + fm] as B and the destination [row fm][column fn, fn + 1] (sgmatrix::lane_map).
-template <typename T>
-inline void project(device const bfloat *input, device const float *weights, device T *output,
+template <typename T, typename W>
+inline void project(device const bfloat *input, device const W *weights, device T *output,
                     constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float2 *parts) {
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint K = p.input_size, column = tg.x * 8 + l.fn, row0 = tg.y * kRows;
   const uint live = min(kRows, p.rows - row0);
   const uint steps = K / 8, first = sg * steps / kSplits, last = (sg + 1) * steps / kSplits;
-  device const float *w = weights + ulong(column) * K + l.fm;
+  device const W *w = weights + ulong(column) * K + l.fm;
   float2 acc[kFragments];
 #pragma unroll
   for (uint f = 0; f < kFragments; ++f) acc[f] = float2(0);
 #pragma unroll(4)
   for (uint step = first; step < last; ++step) {
     const uint k = step * 8;
-    const float2 b(w[k], w[K + k]);
+    const float2 b = float2(float(w[k]), float(w[K + k]));
 #pragma unroll
     for (uint f = 0; f < kFragments; ++f) {
       if (f * 8 >= live) break;
@@ -69,16 +69,20 @@ inline void project(device const bfloat *input, device const float *weights, dev
 static_assert(gguf_float::kSplits >= gguf_float::kFragments, "simdgroup f reduces fragment f");
 
 // Grid (output_size / 8, ceil(rows / 32)), 32 kSplits threads.
-#define GGUF_FLOAT_KERNEL(Name, T)                                                                             \
-  kernel void Name(device const bfloat *input [[buffer(0)]], device const float *weights [[buffer(1)]],       \
+#define GGUF_FLOAT_KERNEL(Name, T, W)                                                                          \
+  kernel void Name(device const bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],           \
                    device T *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],                 \
                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],     \
                    uint lane [[thread_index_in_simdgroup]]) {                                                 \
     threadgroup float2 parts[gguf_float::kSplits * gguf_float::kFragments * 32];                              \
-    gguf_float::project<T>(input, weights, output, p, tg, sg, lane, parts);                                   \
+    gguf_float::project<T, W>(input, weights, output, p, tg, sg, lane, parts);                                \
   }
-GGUF_FLOAT_KERNEL(gguf_float_bf16, bfloat)
-GGUF_FLOAT_KERNEL(gguf_float_f32, float)
+GGUF_FLOAT_KERNEL(gguf_float_bf16, bfloat, float)
+GGUF_FLOAT_KERNEL(gguf_float_f32, float, float)
+// Weights kept as the stored bf16 (the router, the QSA indexer): widening is exact, so a result equals the F32 kernels'
+// on the widened weights.
+GGUF_FLOAT_KERNEL(gguf_float_bf16w_bf16, bfloat, bfloat)
+GGUF_FLOAT_KERNEL(gguf_float_bf16w_f32, float, bfloat)
 #undef GGUF_FLOAT_KERNEL
 
 // Staged variant for fp32 output above 32 rows: each simdgroup stages its K step's 32 rows and 16 columns into
@@ -98,7 +102,8 @@ static_assert(gguf_float::kSplits >= kAccs, "simdgroup a reduces accumulator a")
 
 // Threadgroup: columns [16 tg.x, 16 tg.x + 16) of rows [32 tg.y, 32 tg.y + 32); 512 threads. The staging region of
 // a simdgroup aliases the parts array.
-inline void project(device const bfloat *input, device const float *weights, device float *output,
+template <typename W>
+inline void project(device const bfloat *input, device const W *weights, device float *output,
                     constant GgufFloatParams &p, uint2 tg, uint sg, uint lane, threadgroup float4 *mem) {
   using gguf_float::kFragments, gguf_float::kRows, gguf_float::kSplits;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
@@ -121,7 +126,7 @@ inline void project(device const bfloat *input, device const float *weights, dev
     for (uint j = lane; j < kColumns * 2; j += 32) {
       const uint c = j >> 1, h = j & 1;
       *reinterpret_cast<threadgroup float4 *>(region + kABytes + c * kColStride * 4 + h * 16) =
-          *reinterpret_cast<device const float4 *>(weights + ulong(col0 + c) * K + step * 8 + h * 4);
+          float4(*reinterpret_cast<device const vec<W, 4> *>(weights + ulong(col0 + c) * K + step * 8 + h * 4));
     }
     simdgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup const float *bT = reinterpret_cast<threadgroup const float *>(region + kABytes);
@@ -154,13 +159,17 @@ inline void project(device const bfloat *input, device const float *weights, dev
 } // namespace gguf_staged
 
 // Grid (output_size / 16, ceil(rows / 32)), 32 kSplits threads.
-kernel void gguf_float_s42_f32(device const bfloat *input [[buffer(0)]], device const float *weights [[buffer(1)]],
-                               device float *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],
-                               uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
-                               uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float4 mem[gguf_staged::kTgBytes / 16];
-  gguf_staged::project(input, weights, output, p, tg, sg, lane, mem);
-}
+#define GGUF_STAGED_KERNEL(Name, W)                                                                            \
+  kernel void Name(device const bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],           \
+                   device float *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],             \
+                   uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],     \
+                   uint lane [[thread_index_in_simdgroup]]) {                                                 \
+    threadgroup float4 mem[gguf_staged::kTgBytes / 16];                                                       \
+    gguf_staged::project<W>(input, weights, output, p, tg, sg, lane, mem);                                    \
+  }
+GGUF_STAGED_KERNEL(gguf_float_s42_f32, float)
+GGUF_STAGED_KERNEL(gguf_float_s42_bf16w_f32, bfloat)   // bf16 weights widened into the same float4 stage
+#undef GGUF_STAGED_KERNEL
 
 #if __METAL_VERSION__ >= 400   // MPP-only; Apple7/8 (MACOS15 build) uses gguf_float_{bf16,f32}
 // The same projections on the neural accelerator (ops::FloatTile::NeuralAccelerator), whose matmul takes bf16
@@ -197,16 +206,16 @@ inline ushort3 split(float w) {
 // stay zero); after the barrier each simdgroup with live rows runs the three matmuls, and one past the rows only
 // stages. A simdgroup whose rows cross p.rows computes the 16 rows ending at p.rows instead and stores its own, so no
 // row past the input is read (p.rows >= 16).
-template <typename T>
-inline void project(device bfloat *input, device const float *weights, device T *output,
+template <typename T, typename W>
+inline void project(device bfloat *input, device const W *weights, device T *output,
                     constant GgufFloatParams &p, uint2 tg, ushort sg, ushort lane, threadgroup bfloat *stage) {
   const uint K = p.input_size, steps = K / kStep;
   const uint row0 = tg.y * kRows + sg * kRowsPerSimdgroup, first_row = min(row0, p.rows - kRowsPerSimdgroup);
   const uint col0 = tg.x * kColumns;
   const ushort t = sg * 32 + lane, column = t / (kStep / kPerThread), first = t % (kStep / kPerThread) * kPerThread;
   const bool live_column = col0 + column < p.output_size;
-  device const float4 *w =
-      reinterpret_cast<device const float4 *>(weights + ulong(live_column ? col0 + column : 0) * K + first);
+  device const vec<W, 4> *w =
+      reinterpret_cast<device const vec<W, 4> *>(weights + ulong(live_column ? col0 + column : 0) * K + first);
   auto a = tensor(input + ulong(first_row) * K, dextents<int, 2>{int(K), kRowsPerSimdgroup}, array<int, 2>{1, int(K)});
   constexpr auto descriptor = matmul2d_descriptor(kRowsPerSimdgroup, kColumns, kStep, false, true, false,
                                                   matmul2d_descriptor::mode::multiply_accumulate);
@@ -224,7 +233,7 @@ inline void project(device bfloat *input, device const float *weights, device T 
   for (ushort i = 0; i < high.get_capacity(); ++i) high[i] = low[i] = 0.0f;
   float4 next[kPerThread / 4];
 #pragma unroll
-  for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = live_column ? w[j] : float4(0);
+  for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = live_column ? float4(w[j]) : float4(0);
   const bool owns_rows = row0 < p.rows;   // uniform per simdgroup
   for (uint step = 0; step < steps; ++step) {
     threadgroup ushort *parts =
@@ -239,7 +248,7 @@ inline void project(device bfloat *input, device const float *weights, device T 
     }
     if (step + 1 < steps && live_column) {
 #pragma unroll
-      for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = w[(step + 1) * (kStep / 4) + j];
+      for (ushort j = 0; j < kPerThread / 4; ++j) next[j] = float4(w[(step + 1) * (kStep / 4) + j]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (owns_rows) {
@@ -272,15 +281,17 @@ static_assert(gguf_float_na::kStep % gguf_float_na::kPerThread == 0 && gguf_floa
               "a thread stages whole float4s of one column");
 
 // Grid (ceil(output_size / 32), ceil(rows / 64)), 128 threads; rows >= 16, input_size a multiple of 32.
-#define GGUF_FLOAT_NA_KERNEL(Name, T)                                                                          \
-  kernel void Name(device bfloat *input [[buffer(0)]], device const float *weights [[buffer(1)]],             \
+#define GGUF_FLOAT_NA_KERNEL(Name, T, W)                                                                       \
+  kernel void Name(device bfloat *input [[buffer(0)]], device const W *weights [[buffer(1)]],                 \
                    device T *output [[buffer(2)]], constant GgufFloatParams &p [[buffer(3)]],                 \
                    uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]],   \
                    ushort lane [[thread_index_in_simdgroup]]) {                                               \
     threadgroup bfloat stage[2 * gguf_float_na::kBuffer];                                                      \
-    gguf_float_na::project<T>(input, weights, output, p, tg, sg, lane, stage);                                \
+    gguf_float_na::project<T, W>(input, weights, output, p, tg, sg, lane, stage);                             \
   }
-GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16, bfloat)
-GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32, float)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16, bfloat, float)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_f32, float, float)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16w_bf16, bfloat, bfloat)
+GGUF_FLOAT_NA_KERNEL(gguf_float_na_bf16w_f32, float, bfloat)
 #undef GGUF_FLOAT_NA_KERNEL
 #endif

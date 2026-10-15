@@ -595,15 +595,16 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
   const uint64_t element = elementBytes(type);
   const bool accelerator = tile == FloatTile::NeuralAccelerator;
   if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * sizeof(float) ||
+      (accelerator && (rows < 16 || k % 32)) || weights.plane0.sizeBytes() < uint64_t{n} * k * (weights.bf16Values ? sizeof(uint16_t) : sizeof(float)) ||
       input.sizeBytes() < uint64_t{rows} * k * 2 ||
       output.sizeBytes() < (uint64_t{rows - 1} * outStride + outOffset + n) * element)
     throw std::invalid_argument("invalid float projection");
   // Staged simdgroup tile (16 B loads): fp32 output above 32 rows, 16-byte aligned views
   const bool staged = !accelerator && type == FloatOutput::Float32 && rows > 32 && n % 16 == 0 &&
                       input.gpuAddress() % 16 == 0 && weights.plane0.gpuAddress() % 16 == 0;
-  const std::string kernel = staged ? "gguf_float_s42_f32"
-                                    : std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
+  const std::string weightKind = weights.bf16Values ? "bf16w_" : "";
+  const std::string kernel = staged ? "gguf_float_s42_" + weightKind + "f32"
+                                    : std::string(accelerator ? "gguf_float_na_" : "gguf_float_") + weightKind +
                                           (type == FloatOutput::Float32 ? "f32" : "bf16");
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
                                    : staged    ? metal::DispatchSize{n / 16, (rows + 31) / 32, 1}

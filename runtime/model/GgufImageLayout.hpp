@@ -5,8 +5,8 @@
 // come 16 KiB-aligned sections. A quantized tensor is a descriptor section,
 // then its plane0, optional plane1 and meta sections in its format's layout
 // (metal/abi/QuantFormat.h). A tensor copied as stored (the token
-// embedding's native rows; the F32 MoE router, shared-expert gate and
-// alpha/beta) is a descriptor and its rows; a norm, the convolution and the
+// embedding's native rows; the F32 or BF16 MoE router and QSA indexer
+// projections, the F32 shared-expert gate and alpha/beta) is a descriptor and its rows; a norm, the convolution and the
 // GDN head vectors are their rows alone, F32 or narrowed to the bf16 values
 // they equal.
 // Editing this file re-prepares every GGUF model.
@@ -19,7 +19,7 @@
 
 namespace splash::model {
 
-inline constexpr std::string_view kGgufImageMagic = "MDGG0001";
+inline constexpr std::string_view kGgufImageMagic = "MDGG0002";
 
 // Columns of a superblock: a staging unit wide enough for every format.
 inline constexpr uint64_t kGgufBlockColumns = 256;

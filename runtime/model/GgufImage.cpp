@@ -150,14 +150,15 @@ public:
   }
 
   // An F32 tensor [rows, columns] as stored, or widened from BF16 (the MoE
-  // router and the shared-expert scalar gate, which llama.cpp keeps unquantized).
-  void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
+  // router and the shared-expert scalar gate, which llama.cpp keeps unquantized);
+  // with `keepBf16` a BF16 tensor stays BF16 (the router; the gate is read as F32).
+  void floatTensor(const std::string &name, uint64_t rows, uint64_t columns, bool keepBf16 = false) {
     const GgufTensor *tensor = find(name, wideFloatType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected an F32 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
-    if (tensor->type == ggml::kF32) return copiedRows(*tensor);
+    if (tensor->type == ggml::kF32 || (keepBf16 && tensor->type == ggml::kBF16)) return copiedRows(*tensor);
     const uint64_t bytes = rows * columns * sizeof(float);
     descriptor(ggml::kF32, rows, columns, {}, {bytes, 0, 0}, name);
     copy(tensorRows(*tensor, rows, tensor->bytes / rows), Conversion::WidenToFloat32);
@@ -166,7 +167,7 @@ public:
   // An F32, BF16, Q8_0 or Q4_K tensor [rows, columns] as F32 rows: as stored, or the
   // F32 values BF16, Q8_0 (d * q) or Q4_K equal exactly. With `withDescriptor` it is
   // a float tensor a projection runs (the QSA indexer's projections, which
-  // are BF16), else its rows alone (the hyper-connections' injection
+  // are BF16 and stay BF16), else its rows alone (the hyper-connections' injection
   // weights; the MTP head's are Q8_0).
   void floatRows(const std::string &name, uint64_t rows, uint64_t columns, bool withDescriptor) {
     const GgufTensor *tensor = find(name, [](uint32_t type) {
@@ -176,6 +177,7 @@ public:
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected an F32, BF16, Q8_0 or Q4_K [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
+    if (withDescriptor && tensor->type == ggml::kBF16) return copiedRows(*tensor);
     const uint64_t bytes = rows * columns * sizeof(float);
     if (withDescriptor) descriptor(ggml::kF32, rows, columns, {}, {bytes, 0, 0}, name);
     image_.copies.push_back({section(bytes), tensorRows(*tensor, rows, tensor->bytes / rows),
@@ -401,7 +403,7 @@ void mixerImage(Builder &b, const TargetGeometry &g, const std::string &p, bool 
 void ffnImage(Builder &b, const TargetGeometry &g, const std::string &p) {
   if (g.sparseMoe()) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
-    b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
+    b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize, true);
     b.quantized(p + "ffn_gate_exps.weight", routed * width, g.hiddenSize);
     b.quantized(p + "ffn_up_exps.weight", routed * width, g.hiddenSize);
     b.quantized(p + "ffn_down_exps.weight", routed * g.hiddenSize, width);

@@ -52,7 +52,7 @@ bool matches(const QuantizedSegment &segment, uint32_t output, uint32_t input,
       segment.outputSize != output || segment.inputSize != input)
     return false;
   return floatWeights
-             ? segment.plane0.sizeBytes() >= uint64_t{output} * input * sizeof(float)
+             ? segment.plane0.sizeBytes() >= uint64_t{output} * input * (segment.bf16Values ? sizeof(uint16_t) : sizeof(float))
              : segment.formatId < GGUF_FMT_COUNT && segment.meta;
 }
 

@@ -50,7 +50,7 @@ using splash::metal::MetalBuffer;
 using splash::test::sharedBuffer;
 
 constexpr std::string_view kDraftLayerMagic = "MDFD0004";
-constexpr std::string_view kGgufImageMagic = "MDGG0001";
+constexpr std::string_view kGgufImageMagic = "MDGG0002";
 constexpr std::string_view kTargetEmbeddingMagic = "MDFE0001";
 constexpr std::string_view kTargetHeadMagic = "MDFL0002";
 constexpr std::string_view kTargetLayerMagic = "MDFL0006";
